@@ -28,6 +28,9 @@ import functools
 import pdb
 from jax_tqdm import scan_tqdm
 
+import seaborn as sns
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -260,32 +263,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
-    # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-    env = initialize_environment(config)
-    
-    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
-    config["MAX_TRAIN_UPDATES"] = (
-        config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    config["NUM_REWARD_SHAPING_STEPS"] = config["MAX_TRAIN_UPDATES"] // 2  # used for annealing reward shaping
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
-    config["CLIP_EPS"] = (
-        config["CLIP_EPS"] / env.num_agents
-        if config["SCALE_CLIP_EPS"]
-        else config["CLIP_EPS"]
-    )
-    config["obs_dim"] = env.observation_space(env.agents[0]).shape
-
-    obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-
-    env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+def make_train(env, config, update_step=0, resume_update_step=0):
 
     def linear_schedule(count):
         frac = (
@@ -694,108 +672,167 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    rng = runner_state[-1]
-    metrics = out['metrics']
-
-    reward = metrics['returns']
-    update_step = metrics['update_steps']
-    loss = metrics['loss']
-    value_loss = loss['value_loss']
-    actor_loss = loss['actor_loss']
-    entropy_loss = loss['entropy']
-    final_update_step = update_step[-1]
-    update_step = update_step * config['NUM_ENVS'] * config['NUM_STEPS']
-
+    # Calculate total number of checkpoints needed for auto-continue
+    total_updates_needed = config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    max_updates_per_run = config.get("MAX_UPDATES_PER_RUN", 2000)
+    num_checkpoints_needed = int((total_updates_needed + max_updates_per_run - 1) // max_updates_per_run)  # Ceiling division
     
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1], 'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]}
-        pickle.dump(ckpt, f)
+    print(f"Total updates needed: {total_updates_needed}, Max updates per run: {max_updates_per_run}, Number of checkpoints needed: {num_checkpoints_needed}")
+    print(f"Starting from update step: {final_update_step}")
+
+    env = initialize_environment(config)
+    
+    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+    # Limit NUM_UPDATES to prevent GPU memory issues with jax.lax.scan
+    max_updates_per_run = config.get("MAX_UPDATES_PER_RUN", 2000)  # Default: 2000 updates per run
+    config["NUM_UPDATES"] = min(
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"],
+        max_updates_per_run
+    )
+    
+    resume_update_step = final_update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+
+    config["MAX_TRAIN_UPDATES"] = (
+        config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    config["NUM_REWARD_SHAPING_STEPS"] = config["MAX_TRAIN_UPDATES"] // 2  # used for annealing reward shaping
+    config["MINIBATCH_SIZE"] = (
+        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+    )
+    config["CLIP_EPS"] = (
+        config["CLIP_EPS"] / env.num_agents
+        if config["SCALE_CLIP_EPS"]
+        else config["CLIP_EPS"]
+    )
+    config["obs_dim"] = env.observation_space(env.agents[0]).shape
+
+    import time
+    start_time = time.time()
+    obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    reset_end_time = time.time()
+    print(f"Environment reset took: {reset_end_time - start_time} seconds")
+
+    env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    log_wrapper_end_time = time.time()
+    print(f"Log wrapper took: {log_wrapper_end_time - reset_end_time} seconds")
+
+    # Training loop with checkpointing
+    for current_ckpt_id in range(num_checkpoints_needed):
+        # Load previous checkpoint if continuing from a previous run
+        if current_ckpt_id > 0:
+            prev_ckpt_path = f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{current_ckpt_id - 1}{finetune_appendage}.pkl"
+            print(f"Loading previous checkpoint: {prev_ckpt_path}")
+            with open(prev_ckpt_path, "rb") as f:
+                previous_ckpt = pickle.load(f)
+                model_params = previous_ckpt['params']
+                final_update_step = previous_ckpt['final_update_step']
+                loaded_rng = previous_ckpt['key']
+                rng, _rng = jax.random.split(jax.random.PRNGKey(loaded_rng))
+                resume_update_step = final_update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+                model_params = previous_ckpt['params']
+        
+        print(f"Starting checkpoint {current_ckpt_id} from update step {final_update_step}")
+        train_jit = jax.jit(make_train(env, config, final_update_step, resume_update_step), device=jax.devices()[0])
+        out = train_jit(rng, model_params, final_update_step)
+        runner_state = out['runner_state']
+        train_state = runner_state[0]
+        model_state = train_state[0]
+        rng = runner_state[-1]
+        metrics = out['metrics']
+
+        reward = metrics['returns']
+        update_step = metrics['update_steps']
+        loss = metrics['loss']
+        value_loss = loss['value_loss']
+        actor_loss = loss['actor_loss']
+        entropy_loss = loss['entropy']
+        final_update_step = update_step[-1]
+        update_step = update_step * config['NUM_ENVS'] * config['NUM_STEPS']
+
+        # save model
+        os.makedirs(filepath, exist_ok=True)
+        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{current_ckpt_id}{finetune_appendage}.pkl", "wb") as f:
+            ckpt = {
+                'key': rng, 'params': model_state.params,
+                'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1],
+                'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]
+            }
+
+            pickle.dump(ckpt, f)
+        print(f"Saved checkpoint {config['TRAIN_KWARGS']['ckpt_id']}")
+
+        # plot reward w wandb
+        for i, us in enumerate(update_step):
+            r = reward[i]
+            try:
+                wandb.log(
+                    {
+                        "returns": r,
+                        "env_step": us,
+                        'seed': config["SEED"],
+                        'ckpt_id': config['TRAIN_KWARGS']['ckpt_id']
+                    }
+                )
+            except:
+                pass
 
 
-    # plot reward w wandb
-    for i, us in enumerate(update_step):
-        r = reward[i]
-        try:
-            wandb.log(
-                {
-                    "returns": r,
-                    "env_step": us,
-                    'seed': config["SEED"]
-                }
-            )
-        except:
-            pass
+        # plot reward vs update step with seaborn
+        sns.set_context('paper')
+        # add previous ckpt's first and last update step and reward
+        if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+            # plot_update_step = jnp.concatenate([, previous_ckpt['last_update_step'][None], update_step])    
+            # plot_reward = jnp.concatenate([previous_ckpt['first_reward'][None], previous_ckpt['last_reward'][None], reward])
+            plot_update_step = update_step
+            plot_reward = reward
+        else:
+            plot_update_step = update_step
+            plot_reward = reward
 
+        value_step = jnp.arange(value_loss.shape[0])
+        
 
+        # plot all losses in subplots
+        fig, axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 to add ratio plot
+        fig.suptitle('Training Losses')
+        
+        # Plot total loss
+        sns.lineplot(x=value_step, y=loss['total_loss'], ax=axs[0, 0])
+        axs[0, 0].set_title('Total Loss')
+        axs[0, 0].set_xlabel('Steps')
+        
+        # Plot value loss
+        sns.lineplot(x=value_step, y=value_loss, ax=axs[0, 1])
+        axs[0, 1].set_title('Value Loss')
+        axs[0, 1].set_xlabel('Steps')
+        
+        # Plot actor loss
+        sns.lineplot(x=value_step, y=loss['actor_loss'], ax=axs[1, 0])
+        axs[1, 0].set_title('Actor Loss')
+        axs[1, 0].set_xlabel('Steps')
+        
+        # Plot entropy loss
+        sns.lineplot(x=value_step, y=entropy_loss, ax=axs[1, 1])
+        axs[1, 1].set_title('Entropy Loss')
+        axs[1, 1].set_xlabel('Steps')
+        
+        # Plot ratio
+        sns.lineplot(x=value_step, y=loss['ratio'], ax=axs[2, 0])
+        axs[2, 0].set_title('Policy Ratio')
+        axs[2, 0].set_xlabel('Steps')
+        
+        # Hide the empty subplot
+        sns.lineplot(x=plot_update_step, y=plot_reward, ax=axs[2, 1])
+        axs[2, 1].set_title('Reward')
+        axs[2, 1].set_xlabel('Steps')
+        
+        plt.tight_layout()
+        plt.savefig(f'{filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
+        plt.close()
 
-
-    # plot reward vs update step with seaborn
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    sns.set_context('paper')
-    # add previous ckpt's first and last update step and reward
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
-        # plot_update_step = jnp.concatenate([, previous_ckpt['last_update_step'][None], update_step])    
-        # plot_reward = jnp.concatenate([previous_ckpt['first_reward'][None], previous_ckpt['last_reward'][None], reward])
-        plot_update_step = update_step
-        plot_reward = reward
-    else:
-        plot_update_step = update_step
-        plot_reward = reward
-
-    value_step = jnp.arange(value_loss.shape[0])
-    
-
-    # plot all losses in subplots
-    fig, axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 to add ratio plot
-    fig.suptitle('Training Losses')
-    
-    # Plot total loss
-    sns.lineplot(x=value_step, y=loss['total_loss'], ax=axs[0, 0])
-    axs[0, 0].set_title('Total Loss')
-    axs[0, 0].set_xlabel('Steps')
-    
-    # Plot value loss
-    sns.lineplot(x=value_step, y=value_loss, ax=axs[0, 1])
-    axs[0, 1].set_title('Value Loss')
-    axs[0, 1].set_xlabel('Steps')
-    
-    # Plot actor loss
-    sns.lineplot(x=value_step, y=loss['actor_loss'], ax=axs[1, 0])
-    axs[1, 0].set_title('Actor Loss')
-    axs[1, 0].set_xlabel('Steps')
-    
-    # Plot entropy loss
-    sns.lineplot(x=value_step, y=entropy_loss, ax=axs[1, 1])
-    axs[1, 1].set_title('Entropy Loss')
-    axs[1, 1].set_xlabel('Steps')
-    
-    # Plot ratio
-    sns.lineplot(x=value_step, y=loss['ratio'], ax=axs[2, 0])
-    axs[2, 0].set_title('Policy Ratio')
-    axs[2, 0].set_xlabel('Steps')
-    
-    # Hide the empty subplot
-    sns.lineplot(x=plot_update_step, y=plot_reward, ax=axs[2, 1])
-    axs[2, 1].set_title('Reward')
-    axs[2, 1].set_xlabel('Steps')
-    
-    plt.tight_layout()
-    plt.savefig(f'{filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    plt.close()
-
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
-    print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    
-    
+        print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
+        print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
+        
     '''updates_x = jnp.arange(out["metrics"]["total_loss"][0].shape[0])
     loss_table = jnp.stack([updates_x, out["metrics"]["total_loss"].mean(axis=0), out["metrics"]["actor_loss"].mean(axis=0), out["metrics"]["critic_loss"].mean(axis=0), out["metrics"]["entropy"].mean(axis=0), out["metrics"]["ratio"].mean(axis=0)], axis=1)    
     loss_table = wandb.Table(data=loss_table.tolist(), columns=["updates", "total_loss", "actor_loss", "critic_loss", "entropy", "ratio"])'''

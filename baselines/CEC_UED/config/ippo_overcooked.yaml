@@ -5,7 +5,7 @@
 "NUM_STEPS": 100 #checked
 "FC_DIM_SIZE": 128
 "GRU_HIDDEN_DIM": 128
-"TOTAL_TIMESTEPS": 1e8 #checked #for overcooked : 3e9
+"TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
 "MAX_TRAIN_STEPS": 3e9 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
@@ -56,3 +56,6 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
+# Memory management       
+"MAX_UPDATES_PER_RUN": 200  # Maximum updates per training run to prevent GPU OOM. Use checkpointing for longer training.
+# "AUTO_CONTINUE_CHECKPOINTS": True  # If True, automatically continue training with multiple checkpoints until TOTAL_TIMESTEPS is reached

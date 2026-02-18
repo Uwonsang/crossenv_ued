@@ -717,20 +717,7 @@ def main(config):
     print(f"Log wrapper took: {log_wrapper_end_time - reset_end_time} seconds")
 
     # Training loop with checkpointing
-    for current_ckpt_id in range(num_checkpoints_needed):
-        # Load previous checkpoint if continuing from a previous run
-        if current_ckpt_id > 0:
-            prev_ckpt_path = f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{current_ckpt_id - 1}{finetune_appendage}.pkl"
-            print(f"Loading previous checkpoint: {prev_ckpt_path}")
-            with open(prev_ckpt_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                final_update_step = previous_ckpt['final_update_step']
-                loaded_rng = previous_ckpt['key']
-                rng, _rng = jax.random.split(jax.random.PRNGKey(loaded_rng))
-                resume_update_step = final_update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
-                model_params = previous_ckpt['params']
-        
+    for current_ckpt_id in tqdm(range(num_checkpoints_needed)):
         print(f"Starting checkpoint {current_ckpt_id} from update step {final_update_step}")
         train_jit = jax.jit(make_train(env, config, final_update_step, resume_update_step), device=jax.devices()[0])
         out = train_jit(rng, model_params, final_update_step)
@@ -760,6 +747,11 @@ def main(config):
 
             pickle.dump(ckpt, f)
         print(f"Saved checkpoint {config['TRAIN_KWARGS']['ckpt_id']}")
+
+        # Update model_params and resume_update_step for next checkpoint
+        model_params = model_state.params
+        resume_update_step = final_update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+        rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
         # plot reward w wandb
         for i, us in enumerate(update_step):

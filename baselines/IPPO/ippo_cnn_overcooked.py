@@ -22,6 +22,7 @@ import wandb
 import copy
 
 import matplotlib.pyplot as plt
+from jax_tqdm import scan_tqdm
 
 
 class CNN(nn.Module):
@@ -206,6 +207,7 @@ def make_train(config):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
 
         # TRAIN LOOP
+        @scan_tqdm(int(config["NUM_UPDATES"]))
         def _update_step(runner_state, unused):
             # COLLECT TRAJECTORIES
             def _env_step(runner_state, unused):
@@ -386,7 +388,7 @@ def make_train(config):
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, 0, _rng)
         runner_state, metric = jax.lax.scan(
-            _update_step, runner_state, None, config["NUM_UPDATES"]
+            _update_step, runner_state, jnp.arange(config["NUM_UPDATES"]), config["NUM_UPDATES"]
         )
         return {"runner_state": runner_state, "metrics": metric}
 

@@ -56,6 +56,3 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
-# Memory management       
-"MAX_UPDATES_PER_RUN": 200  # Maximum updates per training run to prevent GPU OOM. Use checkpointing for longer training.
-# "AUTO_CONTINUE_CHECKPOINTS": True  # If True, automatically continue training with multiple checkpoints until TOTAL_TIMESTEPS is reached

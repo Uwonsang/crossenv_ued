@@ -37,7 +37,7 @@ class OvercookedVisualizer:
 		return self._render_state(agent_view_size, state, highlight, tile_size)
 
 	def custom_get_frame(self, state, agent_view_size): # add
-		padding = agent_view_size - 2  # show
+		padding = agent_view_size - 1  # agent_view_size is 5, (1 => 9x9) (2 => 11x11)
 		grid = np.asarray(state.maze_map[padding:-padding, padding:-padding, :])
 		# Render the state
 		frame = OvercookedVisualizer._render_grid(

@@ -1,6 +1,6 @@
-import pickle
 import os
 from tqdm import tqdm
+import h5py
 import jax
 import jax.numpy as jnp
 from jaxmarl.environments.overcooked import overcooked_layouts
@@ -14,23 +14,19 @@ import jaxmarl
 import imageio
 
 
-def load_pickle(path):
-    with open(path, "rb") as f:
-        data = pickle.load(f)
-    return data
+def load_h5(path):
+    """Load env_state dict from h5 (keys = dataset names, values = arrays)."""
+    with h5py.File(path, "r") as f:
+        return {k: f[k][:] for k in f.keys()}
 
 @struct.dataclass
 class FilteredState:
-    agent_pos: chex.Array
-    agent_dir: chex.Array
     agent_dir_idx: chex.Array
     agent_inv: chex.Array
     maze_map: chex.Array
 
 def filtered_state(ep_state):
     dtype_map = {
-        "agent_pos": jnp.uint32,
-        "agent_dir": jnp.int8,
         "agent_dir_idx": jnp.int32,
         "agent_inv": jnp.int32,
         "maze_map": jnp.uint8,
@@ -67,11 +63,8 @@ def layout_render(env_state, config, save_dir):
 @hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def visualize_layout(config):
     config = OmegaConf.to_container(config)
-    config["data_dir"] = '/app/baselines/CEC_UED/VAE/dataset/lr-20260221-062635'
-
-    data_path = os.path.join(config["data_dir"], "env_states.pkl")    
-    env_state = load_pickle(data_path)
-
+    data_path = '/app/baselines/CEC_UED/VAE/dataset/lr-20260221-114855/env_states.h5'
+    env_state = load_h5(data_path)
     save_dir = "/app/baselines/CEC_UED/VAE/dataset/img"
     layout_render(env_state, config, save_dir)
 

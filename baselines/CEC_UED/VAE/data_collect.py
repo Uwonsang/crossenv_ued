@@ -113,6 +113,7 @@ def make_rollout(config):
 
         @scan_tqdm(int(config["NUM_UPDATES"]))
         def _num_updates(runner_state, unused):
+            env_state_at_start, _, _ = runner_state
             
             def _rollout_step(runner_state, unused):
                 env_state, obsv, rng = runner_state
@@ -134,31 +135,36 @@ def make_rollout(config):
             runner_state, _ = jax.lax.scan(
                 _rollout_step, runner_state, None, config["NUM_STEPS"]
             )
-            return runner_state, _
+            return runner_state, env_state_at_start
 
         rng, _rng = jax.random.split(rng)
         runner_state = (env_state, obsv, _rng)
-        runner_state, _ = jax.lax.scan(
+        runner_state, stacked_env_states = jax.lax.scan(
             _num_updates, runner_state, jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state}
+
+        return {"runner_state": runner_state, "stacked_env_states": stacked_env_states}
 
     return run
 
 
-@hydra.main(version_base=None, config_path="../config", config_name="collect_overcooked")
+@hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     filepath = f"/app/baselines/CEC_UED/VAE/dataset/{xpid}"
-    config["DATA_SAVE_DIR"] = filepath
-    print(f"Working on: \n{filepath}\n")
-    
     rng = jax.random.PRNGKey(config["SEED"])
-
     rollout_fn = jax.jit(make_rollout(config), device=jax.devices()[0])
     out = rollout_fn(rng)
 
+    stacked_env_states = out["stacked_env_states"].env_state
+    state_dict = {k: np.asarray(getattr(stacked_env_states, k)) for k in stacked_env_states.__dataclass_fields__.keys()}
+    
+    save_path = os.path.join(filepath, "env_states.pkl")
+    os.makedirs(filepath, exist_ok=True)
+    with open(save_path, "wb") as f:
+        pickle.dump(state_dict, f)
+    print(f"Saved env_states (num_updates x num_envs) to {save_path}")
 
 if __name__ == "__main__":
     main()

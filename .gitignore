@@ -173,4 +173,4 @@ cython_debug/
 outputs/
 outputs/*
 ckpts/*
-dataset/*
+baselines/CEC_UED/VAE/dataset/*

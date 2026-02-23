@@ -28,6 +28,7 @@ import functools
 import pdb
 from jax_tqdm import scan_tqdm
 import time
+import yaml
 
 
 def initialize_environment(config):
@@ -651,6 +652,10 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
+    
+    with open("private.yaml") as f:
+        private_info = yaml.load(f, Loader=yaml.FullLoader)
+    wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],

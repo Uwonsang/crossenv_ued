@@ -55,4 +55,4 @@
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
-"WANDB_MODE" : "online" # disabled, enabled
+"WANDB_MODE" : "disabled" # disabled, online, offline

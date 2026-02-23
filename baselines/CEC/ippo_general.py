@@ -27,7 +27,7 @@ import wandb
 import functools
 import pdb
 from jax_tqdm import scan_tqdm
-
+import yaml
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -581,12 +581,15 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
+            metric["mean_reward"] = traj_batch.reward.mean()
+
             def callback(metric):
                 wandb.log(
                     {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
+                        "mean_reward": metric["mean_reward"],
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
@@ -620,7 +623,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
     if config['TRAIN_KWARGS']['finetune']:
@@ -643,6 +646,9 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
+    with open("private.yaml") as f:
+        private_info = yaml.load(f, Loader=yaml.FullLoader)
+    wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],

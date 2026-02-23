@@ -1,21 +1,20 @@
-# reference from JaxMARL
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
-"LR": 5e-4
-"NUM_ENVS": 64
+"LR": 3e-4
+"NUM_ENVS": 512
 "NUM_SEEDS": 1
 "NUM_STEPS": 256
 "FC_DIM_SIZE": 128
 "GRU_HIDDEN_DIM": 128
-"TOTAL_TIMESTEPS": 5e6 # 3e9 for overcooked
+"TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
 "MAX_TRAIN_STEPS": 3e9
 "UPDATE_EPOCHS": 4
-"NUM_MINIBATCHES": 16
+"NUM_MINIBATCHES": 2
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
 "SCALE_CLIP_EPS": False
-"ENT_COEF": 0.01
-"VF_COEF": 0.5
+"ENT_COEF": 0.005
+"VF_COEF": 1.0
 "MOA_COEF": 1.0
 "MAX_GRAD_NORM": 0.5
 "ACTIVATION": "relu"
@@ -23,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : False # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 100
+  "max_steps": 400
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -56,4 +55,4 @@
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
-"WANDB_MODE" : "disabled" # disabled, online, offline
+"WANDB_MODE" : "online" # disabled, enabled

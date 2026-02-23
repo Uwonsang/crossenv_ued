@@ -14,10 +14,10 @@ import jaxmarl
 import imageio
 
 
-def load_h5(path):
+def load_h5(path, config):
     """Load env_state dict from h5 (keys = dataset names, values = arrays)."""
     with h5py.File(path, "r") as f:
-        return {k: f[k][:] for k in f.keys()}
+        return {k: f[k][:config["VIZ_STEPS"]] for k in f.keys()}
 
 @struct.dataclass
 class FilteredState:
@@ -52,7 +52,7 @@ def layout_render(env_state, config, save_dir):
     # num_layouts = state.agent_pos.shape[0]
     frame = [
         viz.custom_get_frame(jax.tree_map(lambda x: x[step], state), agent_view_size)
-        for step in tqdm(range(100))
+        for step in tqdm(range(config["VIZ_STEPS"]))
     ]
 
     os.makedirs(save_dir, exist_ok=True)
@@ -63,8 +63,8 @@ def layout_render(env_state, config, save_dir):
 @hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def visualize_layout(config):
     config = OmegaConf.to_container(config)
-    data_path = '/app/baselines/CEC_UED/VAE/dataset/lr-20260221-114855/env_states.h5'
-    env_state = load_h5(data_path)
+    data_path = '/app/baselines/CEC_UED/VAE/dataset/env_states_3e9.h5'
+    env_state = load_h5(data_path, config)
     save_dir = "/app/baselines/CEC_UED/VAE/dataset/img"
     layout_render(env_state, config, save_dir)
 

@@ -174,3 +174,4 @@ outputs/
 outputs/*
 ckpts/*
 baselines/CEC_UED/VAE/dataset/*
+multirun/*

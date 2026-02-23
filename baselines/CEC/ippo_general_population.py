@@ -28,6 +28,7 @@ import functools
 import pdb
 from jax_tqdm import scan_tqdm
 import yaml
+import time
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -567,6 +568,12 @@ def make_train(config, update_step=0, filepath=""):
                 ),
                 traj_batch.info,
             )
+
+            returns = metric["returned_episode_returns"][:, :, 0][
+                metric["returned_episode"][:, :, 0].astype(jnp.int32)
+            ].mean()
+            metric = jax.tree_map(lambda x: x.mean(), metric)
+
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
             loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
@@ -581,15 +588,12 @@ def make_train(config, update_step=0, filepath=""):
             }
             rng = update_state[-1]
 
-            metric["mean_reward"] = traj_batch.reward.mean()
-
             def callback(metric):
                 wandb.log(
                     {
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "mean_reward": metric["mean_reward"],
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
@@ -597,10 +601,10 @@ def make_train(config, update_step=0, filepath=""):
                     }
                 )
 
-                save_interval = config["NUM_UPDATES"] // 20
+                save_interval = config["NUM_UPDATES"] // 19
                 step = int(metric["update_steps"])
-                print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}  mean_reward {metric['mean_reward']:.3f}")
                 if save_interval > 0 and step % save_interval == 0 and step > 0:
+                    print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}")
                     ckpt_id = int(step // save_interval - 1)
                     os.makedirs(filepath, exist_ok=True)
                     with open(f"{filepath}/seed{config['SEED']}_ckpt{ckpt_id}.pkl", "wb") as f:
@@ -610,12 +614,8 @@ def make_train(config, update_step=0, filepath=""):
                             'key': jax.device_get(metric["rng"]),
                         }, f)
 
-            returns = metric["returned_episode_returns"][:, :, 0][
-                metric["returned_episode"][:, :, 0].astype(jnp.int32)
-            ].mean()
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-
             metric["params"] = train_state.params
             metric["rng"] = rng
             jax.experimental.io_callback(callback, None, metric)
@@ -632,17 +632,19 @@ def make_train(config, update_step=0, filepath=""):
             init_hstate,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
+        runner_state, _ = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, 'metrics': metric}
+        return {"runner_state": runner_state}
 
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final_baseline")
+@hydra.main(version_base=None, config_path="repro_config", config_name="ippo_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
+    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_improved_finetune"
@@ -665,18 +667,21 @@ def main(config):
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
     with open("private.yaml") as f:
         private_info = yaml.load(f, Loader=yaml.FullLoader)
+    
+    layout_name = config["ENV_KWARGS"]["layout"]
     wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"IPPO_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
+    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
     print(f"Working on: \n{filepath}\n")
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -699,10 +704,10 @@ def main(config):
         if config["ENV_NAME"] == "overcooked":
             finetune_filepath += f"/cramped_room_9"
         if config['FCP']:
-            finetune_filepath = f"{finetune_filepath}/ikFalse/graph{config['GRAPH_NET']}"
+            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
             finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
         else:
-            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/graph{config['GRAPH_NET']}"
+            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
             finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
         print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint

@@ -655,13 +655,16 @@ def main(config):
     
     with open("private.yaml") as f:
         private_info = yaml.load(f, Loader=yaml.FullLoader)
+    
+    layout_name = config["ENV_KWARGS"]["layout"]
     wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"CEC_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

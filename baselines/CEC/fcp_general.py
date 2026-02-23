@@ -26,6 +26,7 @@ import wandb
 import functools
 import pdb
 from jax_tqdm import scan_tqdm
+import yaml
 
 
 def initialize_environment(config):
@@ -641,12 +642,14 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
+    wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "FCP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"FCP_{config["ENV_KWARGS"]["layout"]}_{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

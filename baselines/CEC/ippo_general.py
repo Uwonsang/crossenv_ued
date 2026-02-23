@@ -627,7 +627,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC")
+@hydra.main(version_base=None, config_path="repro_config", config_name="ippo_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")

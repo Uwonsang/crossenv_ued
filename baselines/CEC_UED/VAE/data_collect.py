@@ -114,10 +114,17 @@ def make_rollout(config, save_path):
     )
     n_actions = env.action_space(env.agents[0]).n
 
-    _, init_state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
-    field_names = ["agent_dir_idx", "agent_inv", "maze_map"]
-    field_shapes = {k: getattr(init_state, k).shape for k in field_names}
-    field_dtypes = {k: getattr(init_state, k).dtype for k in field_names}
+    init_obs, init_state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
+    state_names = ["agent_dir_idx", "agent_inv", "maze_map"]
+    state_shapes = {k: getattr(init_state, k).shape for k in state_names}
+    state_dtypes = {k: getattr(init_state, k).dtype for k in state_names}
+
+    obs_shapes = {"agent_0": init_obs["agent_0"].shape}
+    obs_dtypes = {"agent_0": init_obs["agent_0"].dtype}
+    
+    field_shapes =  {**state_shapes, **obs_shapes}
+    field_dtypes = {**state_dtypes, **obs_dtypes}
+    field_names = list(obs_shapes.keys()) + list(state_names) 
 
     env = LogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
@@ -160,7 +167,7 @@ def make_rollout(config, save_path):
             )
 
             def do_save(_):
-                arrays = [getattr(env_state_at_start.env_state, k) for k in field_names]
+                arrays = [obsv[k] for k in obs_shapes.keys()] + [getattr(env_state_at_start.env_state, k) for k in state_names]
                 io_callback(save_to_hdf5, None, arrays, update_idx, ordered=True)
 
             jax.lax.cond(
@@ -187,8 +194,8 @@ def make_rollout(config, save_path):
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-    ts_str = f"{int(config["TOTAL_TIMESTEPS"]):.0e}".replace("+0", "")
-    save_path = f"/app/baselines/CEC_UED/VAE/dataset/env_states_{ts_str}.h5"
+    ts_str = f"{int(config['TOTAL_TIMESTEPS']):.0e}".replace("+0", "")
+    save_path = f"/app/baselines/CEC_UED/VAE/dataset/env_states_obs_{ts_str}.h5"
 
     rng = jax.random.PRNGKey(config["SEED"])
     rollout_fn = jax.jit(make_rollout(config, save_path), device=jax.devices()[0])

@@ -12,6 +12,7 @@ import hydra
 from omegaconf import OmegaConf
 import jaxmarl
 import imageio
+from data_prep import restore_from_obs
 
 
 def load_h5(path, config):
@@ -43,13 +44,18 @@ def filtered_state(ep_state):
     
     return FilteredState(**state_dict)
 
-def layout_render(env_state, config, save_dir):
+def layout_render(env_state_obs, config, save_dir):
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     agent_view_size = env.agent_view_size
     viz = OvercookedVisualizer()
-    
-    state = filtered_state(env_state)
-    # num_layouts = state.agent_pos.shape[0]
+
+    if config["use_obs"]:
+        restore_from_obs_batch = jax.vmap(jax.vmap(restore_from_obs, in_axes=0), in_axes=0)
+        restored = restore_from_obs_batch(env_state_obs["agent_0"])
+        state = filtered_state(restored)
+    else:
+        state = filtered_state(env_state_obs)
+
     frame = [
         viz.custom_get_frame(jax.tree_map(lambda x: x[step], state), agent_view_size)
         for step in tqdm(range(config["VIZ_STEPS"]))
@@ -63,10 +69,10 @@ def layout_render(env_state, config, save_dir):
 @hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def visualize_layout(config):
     config = OmegaConf.to_container(config)
-    data_path = '/app/baselines/CEC_UED/VAE/dataset/env_states_3e9.h5'
-    env_state = load_h5(data_path, config)
-    save_dir = "/app/baselines/CEC_UED/VAE/dataset/img"
-    layout_render(env_state, config, save_dir)
+    data_path = '/app/baselines/CEC_UED/VAE/dataset/env_states_3e6_lr-20260224-071423.h5'
+    env_state_obs = load_h5(data_path, config)
+    save_dir = f"/app/baselines/CEC_UED/VAE/dataset/img_use_obs_{config['use_obs']}"
+    layout_render(env_state_obs, config, save_dir)
 
 
 if __name__ == "__main__":

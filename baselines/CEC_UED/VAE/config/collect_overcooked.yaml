@@ -13,4 +13,4 @@
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit  
 "SAVE_INTERVAL": 1 
 "VIZ_STEPS": 100 # None=all, or e.g. slice(0,100), [0,1,2], 0
-# save env_states every N updates (io_callback) # uncomment to save only these; omit or null = save all
+"use_obs": True

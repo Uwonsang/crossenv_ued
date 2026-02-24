@@ -1,6 +1,6 @@
 """
-Map rollout only: reset env (diverse layouts) and run rollouts with random actions.
-Saves (obsv, env_state) for data collection. No agent training.
+Reset-only data collection: resets env (diverse layouts) NUM_UPDATES times.
+Saves (agent_0 obs, env_state) pairs that are always time-aligned.
 """
 import os
 import jax
@@ -84,16 +84,6 @@ def initialize_environment(config):
     return env
 
 
-def batchify(x: dict, agent_list, num_actors):
-    x = jnp.stack([x[a] for a in agent_list])
-    return x.reshape((num_actors, -1))
-
-
-def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
-    x = x.reshape((num_actors, num_envs, -1))
-    return {a: x[i] for i, a in enumerate(agent_list)}
-
-
 def init_hdf5(save_path, field_names, field_shapes, field_dtypes, num_updates, num_envs):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     with h5py.File(save_path, "w") as f:
@@ -106,29 +96,31 @@ def init_hdf5(save_path, field_names, field_shapes, field_dtypes, num_updates, n
             )
     print(f"Initialized HDF5 at {save_path}")
 
+
 def make_rollout(config, save_path):
     env = initialize_environment(config)
-    config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    config["NUM_UPDATES"] = (
-        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-    )
-    n_actions = env.action_space(env.agents[0]).n
 
-    init_obs, init_state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
-    state_names = ["agent_dir_idx", "agent_inv", "maze_map"]
+    config["NUM_UPDATES"] = (
+        config["NUM_LAYOUTS"] // config["NUM_ENVS"]
+    )
+    init_obs, init_state = env.reset(
+        jax.random.PRNGKey(0),
+        params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]}
+    )
+    state_names  = ["agent_dir_idx", "agent_inv", "maze_map"]
     state_shapes = {k: getattr(init_state, k).shape for k in state_names}
     state_dtypes = {k: getattr(init_state, k).dtype for k in state_names}
+    obs_shapes   = {"agent_0": init_obs["agent_0"].shape}
+    obs_dtypes   = {"agent_0": init_obs["agent_0"].dtype}
 
-    obs_shapes = {"agent_0": init_obs["agent_0"].shape}
-    obs_dtypes = {"agent_0": init_obs["agent_0"].dtype}
-    
-    field_shapes =  {**state_shapes, **obs_shapes}
-    field_dtypes = {**state_dtypes, **obs_dtypes}
-    field_names = list(obs_shapes.keys()) + list(state_names) 
+    field_shapes = {**obs_shapes, **state_shapes}
+    field_dtypes = {**obs_dtypes, **state_dtypes}
+    field_names  = list(obs_shapes.keys()) + list(state_names)
 
     env = LogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
-    init_hdf5(save_path, field_names, field_shapes, field_dtypes, int(config["NUM_UPDATES"]), config["NUM_ENVS"])
+    init_hdf5(save_path, field_names, field_shapes, field_dtypes,
+              int(config["NUM_UPDATES"]), config["NUM_ENVS"])
 
     def run(rng):
         rng, _rng = jax.random.split(rng)
@@ -142,47 +134,28 @@ def make_rollout(config, save_path):
                     f[k][idx] = np.asarray(v)
 
         @scan_tqdm(int(config["NUM_UPDATES"]))
-        def _num_updates(runner_state, update_idx):
-            env_state_at_start, _, _ = runner_state
-            
-            def _rollout_step(runner_state, unused):
-                env_state, obsv, rng = runner_state
-                rng, _rng = jax.random.split(rng)
-                action = jax.random.randint(_rng, (config["NUM_ACTORS"],), 0, n_actions)
-                env_act = unbatchify(action, env.agents, config["NUM_ENVS"], env.num_agents)
-                env_act = {k: v.squeeze() for k, v in env_act.items()}
+        def _collect(runner_state, update_idx):
+            env_state, obsv, rng = runner_state
 
-                rng, _rng = jax.random.split(rng)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
-                )(rng_step, env_state, env_act)
-                
-                runner_state = (env_state, obsv, rng)     
-                return runner_state, None
-                
-            """One update = NUM_STEPS env steps."""
-            runner_state, _ = jax.lax.scan(
-                _rollout_step, runner_state, None, config["NUM_STEPS"]
+            arrays = (
+                [obsv[k] for k in obs_shapes.keys()]
+                + [getattr(env_state.env_state, k) for k in state_names]
             )
+            io_callback(save_to_hdf5, None, arrays, update_idx, ordered=True)
 
-            def do_save(_):
-                arrays = [obsv[k] for k in obs_shapes.keys()] + [getattr(env_state_at_start.env_state, k) for k in state_names]
-                io_callback(save_to_hdf5, None, arrays, update_idx, ordered=True)
+            rng, _rng = jax.random.split(rng)
+            reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
 
-            jax.lax.cond(
-                update_idx % config["SAVE_INTERVAL"] == 0,
-                do_save,
-                lambda _: None,
-                operand=None,
-            )
-
-            return runner_state, None
+            return (env_state, obsv, rng), None
 
         rng, _rng = jax.random.split(rng)
         runner_state = (env_state, obsv, _rng)
         runner_state, _ = jax.lax.scan(
-            _num_updates, runner_state, jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _collect,
+            runner_state,
+            jnp.arange(int(config["NUM_UPDATES"])),
+            int(config["NUM_UPDATES"]),
         )
 
         return {"runner_state": runner_state}
@@ -193,13 +166,13 @@ def make_rollout(config, save_path):
 @hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def main(config):
     config = OmegaConf.to_container(config)
-    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-    ts_str = f"{int(config['TOTAL_TIMESTEPS']):.0e}".replace("+0", "")
-    save_path = f"/app/baselines/CEC_UED/VAE/dataset/env_states_obs_{ts_str}.h5"
+    xpid    = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    ts_str  = f"{int(config['NUM_LAYOUTS']):.0e}".replace("+0", "")
+    save_path = f"/app/baselines/CEC_UED/VAE/dataset/layouts_data_{ts_str}_test.h5"
 
     rng = jax.random.PRNGKey(config["SEED"])
     rollout_fn = jax.jit(make_rollout(config, save_path), device=jax.devices()[0])
-    out = rollout_fn(rng)
+    rollout_fn(rng)
     print("Done.")
 
 if __name__ == "__main__":

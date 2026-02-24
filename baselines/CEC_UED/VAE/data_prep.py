@@ -1,4 +1,3 @@
-
 import jax.numpy as jnp
 from jaxmarl.environments.overcooked.common import (
     OBJECT_TO_INDEX,
@@ -16,11 +15,8 @@ def restore_from_obs(obs, agent_view_size=5):
     padding = agent_view_size - 1  # 4
 
     # agent_dir_idx
-    agent_0_dir_layers = obs[:, :, 2:6]
-    agent_0_dir_idx = jnp.argmax(jnp.sum(agent_0_dir_layers, axis=(0, 1)))
-
-    agent_1_dir_layers = obs[:, :, 6:10]
-    agent_1_dir_idx = jnp.argmax(jnp.sum(agent_1_dir_layers, axis=(0, 1)))
+    agent_0_dir_idx = jnp.argmax(jnp.max(obs[:, :, 2:6], axis=(0, 1)))
+    agent_1_dir_idx = jnp.argmax(jnp.max(obs[:, :, 6:10], axis=(0, 1)))
 
     agent_dir_idx = jnp.array([agent_0_dir_idx, agent_1_dir_idx])
 
@@ -49,6 +45,14 @@ def restore_from_obs(obs, agent_view_size=5):
 
     
     color_map = jnp.zeros((H, W), dtype=jnp.uint8)
+    color_map = jnp.where(obs[:, :, 11], COLOR_TO_INDEX['grey'],   color_map)  # wall
+    color_map = jnp.where(obs[:, :, 10], COLOR_TO_INDEX['black'],  color_map)  # pot
+    color_map = jnp.where(obs[:, :, 12], COLOR_TO_INDEX['yellow'], color_map)  # onion_pile
+    color_map = jnp.where(obs[:, :, 14], COLOR_TO_INDEX['white'],  color_map)  # plate_pile
+    color_map = jnp.where(obs[:, :, 15], COLOR_TO_INDEX['green'],  color_map)  # goal
+    color_map = jnp.where(obs[:, :, 23], COLOR_TO_INDEX['yellow'], color_map)  # onion
+    color_map = jnp.where(obs[:, :, 22], COLOR_TO_INDEX['white'],  color_map)  # plate
+    color_map = jnp.where(obs[:, :, 21], COLOR_TO_INDEX['white'],  color_map)  # dish
     color_map = color_map.at[y0, x0].set(COLOR_TO_INDEX['red'])
     color_map = color_map.at[y1, x1].set(COLOR_TO_INDEX['blue'])
 
@@ -68,15 +72,6 @@ def restore_from_obs(obs, agent_view_size=5):
         mode='constant',
         constant_values=0
     )
-
-    padded_color = jnp.pad(
-        color_map,
-        pad_width=((padding, padding), (padding, padding)),
-        mode='constant',
-        constant_values=0)
-
-    padded_maze_map = padded_maze_map.at[:, :, 1].set(padded_color)
-
     padded_obj = jnp.pad(
         obj_map,
         pad_width=((padding, padding), (padding, padding)),

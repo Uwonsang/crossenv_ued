@@ -14,6 +14,7 @@ from jax_tqdm import scan_tqdm
 import yaml
 from sklearn.datasets import load_digits
 from sklearn.model_selection import train_test_split
+import os
 
 
 class Encoder(nn.Module):
@@ -106,11 +107,22 @@ def make_train(config, train_data, test_data):
             (loss, (recon_loss, kl_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
             train_state = train_state.apply_gradients(grads=grads)
 
+            # evlauation on test data
+            rng, _rng_test = jax.random.split(rng)
+            test_logits, test_mean, test_std = train_state.apply_fn(train_state.params, test_data, _rng_test)
+            test_x_flat = test_data.reshape((test_data.shape[0], -1))
+            test_recon = jnp.mean(optax.sigmoid_binary_cross_entropy(test_logits, test_x_flat))
+            test_kl = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(test_std) - 1.0 + test_std**2 + test_mean**2, axis=-1))
+            test_loss = test_recon + 0.1 * test_kl
+
             metric = {
                 "loss": loss,
                 "recon_loss": recon_loss,
                 "kl_loss": kl_loss,
                 "update_step": update_idx,
+                "test_loss": test_loss,
+                "test_recon_loss": test_recon,
+                "test_kl_loss": test_kl,
             }
 
             def callback(metric):
@@ -122,7 +134,10 @@ def make_train(config, train_data, test_data):
                         f"Step: {int(metric['update_step'])}, "
                         f"Loss: {metric['loss']:.4f}, "
                         f"Recon Loss: {metric['recon_loss']:.4f}, "
-                        f"KL Loss: {metric['kl_loss']:.4f}"
+                        f"KL Loss: {metric['kl_loss']:.4f}, "
+                        f"Test Loss: {metric['test_loss']:.4f}, "
+                        f"Test Recon Loss: {metric['test_recon_loss']:.4f}, "
+                        f"Test KL Loss: {metric['test_kl_loss']:.4f}"
                     )
 
             jax.debug.callback(callback, metric)
@@ -157,7 +172,6 @@ def main(config):
         name=f"VAE_seed{config['SEED']}"
     )
 
-
     digits = load_digits()
     images_normed = (digits.images / 16) > 0.5 #불러온 이미지 정규화
     splits = train_test_split(images_normed, random_state=0)
@@ -167,6 +181,23 @@ def main(config):
     train_fn = jax.jit(make_train(config, images_train, images_test))
     out = train_fn(rng)
     print("Done.")
+
+    # visualize results
+    train_state, _ = out["runner_state"]
+    model = VAE(images_test.shape[1:], config=config)
+    rng_vis = jax.random.PRNGKey(0)
+    logits, mean, std = model.apply(train_state.params, images_test, rng_vis)
+    images_pred = jax.nn.sigmoid(logits).reshape(-1, *images_test.shape[1:])
+
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(2, 10, figsize=(6, 1.5),
+                    subplot_kw={'xticks':[], 'yticks':[]},
+                    gridspec_kw=dict(hspace=0.1, wspace=0.1))
+    for i in range(10):
+        ax[0, i].imshow(images_test[i], cmap='binary', interpolation='gaussian')
+        ax[1, i].imshow(images_pred[i], cmap='binary', interpolation='gaussian')
+    os.makedirs('vae_results', exist_ok=True)
+    plt.savefig('vae_results/vae_results.png')
 
 
 if __name__ == "__main__":

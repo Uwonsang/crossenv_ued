@@ -15,8 +15,8 @@ def restore_from_obs(obs, agent_view_size=5):
     padding = agent_view_size - 1  # 4
 
     # agent_dir_idx
-    agent_0_dir_idx = jnp.argmax(jnp.max(obs[:, :, 2:6], axis=(0, 1)))
-    agent_1_dir_idx = jnp.argmax(jnp.max(obs[:, :, 6:10], axis=(0, 1)))
+    agent_0_dir_idx = jnp.argmax(jnp.sum(obs[:, :, 2:6], axis=(0, 1)))
+    agent_1_dir_idx = jnp.argmax(jnp.sum(obs[:, :, 6:10], axis=(0, 1)))
 
     agent_dir_idx = jnp.array([agent_0_dir_idx, agent_1_dir_idx])
 
@@ -42,8 +42,6 @@ def restore_from_obs(obs, agent_view_size=5):
     y0, x0 = agent_0_pos[0], agent_0_pos[1]
     agent_1_pos = jnp.argwhere(obs[:, :, 1], size=1)[0]
     y1, x1 = agent_1_pos[0], agent_1_pos[1]
-
-    
     color_map = jnp.zeros((H, W), dtype=jnp.uint8)
     color_map = jnp.where(obs[:, :, 11], COLOR_TO_INDEX['grey'],   color_map)  # wall
     color_map = jnp.where(obs[:, :, 10], COLOR_TO_INDEX['black'],  color_map)  # pot
@@ -79,6 +77,9 @@ def restore_from_obs(obs, agent_view_size=5):
         constant_values=pad_value_obj
     )
     padded_maze_map = padded_maze_map.at[:, :, 0].set(padded_obj)
+    # Channel 2 at agent cells must be agent_dir_idx (visualizer reads obj[2] when len(agent_dir_idx) != 1)
+    padded_maze_map = padded_maze_map.at[padding + y0, padding + x0, 2].set(agent_0_dir_idx.astype(jnp.uint8))
+    padded_maze_map = padded_maze_map.at[padding + y1, padding + x1, 2].set(agent_1_dir_idx.astype(jnp.uint8))
 
     state = {
         "agent_dir_idx": agent_dir_idx,

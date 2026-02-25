@@ -1,5 +1,5 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
-"NUM_ENVS": 50
+"NUM_ENVS": 500
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
@@ -11,4 +11,4 @@
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit  
 "VIZ_STEPS": 100 # None=all, or e.g. slice(0,100), [0,1,2], 0
 "use_obs": True
-"NUM_LAYOUTS": 1e3
+"NUM_LAYOUTS": 1e7

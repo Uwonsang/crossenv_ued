@@ -168,7 +168,7 @@ def main(config):
     config = OmegaConf.to_container(config)
     xpid    = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     ts_str  = f"{int(config['NUM_LAYOUTS']):.0e}".replace("+0", "")
-    save_path = f"/app/baselines/CEC_UED/VAE/dataset/layouts_data_{ts_str}_test.h5"
+    save_path = f"/app/baselines/CEC_UED/VAE/dataset/layout_dataset_{ts_str}.h5"
 
     rng = jax.random.PRNGKey(config["SEED"])
     rollout_fn = jax.jit(make_rollout(config, save_path), device=jax.devices()[0])

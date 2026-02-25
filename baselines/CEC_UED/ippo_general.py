@@ -653,11 +653,12 @@ def main(config):
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
     
-    with open("private.yaml") as f:
-        private_info = yaml.load(f, Loader=yaml.FullLoader)
+    if config["WANDB_MODE"] == "online":
+        with open("private.yaml") as f:
+            private_info = yaml.load(f, Loader=yaml.FullLoader)
+        wandb.login(key=private_info["wandb_key"])
     
     layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],

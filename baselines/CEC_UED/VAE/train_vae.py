@@ -8,62 +8,122 @@ from flax.linen.initializers import constant, orthogonal
 import hydra
 from omegaconf import OmegaConf
 
-
 import wandb
 from jax_tqdm import scan_tqdm
 import yaml
-from sklearn.datasets import load_digits
-from sklearn.model_selection import train_test_split
+import h5py
 import os
 
+def load_h5(path, config):
+    with h5py.File(path, "r") as f:
+        return {k: f[k][:1000].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
+
+def split_dataset(dataset, validation_ratio, rng):
+    """Split into train/val by random permutation. dataset: array of shape (N, ...)."""
+    num_data = len(dataset)
+    random_indices = jax.random.permutation(rng, jnp.arange(num_data))
+    validation_split = int(validation_ratio * num_data)
+    train_indices = random_indices[:-validation_split]
+    validation_indices = random_indices[-validation_split:]
+    return dataset[train_indices], dataset[validation_indices]
+        
 
 class Encoder(nn.Module):
-    hidden_size: int
     latent_size: int
 
     @nn.compact
     def __call__(self, x):
-        x = nn.Dense(self.hidden_size, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(x)
+
+        x = nn.Conv(
+            features=16,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
         x = nn.relu(x)
-        mean = nn.Dense(self.latent_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+
+        x = nn.Conv(
+            features=12,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.relu(x)
+
+        x = nn.Conv(
+            features=8,
+            kernel_size=(3, 3),
+            strides=(2, 2),
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(x)
+        x = nn.relu(x)
+
+        x = x.reshape((x.shape[0], -1))  # (B, 72)
+        mean    = nn.Dense(self.latent_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
         log_std = nn.Dense(self.latent_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
         return mean, log_std
 
-
 class Decoder(nn.Module):
-    hidden_size: int
-    output_size: int
-
     @nn.compact
     def __call__(self, z):
-        z = nn.Dense(self.hidden_size, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(z)
+        z = nn.Dense(3 * 3 * 8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
         z = nn.relu(z)
-        logits = nn.Dense(self.output_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
-        return logits
+        z = z.reshape((z.shape[0], 3, 3, 8))           # (B,3,3,8)
+
+        z = nn.ConvTranspose(
+            features=12,
+            kernel_size=(5, 5),
+            strides=(2, 2),
+            padding='VALID',              
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(z)
+        z = nn.relu(z) # (B,9,9,12)
+
+        z = nn.ConvTranspose(
+            features=16,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding='SAME',
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+        )(z)
+        z = nn.relu(z) # (B,9,9,16)
+
+        z = nn.Conv(
+            features=26,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding='SAME',
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+        )(z) # (B,9,9,26)
+        
+        return z
 
 
 class VAE(nn.Module):
     image_shape: int
-    config: int
+    config: dict
 
     @nn.compact
     def __call__(self, x, rng):
-        input_size = int(np.prod(self.image_shape))
-        x = x.reshape((x.shape[0], -1))
-
-        mean, log_std = Encoder(self.config['HIDDEN_SIZE'], self.config['LATENT_SIZE'])(x)
+        # x: (B,9,9,26)
+        mean, log_std = Encoder(self.config['LATENT_SIZE'])(x)
         std = jnp.exp(log_std)
 
         rng, _rng = jax.random.split(rng)
         z = mean + std * jax.random.normal(_rng, mean.shape)
-       
-        logits = Decoder(self.config['HIDDEN_SIZE'], input_size)(z)
 
-        return logits, mean, std
+        recon = Decoder()(z) 
+
+        return recon, mean, std
 
 
 def make_train(config, train_data, test_data):
-    """data: jnp.array of shape (N, input_size)"""
 
     n_samples = train_data.shape[0]
     input_shape = train_data.shape[1:]
@@ -87,31 +147,34 @@ def make_train(config, train_data, test_data):
             train_state, rng = runner_state
 
             rng, _rng_batch, _rng_vae = jax.random.split(rng, 3)
-            batch_idx = jax.random.randint(_rng_batch, (batch_size,), 0, n_samples)
+            batch_idx = jax.random.randint(_rng_batch, (batch_size,), 0, n_samples) 
             batch = train_data[batch_idx]
 
-            def loss_fn(params):
-                def vae_loss(params, apply_fn, x, rng):
-                    logits, mean, std = apply_fn(params, x, rng)
-                    
-                    x_flat = x.reshape((x.shape[0], -1))
-                    reconstruction_loss = jnp.mean(
-                        optax.sigmoid_binary_cross_entropy(logits, x_flat)
-                    )
-                    kl_loss = jnp.mean(
-                        0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std ** 2 + mean ** 2, axis=-1)
-                    )
-                    return reconstruction_loss + 0.1 * kl_loss, (reconstruction_loss, kl_loss)
-                return vae_loss(params, train_state.apply_fn, batch, _rng_vae)
+            def vae_loss(params, apply_fn, x, rng):
+                logits, mean, std = apply_fn(params, x, rng)
 
-            (loss, (recon_loss, kl_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(train_state.params)
+                x_flat = x.reshape((x.shape[0], -1))
+                logits_flat = logits.reshape((logits.shape[0], -1))
+
+                reconstruction_loss = jnp.mean(
+                    optax.sigmoid_binary_cross_entropy(logits_flat, x_flat)
+                )
+                kl_loss = jnp.mean(
+                    0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1)
+                )
+                return reconstruction_loss + 0.1 * kl_loss, (reconstruction_loss, kl_loss)
+
+            (loss, (recon_loss, kl_loss)), grads = jax.value_and_grad(vae_loss, has_aux=True)(
+                train_state.params, train_state.apply_fn, batch, _rng_vae
+                )
             train_state = train_state.apply_gradients(grads=grads)
 
             # evlauation on test data
             rng, _rng_test = jax.random.split(rng)
             test_logits, test_mean, test_std = train_state.apply_fn(train_state.params, test_data, _rng_test)
             test_x_flat = test_data.reshape((test_data.shape[0], -1))
-            test_recon = jnp.mean(optax.sigmoid_binary_cross_entropy(test_logits, test_x_flat))
+            test_logits_flat = test_logits.reshape((test_logits.shape[0], -1))  # 추가
+            test_recon = jnp.mean(optax.sigmoid_binary_cross_entropy(test_logits_flat, test_x_flat))
             test_kl = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(test_std) - 1.0 + test_std**2 + test_mean**2, axis=-1))
             test_loss = test_recon + 0.1 * test_kl
 
@@ -154,7 +217,7 @@ def make_train(config, train_data, test_data):
 
     return train
 
-@hydra.main(version_base=None, config_path="../config", config_name="vae_config")
+@hydra.main(version_base=None, config_path="config", config_name="vae_config")
 def main(config):
     config = OmegaConf.to_container(config)
 
@@ -172,14 +235,16 @@ def main(config):
         name=f"VAE_seed{config['SEED']}"
     )
 
-    digits = load_digits()
-    images_normed = (digits.images / 16) > 0.5 #불러온 이미지 정규화
-    splits = train_test_split(images_normed, random_state=0)
-    images_train, images_test = map(jnp.asarray, splits)
-
     rng = jax.random.PRNGKey(config["SEED"])
+    rng_data, rng_train = jax.random.split(rng)
+
+    data = load_h5(config["LAYOUT_DATA_PATH"], config)
+    full_dataset = jnp.asarray(data["agent_0"])
+    images_train, images_test = split_dataset(
+        full_dataset, config["VALIDATION_RATIO"], rng=rng_data)
+
     train_fn = jax.jit(make_train(config, images_train, images_test))
-    out = train_fn(rng)
+    out = train_fn(rng_train)
     print("Done.")
 
     # visualize results
@@ -189,15 +254,8 @@ def main(config):
     logits, mean, std = model.apply(train_state.params, images_test, rng_vis)
     images_pred = jax.nn.sigmoid(logits).reshape(-1, *images_test.shape[1:])
 
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(2, 10, figsize=(6, 1.5),
-                    subplot_kw={'xticks':[], 'yticks':[]},
-                    gridspec_kw=dict(hspace=0.1, wspace=0.1))
-    for i in range(10):
-        ax[0, i].imshow(images_test[i], cmap='binary', interpolation='gaussian')
-        ax[1, i].imshow(images_pred[i], cmap='binary', interpolation='gaussian')
-    os.makedirs('vae_results', exist_ok=True)
-    plt.savefig('vae_results/vae_results.png')
+    breakpoint()
+    print(123)
 
 
 if __name__ == "__main__":

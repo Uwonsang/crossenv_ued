@@ -1,9 +1,11 @@
 "SEED": 0
 "BATCH_SIZE": 128
-"NUM_EPOCHS": 3000
+"NUM_EPOCHS": 1000
+"VALIDATION_RATIO": 0.3
 "LR": 1e-3
 "HIDDEN_SIZE": 32
 "LATENT_SIZE": 8
+LAYOUT_DATA_PATH : "/app/baselines/CEC_UED/VAE/dataset/layout_dataset_1e7.h5"
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"

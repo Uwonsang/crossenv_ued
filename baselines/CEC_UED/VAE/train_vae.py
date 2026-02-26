@@ -9,17 +9,18 @@ import hydra
 from omegaconf import OmegaConf
 
 import wandb
-from jax_tqdm import scan_tqdm
 import yaml
 import h5py
+from tqdm import tqdm
+import pickle
 
 def load_h5(path, config):
     with h5py.File(path, "r") as f:
-        return {k: f[k][:1000].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
+        return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
 
-def split_dataset(dataset, validation_ratio, rng):
+def split_dataset(dataset, validation_ratio):
     num_data = len(dataset)
-    random_indices = jax.random.permutation(rng, jnp.arange(num_data))
+    random_indices = np.random.permutation(np.arange(num_data))
     validation_split = int(validation_ratio * num_data)
     train_indices = random_indices[:-validation_split]
     validation_indices = random_indices[-validation_split:]
@@ -127,94 +128,72 @@ def make_train(config, train_data, test_data):
     train_batch_size = config["BATCH_SIZE_TRAIN"]
     test_batch_size = config["BATCH_SIZE_TEST"]
     num_epochs = config["NUM_EPOCHS"]
-    
+    steps_per_epoch = n_train_samples // train_batch_size
+
     def train(rng):
-        # INIT NETWORK
         model = VAE(input_shape, config=config)
-        
         rng, _rng = jax.random.split(rng)
-        init_x = jnp.zeros((1, *input_shape))
-        init_rng = jax.random.PRNGKey(0)
-        params = model.init(_rng, init_x, init_rng)
+        params = model.init(_rng, jnp.zeros((1, *input_shape)), jax.random.PRNGKey(0))
+        train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(config["LR"]))
 
-        tx = optax.adam(config["LR"])
-        train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+        def vae_loss(params, apply_fn, x, rng):
+            logits, mean, std = apply_fn(params, x, rng)
+            x_flat      = x.reshape((x.shape[0], -1))
+            logits_flat = logits.reshape((logits.shape[0], -1))
+            recon_loss  = jnp.mean(optax.sigmoid_binary_cross_entropy(logits_flat, x_flat))
+            kl_loss     = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1))
+            return recon_loss + 0.1 * kl_loss, (recon_loss, kl_loss)
 
-        @scan_tqdm(num_epochs)
-        def _update_step(runner_state, epoch_idx):
-            train_state, rng = runner_state
+        jit_update = jax.jit(jax.value_and_grad(vae_loss, has_aux=True), static_argnums=(1,))
+        jit_eval   = jax.jit(vae_loss, static_argnums=(1,))
 
-            rng, _rng_train_batch, _rng_vae = jax.random.split(rng, 3)
-            train_batch_idx = jax.random.randint(_rng_train_batch, (train_batch_size,), 0, n_train_samples) 
-            train_batch = train_data[train_batch_idx]
+        for epoch in tqdm(range(num_epochs)):
+            perm = np.random.permutation(n_train_samples)
+            epoch_losses, epoch_recons, epoch_kls = [], [], []
 
-            def vae_loss(params, apply_fn, x, rng):
-                logits, mean, std = apply_fn(params, x, rng)
+            for step in tqdm(range(steps_per_epoch)):
+                idx = perm[step * train_batch_size : (step + 1) * train_batch_size]
+                train_batch = jnp.array(train_data[idx])
 
-                x_flat = x.reshape((x.shape[0], -1))
-                logits_flat = logits.reshape((logits.shape[0], -1))
-
-                reconstruction_loss = jnp.mean(
-                    optax.sigmoid_binary_cross_entropy(logits_flat, x_flat)
+                rng, _rng_vae = jax.random.split(rng)
+                (loss, (recon_loss, kl_loss)), grads = jit_update(
+                    train_state.params, train_state.apply_fn, train_batch, _rng_vae
                 )
-                kl_loss = jnp.mean(
-                    0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1)
+                train_state = train_state.apply_gradients(grads=grads)
+                epoch_losses.append(float(loss))
+                epoch_recons.append(float(recon_loss))
+                epoch_kls.append(float(kl_loss))
+
+            # test eval (epoch당 1회, 전체 test 순회)
+            # test_steps = n_test_samples // test_batch_size
+            # test_perm  = np.random.permutation(n_test_samples)
+            # test_losses, test_recons, test_kls = [], [], []
+
+            # for step in range(test_steps):
+            #     idx = test_perm[step * test_batch_size : (step + 1) * test_batch_size]
+            #     test_batch = jnp.array(test_data[idx])
+            #     rng, _rng_test = jax.random.split(rng)
+            #     test_loss, (test_recon, test_kl) = jit_eval(
+            #         train_state.params, test_batch, _rng_test
+            #     )
+            #     test_losses.append(float(test_loss))
+            #     test_recons.append(float(test_recon))
+            #     test_kls.append(float(test_kl))
+
+            wandb.log({
+                "loss": np.mean(epoch_losses), "recon_loss": np.mean(epoch_recons), "kl_loss": np.mean(epoch_kls),
+                # "test_loss": np.mean(test_losses), "test_recon_loss": np.mean(test_recons), "test_kl_loss": np.mean(test_kls),
+                "epoch": epoch,
+            })
+
+            if epoch % 10 == 0:
+                print(
+                    f"Epoch {epoch} | Loss: {np.mean(epoch_losses):.4f} | Recon: {np.mean(epoch_recons):.4f} | "
+                    f"KL: {np.mean(epoch_kls):.4f}"
                 )
-                return reconstruction_loss + 0.1 * kl_loss, (reconstruction_loss, kl_loss)
+                # | Test Loss: {np.mean(test_losses):.4f
 
-            (loss, (recon_loss, kl_loss)), grads = jax.value_and_grad(vae_loss, has_aux=True)(
-                train_state.params, train_state.apply_fn, train_batch, _rng_vae
-                )
-            train_state = train_state.apply_gradients(grads=grads)
-
-            # evlauation on test data
-            rng, _rng_test_batch, _rng_test_vae = jax.random.split(rng, 3)
-            test_batch_idx = jax.random.randint(_rng_test_batch, (test_batch_size,), 0, n_test_samples) 
-            test_batch = test_data[test_batch_idx]
-
-            test_logits, test_mean, test_std = train_state.apply_fn(train_state.params, test_batch, _rng_test_vae)
-            test_x_flat = test_batch.reshape((test_batch.shape[0], -1))
-            test_logits_flat = test_logits.reshape((test_logits.shape[0], -1))  # 추가
-            test_recon = jnp.mean(optax.sigmoid_binary_cross_entropy(test_logits_flat, test_x_flat))
-            test_kl = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(test_std) - 1.0 + test_std**2 + test_mean**2, axis=-1))
-            test_loss = test_recon + 0.1 * test_kl
-
-            metric = {
-                "loss": loss,
-                "recon_loss": recon_loss,
-                "kl_loss": kl_loss,
-                "epoch_idx": epoch_idx,
-                "test_loss": test_loss,
-                "test_recon_loss": test_recon,
-                "test_kl_loss": test_kl,
-            }
-
-            def callback(metric):
-                wandb.log({k: float(v) for k, v in metric.items()})
-                # Only log every N steps
-                PRINT_INTERVAL = 100
-                if int(metric["epoch_idx"]) % PRINT_INTERVAL == 0:
-                    print(
-                        f"Step: {int(metric['epoch_idx'])}, "
-                        f"Loss: {metric['loss']:.4f}, "
-                        f"Recon Loss: {metric['recon_loss']:.4f}, "
-                        f"KL Loss: {metric['kl_loss']:.4f}, "
-                        f"Test Loss: {metric['test_loss']:.4f}, "
-                        f"Test Recon Loss: {metric['test_recon_loss']:.4f}, "
-                        f"Test KL Loss: {metric['test_kl_loss']:.4f}"
-                    )
-
-            jax.debug.callback(callback, metric)
-
-            return (train_state, rng), metric
-
-        rng, _rng = jax.random.split(rng)
-        runner_state = (train_state, _rng)
-        runner_state, metrics = jax.lax.scan(
-            _update_step, runner_state, jnp.arange(num_epochs), num_epochs
-        )
-
-        return {"runner_state": runner_state, "metrics": metrics}
+        return {"train_state": train_state, "key": rng}
 
     return train
 
@@ -237,24 +216,20 @@ def main(config):
     )
 
     rng = jax.random.PRNGKey(config["SEED"])
-    rng_data, rng_train = jax.random.split(rng)
+    rng, rng_train = jax.random.split(rng)
 
     data = load_h5(config["LAYOUT_DATA_PATH"], config)
-    full_dataset = jnp.asarray(data["agent_0"])
     images_train, images_test = split_dataset(
-        full_dataset, config["VALIDATION_RATIO"], rng=rng_data)
+        data["agent_0"], config["VALIDATION_RATIO"])
 
-    train_fn = jax.jit(make_train(config, images_train, images_test))
+    train_fn = make_train(config, images_train, images_test)
     out = train_fn(rng_train)
+    
+    # after training, save the model
+    os.makedirs("baselines/CEC_UED/VAE/checkpoints", exist_ok=True)
+    with open(f"baselines/CEC_UED/VAE/checkpoints/vae_seed{config['SEED']}.pkl", "wb") as f:
+        pickle.dump({'params': out["train_state"], 'key': out["key"]}, f)
     print("Done.")
-
-    # visualize results
-    # train_state, _ = out["runner_state"]
-    # model = VAE(images_test.shape[1:], config=config)
-    # rng_vis = jax.random.PRNGKey(0)
-    # logits, mean, std = model.apply(train_state.params, images_test, rng_vis)
-    # images_pred = jax.nn.sigmoid(logits).reshape(-1, *images_test.shape[1:])
-
 
 if __name__ == "__main__":
     main()

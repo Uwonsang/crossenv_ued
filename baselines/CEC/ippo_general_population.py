@@ -138,14 +138,13 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
+                reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                # features=64 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked")else 2 * self.config["FC_DIM_SIZE"],
                 features=64,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
@@ -153,7 +152,6 @@ class ActorCriticRNN(nn.Module):
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             embedding = nn.Conv(
-                # features=32 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked") else self.config["FC_DIM_SIZE"],
                 features=32,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
@@ -594,9 +592,7 @@ def make_train(config, update_step=0, filepath=""):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
+                        "env_step": metric["update_steps"].astype(jnp.int64) * config["NUM_ENVS"] * config["NUM_STEPS"],
                         **metric["loss"],
                     }
                 )

@@ -597,9 +597,7 @@ def make_train(config, update_step=0):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
+                        "env_step": metric["update_steps"].astype(jnp.int64) * config["NUM_ENVS"] * config["NUM_STEPS"],
                         **metric["loss"],
                     }
                 )

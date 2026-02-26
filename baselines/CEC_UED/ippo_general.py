@@ -139,9 +139,9 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
+                reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
@@ -597,9 +597,7 @@ def make_train(config, update_step=0):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
+                        "env_step": metric["update_steps"].astype(jnp.int64) * config["NUM_ENVS"] * config["NUM_STEPS"],
                         **metric["loss"],
                     }
                 )

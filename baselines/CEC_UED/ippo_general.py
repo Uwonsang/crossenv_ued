@@ -5,6 +5,7 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
 import pickle
 import jax
 import jax.numpy as jnp
@@ -597,7 +598,7 @@ def make_train(config, update_step=0):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "env_step": metric["update_steps"].astype(jnp.int64) * config["NUM_ENVS"] * config["NUM_STEPS"],
+                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                         **metric["loss"],
                     }
                 )

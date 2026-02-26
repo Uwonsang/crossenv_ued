@@ -1,6 +1,8 @@
 """ 
 Based on PureJaxRL Implementation of PPO
 """
+import os
+os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
 
 import jax
 import jax.numpy as jnp

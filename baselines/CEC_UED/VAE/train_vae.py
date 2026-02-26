@@ -17,7 +17,7 @@ import os
 
 def load_h5(path):
     with h5py.File(path, "r") as f:
-        return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
+        return {k: f[k][:100].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
 
 def split_dataset(dataset, validation_ratio):
     num_data = len(dataset)
@@ -44,7 +44,6 @@ class DataLoader:
             yield jnp.array(self.data[batch_idx])
 
 class Encoder(nn.Module):
-    latent_size: int
 
     @nn.compact
     def __call__(self, x):
@@ -76,9 +75,9 @@ class Encoder(nn.Module):
         )(x)
         x = nn.relu(x)
 
-        x = x.reshape((x.shape[0], -1))  # (B, 72)
-        mean    = nn.Dense(self.latent_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        log_std = nn.Dense(self.latent_size, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        x = x.reshape((x.shape[0], -1))
+        mean = nn.Dense(8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        log_std = nn.Dense(8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
         return mean, log_std
 
 class Decoder(nn.Module):
@@ -87,7 +86,7 @@ class Decoder(nn.Module):
     def __call__(self, z):
         z = nn.Dense(3 * 3 * 8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
         z = nn.relu(z)
-        z = z.reshape((z.shape[0], 3, 3, 8))           # (B,3,3,8)
+        z = z.reshape((z.shape[0], 3, 3, 8)) # (B,3,3,8)
 
         z = nn.ConvTranspose(
             features=12,
@@ -127,7 +126,7 @@ class VAE(nn.Module):
     @nn.compact
     def __call__(self, x, rng):
         # x: (B,9,9,26)
-        mean, log_std = Encoder(self.config['LATENT_SIZE'])(x)
+        mean, log_std = Encoder()(x)
         std = jnp.exp(log_std)
 
         rng, _rng = jax.random.split(rng)
@@ -160,7 +159,7 @@ def make_train(config, train_data, test_data):
             logits_flat = logits.reshape((logits.shape[0], -1))
             recon_loss  = jnp.mean(optax.sigmoid_binary_cross_entropy(logits_flat, x_flat))
             kl_loss     = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1))
-            return recon_loss + 0.1 * kl_loss, (recon_loss, kl_loss)
+            return recon_loss + config["BETA"] * kl_loss, (recon_loss, kl_loss)
 
         jit_update = jax.jit(jax.value_and_grad(vae_loss, has_aux=True), static_argnums=(1,))
         jit_eval   = jax.jit(vae_loss, static_argnums=(1,))

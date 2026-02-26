@@ -13,8 +13,9 @@ import yaml
 import h5py
 from tqdm import tqdm
 import pickle
+import os
 
-def load_h5(path, config):
+def load_h5(path):
     with h5py.File(path, "r") as f:
         return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
 
@@ -25,6 +26,22 @@ def split_dataset(dataset, validation_ratio):
     train_indices = random_indices[:-validation_split]
     validation_indices = random_indices[-validation_split:]
     return dataset[train_indices], dataset[validation_indices]
+
+class DataLoader:
+    def __init__(self, data, batch_size, shuffle=True):
+        self.data = data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n_samples = len(data)
+
+    def __len__(self):
+        return self.n_samples // self.batch_size
+
+    def __iter__(self):
+        indices = np.random.permutation(self.n_samples) if self.shuffle else np.arange(self.n_samples)
+        for i in range(len(self)):
+            batch_idx = indices[i * self.batch_size : (i + 1) * self.batch_size]
+            yield jnp.array(self.data[batch_idx])
 
 class Encoder(nn.Module):
     latent_size: int
@@ -65,6 +82,7 @@ class Encoder(nn.Module):
         return mean, log_std
 
 class Decoder(nn.Module):
+    
     @nn.compact
     def __call__(self, z):
         z = nn.Dense(3 * 3 * 8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
@@ -125,10 +143,10 @@ def make_train(config, train_data, test_data):
     n_train_samples = train_data.shape[0]
     n_test_samples = test_data.shape[0]
     input_shape = train_data.shape[1:]
-    train_batch_size = config["BATCH_SIZE_TRAIN"]
-    test_batch_size = config["BATCH_SIZE_TEST"]
     num_epochs = config["NUM_EPOCHS"]
-    steps_per_epoch = n_train_samples // train_batch_size
+
+    train_loader = DataLoader(train_data, config["BATCH_SIZE_TRAIN"], shuffle=True)
+    test_loader = DataLoader(test_data, config["BATCH_SIZE_TEST"], shuffle=False)
 
     def train(rng):
         model = VAE(input_shape, config=config)
@@ -148,50 +166,38 @@ def make_train(config, train_data, test_data):
         jit_eval   = jax.jit(vae_loss, static_argnums=(1,))
 
         for epoch in tqdm(range(num_epochs)):
-            perm = np.random.permutation(n_train_samples)
             epoch_losses, epoch_recons, epoch_kls = [], [], []
+            epoch_test_losses, epoch_test_recons, epoch_test_kls = [], [], []
 
-            for step in tqdm(range(steps_per_epoch)):
-                idx = perm[step * train_batch_size : (step + 1) * train_batch_size]
-                train_batch = jnp.array(train_data[idx])
-
+            for train_batch in tqdm(train_loader):
                 rng, _rng_vae = jax.random.split(rng)
                 (loss, (recon_loss, kl_loss)), grads = jit_update(
-                    train_state.params, train_state.apply_fn, train_batch, _rng_vae
-                )
+                    train_state.params, train_state.apply_fn, train_batch, _rng_vae)
+
                 train_state = train_state.apply_gradients(grads=grads)
                 epoch_losses.append(float(loss))
                 epoch_recons.append(float(recon_loss))
                 epoch_kls.append(float(kl_loss))
 
-            # test eval (epoch당 1회, 전체 test 순회)
-            # test_steps = n_test_samples // test_batch_size
-            # test_perm  = np.random.permutation(n_test_samples)
-            # test_losses, test_recons, test_kls = [], [], []
-
-            # for step in range(test_steps):
-            #     idx = test_perm[step * test_batch_size : (step + 1) * test_batch_size]
-            #     test_batch = jnp.array(test_data[idx])
-            #     rng, _rng_test = jax.random.split(rng)
-            #     test_loss, (test_recon, test_kl) = jit_eval(
-            #         train_state.params, test_batch, _rng_test
-            #     )
-            #     test_losses.append(float(test_loss))
-            #     test_recons.append(float(test_recon))
-            #     test_kls.append(float(test_kl))
+            for test_batch in tqdm(test_loader):
+                rng, _rng_test = jax.random.split(rng)
+                test_loss, (test_recon, test_kl) = jit_eval(train_state.params, train_state.apply_fn, test_batch, _rng_test)
+                epoch_test_losses.append(float(test_loss))
+                epoch_test_recons.append(float(test_recon))
+                epoch_test_kls.append(float(test_kl))
 
             wandb.log({
                 "loss": np.mean(epoch_losses), "recon_loss": np.mean(epoch_recons), "kl_loss": np.mean(epoch_kls),
-                # "test_loss": np.mean(test_losses), "test_recon_loss": np.mean(test_recons), "test_kl_loss": np.mean(test_kls),
+                "test_loss": np.mean(epoch_test_losses), "test_recon_loss": np.mean(epoch_test_recons), "test_kl_loss": np.mean(epoch_test_kls),
                 "epoch": epoch,
             })
 
             if epoch % 10 == 0:
                 print(
                     f"Epoch {epoch} | Loss: {np.mean(epoch_losses):.4f} | Recon: {np.mean(epoch_recons):.4f} | "
-                    f"KL: {np.mean(epoch_kls):.4f}"
+                    f"KL: {np.mean(epoch_kls):.4f} | Test Loss: {np.mean(epoch_test_losses):.4f}"
                 )
-                # | Test Loss: {np.mean(test_losses):.4f
+
 
         return {"train_state": train_state, "key": rng}
 
@@ -218,7 +224,7 @@ def main(config):
     rng = jax.random.PRNGKey(config["SEED"])
     rng, rng_train = jax.random.split(rng)
 
-    data = load_h5(config["LAYOUT_DATA_PATH"], config)
+    data = load_h5(config["LAYOUT_DATA_PATH"])
     images_train, images_test = split_dataset(
         data["agent_0"], config["VALIDATION_RATIO"])
 
@@ -226,9 +232,9 @@ def main(config):
     out = train_fn(rng_train)
     
     # after training, save the model
-    os.makedirs("baselines/CEC_UED/VAE/checkpoints", exist_ok=True)
-    with open(f"baselines/CEC_UED/VAE/checkpoints/vae_seed{config['SEED']}.pkl", "wb") as f:
-        pickle.dump({'params': out["train_state"], 'key': out["key"]}, f)
+    os.makedirs("/app/baselines/CEC_UED/VAE/checkpoints", exist_ok=True)
+    with open(f"/app/baselines/CEC_UED/VAE/checkpoints/vae_seed{config['SEED']}.pkl", "wb") as f:
+        pickle.dump({'params': out["train_state"].params, 'config': config, 'key': out["key"]}, f)
     print("Done.")
 
 if __name__ == "__main__":

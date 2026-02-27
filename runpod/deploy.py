@@ -81,11 +81,11 @@ def create_pod_config_from_yaml(config_data):
 
     cmd_str = " && ".join(cmd) if cmd else ""
 
-    # 필수 필드는 없으면 명시적으로 에러를 던져서 YAML을 바로 수정하게 만든다.
     name = config_data.get('name')
     template_id = pod_cfg.get('template_id')
     gpu = pod_cfg.get('gpu')
     gpu_count = pod_cfg.get('gpu_count')
+    network_volume_id = pod_cfg.get('network_volume_id')
 
     missing = []
     if name is None:
@@ -105,6 +105,7 @@ def create_pod_config_from_yaml(config_data):
         'templateId': template_id,
         'gpuTypeIds': [gpu],
         'gpuCount': gpu_count,
+        'networkVolumeId': network_volume_id
     }
 
     if pod_cfg.get('spot'):
@@ -217,7 +218,7 @@ def run_single_pod(pod_config, status_dict, pod_id_key, API_KEY, log_queue):
     try:
         hash_str = os.urandom(4).hex()
         date_str = datetime.now().strftime('%Y%m%d-%H%M%S')
-        pod_name = f"crossenv_ued-{hash_str}-{date_str}"
+        pod_name = f"{pod_config['name']}-{hash_str}-{date_str}"
 
         # Update status - initialize immediately with the pod name
         update_status(pod_id_key,
@@ -236,10 +237,10 @@ def run_single_pod(pod_config, status_dict, pod_id_key, API_KEY, log_queue):
         # RunPod API 요청용 설정 (내부 설정 제외)
         runpod_request = {
             'name': pod_name,
-            'templateId': "7oppv1xad7",
-            'gpuTypeIds': ["NVIDIA GeForce RTX 5090"],
-            'gpuCount': 1,
-            'networkVolumeId': 'c4fddrd4z9'
+            'templateId': pod_config['templateId'],
+            'gpuTypeIds': pod_config['gpuTypeIds'],
+            'gpuCount': pod_config['gpuCount'],
+            'networkVolumeId': pod_config['networkVolumeId']
         }
 
         # dockerStartCmd가 있으면 추가

@@ -37,28 +37,12 @@ import runpod
 import requests
 from dotenv import load_dotenv
 
-base_url = 'https://rest.runpod.io/v1'
 
-# Global tracking for cleanup
-_active_pods = {}  # {pod_id: API_KEY}
+_active_pods = {} 
 _cleanup_lock = None
 _console = Console()
 
-defaults = {
-    'name': f'pcg-{" ".join(time.ctime().split()[1:-1])}',
-    'template_id': 'zkat0jqlju',
-    'gpu': 'NVIDIA RTX A4000',
-    'gpu_count': 1,
-    'spot': False,
-    'commands': []
-}
-
-# ---
-command_folder_path = os.path.join(__file__.rstrip('train_in_runpod.py'), 'model')
-config_folder_path = os.path.join(__file__.rstrip('train_in_runpod.py'), 'config')
-
-
-# ---
+config_folder_path = os.path.join(os.path.dirname(__file__), 'config')
 
 class CmdType(Enum):
     TRAIN = "TRAIN"
@@ -67,63 +51,33 @@ class CmdType(Enum):
 
 
 def parse_args():
-    conf_parser = argparse.ArgumentParser(add_help=False)
-    conf_parser.add_argument("-c", "--config", type=str, help="YAML config file path", default=f'config.yaml')
-    conf_parser.add_argument("--configs", type=str, nargs='+', help="Multiple YAML config files for multi-pod execution")
-    temp_args, remaining_argv = conf_parser.parse_known_args()
-
-    config_path = os.path.join(config_folder_path, temp_args.config)
-
-    if temp_args.config and Path(config_path).exists():
-        with open(config_path, "r") as f:
-            data = yaml.safe_load(f)
-
-            pod_cfg = data.get('pod', {})
-            opt_cfg = data.get('options', {})
-
-            yaml_updates = {
-                'template_id': pod_cfg.get('template_id'),
-                'gpu': pod_cfg.get('gpu'),
-                'gpu_count': pod_cfg.get('gpu_count'),
-            }
-
-            yaml_updates = {k: v for k, v in yaml_updates.items() if v is not None}
-            commands = []
-            for entry in data.get('runtime', {}).get('cmds', []):
-                cmd_type = next(iter(entry))
-                if cmd_type == CmdType.TRAIN.value:
-                    commands.append((CmdType.TRAIN, dict(islice(entry.items(), 1, None))))
-                else:
-                    commands.append((CmdType(cmd_type), None))
-
-            yaml_updates['commands'] = commands
-            defaults.update(yaml_updates)
-
-    parser = argparse.ArgumentParser(parents=[conf_parser])
-
-    parser.add_argument('--name', type=str)
-
-    parser.add_argument('--template-id', type=str)
-    parser.add_argument('--gpu', type=str)
-    parser.add_argument('--gpu-count', type=int)
-    parser.add_argument('--spot', action=argparse.BooleanOptionalAction)
-
-    parser.add_argument('--timeout', action=argparse.BooleanOptionalAction)
-    parser.add_argument('--time-limit', type=float)
-    parser.add_argument('--terminate', action=argparse.BooleanOptionalAction)
-
-    parser.set_defaults(**defaults)
-
+    """
+    어떤 YAML 설정 파일을 사용할지에 대해서만 인자를 받는다.
+    실제 pod 설정(name, gpu 등)은 전부 YAML에서 읽는다.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-c",
+        "--config",
+        type=str,
+        help="Single YAML config file name (looked up under runpod/config)",
+    )
+    parser.add_argument(
+        "--configs",
+        type=str,
+        nargs="+",
+        help="Multiple YAML config files (paths or names) for multi-pod execution",
+    )
     args = parser.parse_args()
 
-    # If configs is specified, use it
-    if temp_args.configs:
-        args.configs = temp_args.configs
+    # config / configs 둘 다 없는 경우는 허용하지 않는다.
+    if not args.config and not args.configs:
+        parser.error("One of --config or --configs must be provided.")
 
     return args
 
 
-def create_pod_config_from_yaml(config_data, args):
+def create_pod_config_from_yaml(config_data):
     """Create pod configuration from yaml data"""
     pod_cfg = config_data.get('pod', {})
 
@@ -133,25 +87,44 @@ def create_pod_config_from_yaml(config_data, args):
 
     cmd_str = " && ".join(cmd) if cmd else ""
 
+    # 필수 필드는 없으면 명시적으로 에러를 던져서 YAML을 바로 수정하게 만든다.
+    name = config_data.get('name')
+    template_id = pod_cfg.get('template_id')
+    gpu = pod_cfg.get('gpu')
+    gpu_count = pod_cfg.get('gpu_count')
+
+    missing = []
+    if name is None:
+        missing.append("name")
+    if template_id is None:
+        missing.append("pod.template_id")
+    if gpu is None:
+        missing.append("pod.gpu")
+    if gpu_count is None:
+        missing.append("pod.gpu_count")
+    if missing:
+        raise ValueError(f"Missing required fields in config: {', '.join(missing)}")
+
     # RunPod API configuration
     runpod_config = {
-        'name': config_data.get('name', args.name),
-        'templateId': pod_cfg.get('template_id', args.template_id),
-        'gpuTypeIds': [pod_cfg.get('gpu', args.gpu)],
-        'gpuCount': pod_cfg.get('gpu_count', args.gpu_count),
+        'name': name,
+        'templateId': template_id,
+        'gpuTypeIds': [gpu],
+        'gpuCount': gpu_count,
     }
 
-    if pod_cfg.get('spot', args.spot):
+    if pod_cfg.get('spot'):
         runpod_config['interruptible'] = True
 
     if cmd_str:
         runpod_config['dockerStartCmd'] = ['bash', '-lc', cmd_str]
 
     # Internal configuration for monitoring and termination
+    options_cfg = config_data.get('options', {})
     internal_config = {
-        'timeout': config_data.get('options', {}).get('timeout', getattr(args, 'timeout', False)),
-        'time_limit': config_data.get('options', {}).get('time_limit', getattr(args, 'time_limit', 7200)),
-        'terminate': config_data.get('options', {}).get('terminate', getattr(args, 'terminate', True)),
+        'timeout': options_cfg.get('timeout', False),
+        'time_limit': options_cfg.get('time_limit', 7200),
+        'terminate': options_cfg.get('terminate', True),
     }
 
     # Combine configurations
@@ -248,10 +221,9 @@ def run_single_pod(pod_config, status_dict, pod_id_key, API_KEY, log_queue):
                 log_queue.append(log_msg)
 
     try:
-        # make name pcg-shortmd5-<timestamp> first
         hash_str = os.urandom(4).hex()
         date_str = datetime.now().strftime('%Y%m%d-%H%M%S')
-        pod_name = f"pcg-{hash_str}-{date_str}"
+        pod_name = f"crossenv_ued-{hash_str}-{date_str}"
 
         # Update status - initialize immediately with the pod name
         update_status(pod_id_key,
@@ -270,8 +242,8 @@ def run_single_pod(pod_config, status_dict, pod_id_key, API_KEY, log_queue):
         # RunPod API 요청용 설정 (내부 설정 제외)
         runpod_request = {
             'name': pod_name,
-            'templateId': 'zkat0jqlju',
-            'gpuTypeIds': ['NVIDIA RTX A4000'],
+            'templateId': "7oppv1xad7",
+            'gpuTypeIds': ["NVIDIA GeForce RTX 5090"],
             'gpuCount': 1,
             'networkVolumeId': 'c4fddrd4z9'
         }
@@ -574,18 +546,15 @@ def main(args):
     signal.signal(signal.SIGTERM, cleanup_all_pods)  # kill command
     atexit.register(cleanup_all_pods)  # Normal exit
 
-    load_dotenv()
+    load_dotenv('/app/runpod/.env')
     API_KEY = os.getenv('RUNPOD_API_KEY')
-
-    if not API_KEY:
-        raise FileNotFoundError('Cannot access to API_KEY file. Please check .env file exists in current folder.')
 
     runpod.api_key = API_KEY
 
     pod_configs = []
 
     # Check if multiple configs provided
-    if hasattr(args, 'configs') and args.configs:
+    if getattr(args, 'configs', None):
         # Multi-pod mode
         for config_file in args.configs:
             config_path = Path(config_file)
@@ -595,26 +564,24 @@ def main(args):
 
             with open(config_path, 'r') as f:
                 config_data = yaml.safe_load(f)
-                pod_config = create_pod_config_from_yaml(config_data, args)
+                pod_config = create_pod_config_from_yaml(config_data)
                 pod_configs.append(pod_config)
-    elif hasattr(args, 'config') and args.config:
+    elif getattr(args, 'config', None):
         # Single config file - also use dashboard
         config_path = Path(config_folder_path) / args.config
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-                pod_config = create_pod_config_from_yaml(config_data, args)
-                pod_configs.append(pod_config)
-        else:
-            print(f"Warning: Config file {config_path} not found")
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        with open(config_path, 'r') as f:
+            config_data = yaml.safe_load(f)
+            pod_config = create_pod_config_from_yaml(config_data)
+            pod_configs.append(pod_config)
 
     if pod_configs:
         print(f"Starting {len(pod_configs)} pod(s) with dashboard...")
         run_multiple_pods(pod_configs, API_KEY)
     else:
         print("No valid pod configurations found.")
-
-
 
 
 if __name__ == '__main__':

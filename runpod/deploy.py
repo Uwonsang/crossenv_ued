@@ -60,19 +60,13 @@ def parse_args():
         "-c",
         "--config",
         type=str,
-        help="Single YAML config file name (looked up under runpod/config)",
-    )
-    parser.add_argument(
-        "--configs",
-        type=str,
         nargs="+",
-        help="Multiple YAML config files (paths or names) for multi-pod execution",
+        help=(
+            "YAML config file(s). "
+            "Names are looked up under runpod/config, paths are used as-is."
+        ),
     )
     args = parser.parse_args()
-
-    # config / configs 둘 다 없는 경우는 허용하지 않는다.
-    if not args.config and not args.configs:
-        parser.error("One of --config or --configs must be provided.")
 
     return args
 
@@ -553,26 +547,20 @@ def main(args):
 
     pod_configs = []
 
-    # Check if multiple configs provided
-    if getattr(args, 'configs', None):
-        # Multi-pod mode
-        for config_file in args.configs:
-            config_path = Path(config_file)
-            if not config_path.exists():
-                print(f"Warning: Config file {config_file} not found, skipping...")
-                continue
+    # -c/--config 는 이미 리스트로 들어온다
+    config_args = args.config or []
 
-            with open(config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
-                pod_config = create_pod_config_from_yaml(config_data)
-                pod_configs.append(pod_config)
-    elif getattr(args, 'config', None):
-        # Single config file - also use dashboard
-        config_path = Path(config_folder_path) / args.config
-        if not config_path.exists():
-            raise FileNotFoundError(f"Config file not found: {config_path}")
+    # 주어진 모든 config 에 대해 pod 설정 생성
+    for cfg in config_args:
+        cfg_path = Path(cfg)
+        if not cfg_path.exists():
+            # runpod/config 아래 이름으로 다시 시도
+            cfg_path = Path(config_folder_path) / cfg
 
-        with open(config_path, 'r') as f:
+        if not cfg_path.exists():
+            raise FileNotFoundError(f"Config file not found: {cfg} (resolved {cfg_path})")
+
+        with open(cfg_path, "r") as f:
             config_data = yaml.safe_load(f)
             pod_config = create_pod_config_from_yaml(config_data)
             pod_configs.append(pod_config)

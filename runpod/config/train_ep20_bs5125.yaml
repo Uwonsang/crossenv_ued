@@ -1,0 +1,15 @@
+name: ippo_general_population
+pod:
+  template_id: 7oppv1xad7
+  gpu: NVIDIA RTX 5090
+  gpu_count: 1
+  spot: false
+options:
+  timeout: true
+  time_limit: 21600
+  terminate: true
+runtime:
+  cmds:
+  - cd /workerspace/crossenv_ued
+  - pip install -e .
+  - python baselines/CEC_UED/ippo_general.py

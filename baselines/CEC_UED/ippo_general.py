@@ -139,9 +139,9 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
+                reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
@@ -597,9 +597,7 @@ def make_train(config, update_step=0):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
+                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                         **metric["loss"],
                     }
                 )
@@ -653,11 +651,12 @@ def main(config):
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
     
-    with open("private.yaml") as f:
-        private_info = yaml.load(f, Loader=yaml.FullLoader)
+    if config["WANDB_MODE"] == "online":
+        with open("private.yaml") as f:
+            private_info = yaml.load(f, Loader=yaml.FullLoader)
+        wandb.login(key=private_info["wandb_key"])
     
     layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
@@ -734,24 +733,6 @@ def main(config):
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1], 'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]}
         pickle.dump(ckpt, f)
-
-
-    # plot reward w wandb
-    for i, us in enumerate(update_step):
-        r = reward[i]
-        try:
-            wandb.log(
-                {
-                    "returns": r,
-                    "env_step": us,
-                    'seed': config["SEED"]
-                }
-            )
-        except:
-            pass
-
-
-
 
     # plot reward vs update step with seaborn
     import seaborn as sns

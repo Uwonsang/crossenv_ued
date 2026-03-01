@@ -3,8 +3,8 @@
 "NUM_ENVS": 512
 "NUM_SEEDS": 1
 "NUM_STEPS": 256 #checked
-"FC_DIM_SIZE": 128
-"GRU_HIDDEN_DIM": 128
+"FC_DIM_SIZE": 256
+"GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
 "MAX_TRAIN_STEPS": 3e9 #checked
 "UPDATE_EPOCHS": 4 #checked
@@ -47,7 +47,7 @@
   "ik": False # relevant to which model to load (ik vs sk)
   "debug": False
   "use_ckpt": True  # if true, will load from ckpt_id, otherwise will load from latest
-"GRAPH_NET": False
+"CONV_NET": True
 "LSTM": True
 "FCP": False
 "FCP_KWARGS":

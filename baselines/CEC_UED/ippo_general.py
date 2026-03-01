@@ -627,7 +627,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="repro_config", config_name="ippo_final_baseline")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
@@ -655,13 +655,16 @@ def main(config):
     
     with open("private.yaml") as f:
         private_info = yaml.load(f, Loader=yaml.FullLoader)
+    
+    layout_name = config["ENV_KWARGS"]["layout"]
     wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"CEC_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

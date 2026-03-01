@@ -241,6 +241,8 @@ class Overcooked(MultiAgentEnv):
         
         
         def check_match(state_):  # says whether or not the observation is in the held out set
+            if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
+                return jnp.array(False)
             goal_match = lambda g_pos: jnp.all(g_pos == state_.goal_pos)
             pot_match = lambda p_pos: jnp.all(p_pos == state_.pot_pos)
             wall_match = lambda w_map: jnp.all(w_map == state_.wall_map)

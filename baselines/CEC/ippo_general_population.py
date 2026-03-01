@@ -27,9 +27,8 @@ import wandb
 import functools
 import pdb
 from jax_tqdm import scan_tqdm
-import time
 import yaml
-
+import time
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -262,7 +261,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(config, update_step=0, filepath=""):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     
@@ -570,13 +569,11 @@ def make_train(config, update_step=0):
                 traj_batch.info,
             )
 
-            # 'returned_episode', 'returned_episode_lengths', 'returned_episode_returns'
             returns = metric["returned_episode_returns"][:, :, 0][
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
-            # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
             metric = jax.tree_map(lambda x: x.mean(), metric)
-            
+
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
             loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
@@ -603,8 +600,24 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
+
+                save_interval = config["NUM_UPDATES"] // 19
+                step = int(metric["update_steps"])
+                if save_interval > 0 and step % save_interval == 0 and step > 0:
+                    print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}")
+                    ckpt_id = int(step // save_interval - 1)
+                    os.makedirs(filepath, exist_ok=True)
+                    with open(f"{filepath}/seed{config['SEED']}_ckpt{ckpt_id}.pkl", "wb") as f:
+                        pickle.dump({
+                            'params': jax.device_get(metric["params"]),
+                            'final_update_step': step,
+                            'key': jax.device_get(metric["rng"]),
+                        }, f)
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["params"] = train_state.params
+            metric["rng"] = rng
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
@@ -619,10 +632,10 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
+        runner_state, _ = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, 'metrics': metric}
+        return {"runner_state": runner_state}
 
     return train
 
@@ -631,7 +644,7 @@ def make_train(config, update_step=0):
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-
+    
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_improved_finetune"
@@ -652,16 +665,18 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
-    
     with open("private.yaml") as f:
         private_info = yaml.load(f, Loader=yaml.FullLoader)
+    
+    layout_name = config["ENV_KWARGS"]["layout"]
     wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"IPPO_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
@@ -708,127 +723,8 @@ def main(config):
         rng = jax.random.PRNGKey(config["SEED"])
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
+    train_jit = jax.jit(make_train(config, final_update_step, filepath), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    rng = runner_state[-1]
-    metrics = out['metrics']
-
-    reward = metrics['returns']
-    update_step = metrics['update_steps']
-    loss = metrics['loss']
-    value_loss = loss['value_loss']
-    actor_loss = loss['actor_loss']
-    entropy_loss = loss['entropy']
-    final_update_step = update_step[-1]
-    update_step = update_step * config['NUM_ENVS'] * config['NUM_STEPS']
-
-    
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1], 'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]}
-        pickle.dump(ckpt, f)
-
-
-    # plot reward w wandb
-    for i, us in enumerate(update_step):
-        r = reward[i]
-        try:
-            wandb.log(
-                {
-                    "returns": r,
-                    "env_step": us,
-                    'seed': config["SEED"]
-                }
-            )
-        except:
-            pass
-
-
-
-
-    # plot reward vs update step with seaborn
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    sns.set_context('paper')
-    # add previous ckpt's first and last update step and reward
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
-        # plot_update_step = jnp.concatenate([, previous_ckpt['last_update_step'][None], update_step])    
-        # plot_reward = jnp.concatenate([previous_ckpt['first_reward'][None], previous_ckpt['last_reward'][None], reward])
-        plot_update_step = update_step
-        plot_reward = reward
-    else:
-        plot_update_step = update_step
-        plot_reward = reward
-
-    value_step = jnp.arange(value_loss.shape[0])
-    
-
-    # plot all losses in subplots
-    fig, axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 to add ratio plot
-    fig.suptitle('Training Losses')
-    
-    # Plot total loss
-    sns.lineplot(x=value_step, y=loss['total_loss'], ax=axs[0, 0])
-    axs[0, 0].set_title('Total Loss')
-    axs[0, 0].set_xlabel('Steps')
-    
-    # Plot value loss
-    sns.lineplot(x=value_step, y=value_loss, ax=axs[0, 1])
-    axs[0, 1].set_title('Value Loss')
-    axs[0, 1].set_xlabel('Steps')
-    
-    # Plot actor loss
-    sns.lineplot(x=value_step, y=loss['actor_loss'], ax=axs[1, 0])
-    axs[1, 0].set_title('Actor Loss')
-    axs[1, 0].set_xlabel('Steps')
-    
-    # Plot entropy loss
-    sns.lineplot(x=value_step, y=entropy_loss, ax=axs[1, 1])
-    axs[1, 1].set_title('Entropy Loss')
-    axs[1, 1].set_xlabel('Steps')
-    
-    # Plot ratio
-    sns.lineplot(x=value_step, y=loss['ratio'], ax=axs[2, 0])
-    axs[2, 0].set_title('Policy Ratio')
-    axs[2, 0].set_xlabel('Steps')
-    
-    # Hide the empty subplot
-    sns.lineplot(x=plot_update_step, y=plot_reward, ax=axs[2, 1])
-    axs[2, 1].set_title('Reward')
-    axs[2, 1].set_xlabel('Steps')
-    
-    plt.tight_layout()
-    plt.savefig(f'{filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    plt.close()
-
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
-    print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    
-    
-    '''updates_x = jnp.arange(out["metrics"]["total_loss"][0].shape[0])
-    loss_table = jnp.stack([updates_x, out["metrics"]["total_loss"].mean(axis=0), out["metrics"]["actor_loss"].mean(axis=0), out["metrics"]["critic_loss"].mean(axis=0), out["metrics"]["entropy"].mean(axis=0), out["metrics"]["ratio"].mean(axis=0)], axis=1)    
-    loss_table = wandb.Table(data=loss_table.tolist(), columns=["updates", "total_loss", "actor_loss", "critic_loss", "entropy", "ratio"])'''
-    '''print('shape', out["metrics"]["returned_episode_returns"][0].shape)
-    updates_x = jnp.arange(out["metrics"]["returned_episode_returns"][0].shape[0])
-    returns_table = jnp.stack([updates_x, out["metrics"]["returned_episode_returns"].mean(axis=0)], axis=1)
-    returns_table = wandb.Table(data=returns_table.tolist(), columns=["updates", "returns"])
-    wandb.log({
-        "returns_plot": wandb.plot.line(returns_table, "updates", "returns", title="returns_vs_updates"),
-        "returns": out["metrics"]["returned_episode_returns"][:,-1].mean(),
-        
-    })'''
-
-'''
-"total_loss_plot": wandb.plot.line(loss_table, "updates", "total_loss", title="total_loss_vs_updates"),
-        "actor_loss_plot": wandb.plot.line(loss_table, "updates", "actor_loss", title="actor_loss_vs_updates"),
-        "critic_loss_plot": wandb.plot.line(loss_table, "updates", "critic_loss", title="critic_loss_vs_updates"),
-        "entropy_plot": wandb.plot.line(loss_table, "updates", "entropy", title="entropy_vs_updates"),
-        "ratio_plot": wandb.plot.line(loss_table, "updates", "ratio", title="ratio_vs_updates"),
-'''
 
 if __name__ == "__main__":
     main()

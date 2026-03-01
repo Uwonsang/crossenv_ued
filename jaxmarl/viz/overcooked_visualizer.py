@@ -36,6 +36,19 @@ class OvercookedVisualizer:
 		"""Method for rendering the state in a window. Esp. useful for interactive mode."""
 		return self._render_state(agent_view_size, state, highlight, tile_size)
 
+	def custom_get_frame(self, state, agent_view_size): # add
+		padding = agent_view_size - 1  # agent_view_size is 5, (1 => 9x9) (2 => 11x11)
+		grid = np.asarray(state.maze_map[padding:-padding, padding:-padding, :])
+		# Render the state
+		frame = OvercookedVisualizer._render_grid(
+			grid,
+			tile_size=TILE_PIXELS,
+			highlight_mask=None,
+			agent_dir_idx=state.agent_dir_idx,
+			agent_inv=state.agent_inv
+		)
+		return frame
+
 	def animate(self, state_seq, agent_view_size, action_seq, reward_seq, filename="animation.gif", boundary_locs=None):
 		"""Animate a gif give a state sequence and save if to file."""
 		import imageio

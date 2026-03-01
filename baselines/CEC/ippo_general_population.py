@@ -5,7 +5,6 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
-os.environ["XLA_FLAGS"] = "--xla_gpu_autotune_level=0"
 import pickle
 import jax
 import jax.numpy as jnp

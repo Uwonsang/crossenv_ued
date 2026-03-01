@@ -49,18 +49,7 @@ python runpod/deploy.py --config config.yaml
 ### Multiple Pods (Parallel)
 
 ```bash
-python runpod/deploy.py --configs config1.yaml config2.yaml config3.yaml
-```
-
-### WandB Sweep Example
-
-```bash
-# Start pods for sweep
-GPU=0 python runpod/deploy.py --configs sweep_config1.yaml sweep_config2.yaml
-
-# Or with sweep command
-wandb sweep --project multigame_train sweep/train.yaml --entity your-entity
-python runpod/deploy.py --configs sweep_agent1.yaml sweep_agent2.yaml
+python runpod/deploy.py --config config1.yaml config2.yaml config3.yaml
 ```
 
 ## Configuration File Format
@@ -77,7 +66,6 @@ pod:
 runtime:
   cmds:
     - "cd /workspace/multigame-pcgrl"
-    - "wandb login YOUR_API_KEY"
     - "python train.py n_epochs=100 batch_size=512"
 
 options:

@@ -1,6 +1,6 @@
 name: ippo_general_population
 pod:
-  template_id: 7oppv1xad7
+  template_id: zoz2x6nnmx
   gpu: NVIDIA GeForce RTX 5090
   gpu_count: 1
   spot: false
@@ -13,4 +13,4 @@ runtime:
   cmds:
   - cd /workerspace/crossenv_ued
   - pip install -e .
-  - python baselines/CEC_UED/ippo_general.py
+  - bash baselines/CEC/shell/bash_ippo_pop.sh forced_coord_9 0

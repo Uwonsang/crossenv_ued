@@ -1,4 +1,4 @@
-name: ippo_general_population
+name: ippo_general_pop_coord_9
 pod:
   template_id: zoz2x6nnmx
   gpu: NVIDIA GeForce RTX 5090

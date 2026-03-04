@@ -5,7 +5,8 @@
 "VALIDATION_RATIO": 0.1
 "LR": 1e-4
 "BETA": 0.5
-"LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset/layout_dataset_1e7.h5"
+"LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset"
+"LAYOUT_DATA_FILE" : "layout_dataset_1e6_forced_coord.h5" # layout_dataset_1e6_forced_coord
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_vae"

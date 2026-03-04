@@ -4,7 +4,62 @@ from jaxmarl.environments.overcooked.common import (
     COLOR_TO_INDEX,
 )
 from jaxmarl.environments.overcooked.overcooked import POT_EMPTY_STATUS
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
+import h5py
 
+
+def load_h5(path):
+    with h5py.File(path, "r") as f:
+        return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
+
+def concat_images_with_labels(images):
+    font = ImageFont.load_default()
+
+    canvas_list = []
+    for f_idx, (image1, image2) in enumerate(zip(images[0], images[1])):
+        image1, image2 = map(Image.fromarray, (image1, image2))
+
+        width, height = image1.size
+
+        canvas = Image.new("RGB", (width * 2, height), color=(255, 255, 255))
+        canvas.paste(image1, (0, 0))
+        canvas.paste(image2, (width, 0))
+
+        draw = ImageDraw.Draw(canvas)
+
+        label_text = f"Layout: {f_idx}"
+        draw.text((10, 10), label_text, fill=(0, 0, 0), font=font)
+
+        canvas_list.append(canvas)
+
+    return canvas_list
+
+
+def split_dataset(dataset, validation_ratio):
+    num_data = len(dataset)
+    random_indices = np.random.permutation(np.arange(num_data))
+    validation_split = int(validation_ratio * num_data)
+    train_indices = random_indices[:-validation_split]
+    validation_indices = random_indices[-validation_split:]
+    return dataset[train_indices], dataset[validation_indices]
+
+
+class DataLoader:
+    def __init__(self, data, batch_size, shuffle=True):
+        self.data = data
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n_samples = len(data)
+
+    def __len__(self):
+        return self.n_samples // self.batch_size
+
+    def __iter__(self):
+        indices = np.random.permutation(self.n_samples) if self.shuffle else np.arange(self.n_samples)
+        for i in range(len(self)):
+            batch_idx = indices[i * self.batch_size : (i + 1) * self.batch_size]
+            yield jnp.array(self.data[batch_idx])
 
 def restore_from_obs(obs, agent_view_size=5):
     """

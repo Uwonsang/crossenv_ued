@@ -12,7 +12,7 @@ import hydra
 from omegaconf import OmegaConf
 import jaxmarl
 import imageio
-from data_prep import restore_from_obs
+from utils import restore_from_obs
 
 
 def load_h5(path, config):

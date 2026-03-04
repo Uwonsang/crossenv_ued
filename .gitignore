@@ -177,3 +177,4 @@ baselines/CEC_UED/VAE/dataset/*
 multirun/*
 private.yaml
 wandb/*
+jaxmarl/environments/overcooked/images/*

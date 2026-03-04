@@ -239,6 +239,30 @@ class Overcooked(MultiAgentEnv):
             counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
             return counter_circuit_reset
         
+        @jax.jit
+        def random_coord_ring(key):
+            def reset_sub_dict(key, fn):
+                key, subkey = jax.random.split(key)
+                sampled_layout_dict = fn(subkey, ik=True)
+                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
+                key, subkey = jax.random.split(key)
+                return (temp_o, temp_s), key
+            
+            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
+            return coord_ring_reset
+        
+        @jax.jit
+        def random_forced_coord(key):
+            def reset_sub_dict(key, fn):
+                key, subkey = jax.random.split(key)
+                sampled_layout_dict = fn(subkey, ik=True)
+                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
+                key, subkey = jax.random.split(key)
+                return (temp_o, temp_s), key
+            
+            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
+            return forced_coord_reset
+        
         
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -253,7 +277,20 @@ class Overcooked(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
+        # random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
+        def random_reset_fn(k):
+            fn_name = params['random_reset_fn']
+            if fn_name == 'reset_all':
+                return random_og_5(k)
+            elif fn_name == 'reset_counter_circuit':
+                return random_counter_circuit(k)
+            elif fn_name == 'reset_coord_ring':
+                return random_coord_ring(k)
+            elif fn_name == 'reset_forced_coord':
+                return random_forced_coord(k)
+            else:
+                return random_og_5(k)
+
         obs, state = jax.lax.cond(self.random_reset, random_reset_fn, jitted_reset, key)
         key = jax.random.split(key)[0]
         (obs, state) = jax.lax.cond(jnp.logical_and(check_match(state), self.check_held_out), random_og_5, lambda k: (obs, state), key)
@@ -962,24 +999,31 @@ class Overcooked(MultiAgentEnv):
 
 
 if __name__ == "__main__":
-    env = Overcooked( 
-            layout = None,
-            random_reset= True,
-            max_steps= 256,
-            single_agent= False,
-            check_held_out= False,
-            shuffle_inv_and_pot= True)
+    from jaxmarl.environments.overcooked import overcooked_layouts
+    import os
+
+    env_kwargs = {
+        'layout': overcooked_layouts["cramped_room_9"],
+        'random_reset': True,
+        'max_steps': 256,
+        'single_agent': False,
+        'check_held_out': False,
+        'shuffle_inv_and_pot': False
+    }
+    # env_kwargs = filter_kwargs(env_kwargs, Overcooked)
+    env = Overcooked(**env_kwargs)
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
 
-
+    params={'random_reset_fn': 'reset_forced_coord'} # reset_all or reset_counter_circuit, reset_coord_ring
     keys = jax.random.split(jax.random.PRNGKey(0), 10)
     def render_reset(key):
-        obs, state = env.reset(key)
+        obs, state = env.reset(key, params=params)
         return render_fn(state)
     images = jax.vmap(render_reset)(keys)
     # for each image, save it as a png
+    os.makedirs("/app/jaxmarl/environments/overcooked/images", exist_ok=True)
     for i, image in enumerate(images):
-        imageio.imwrite(f"image_{i}.png", image)
-        print(f"Saved image_{i}.png")
+        imageio.imwrite(f"/app/jaxmarl/environments/overcooked/images/image_{params['random_reset_fn']}_{i}.png", image)
+        print(f"Saved app/jaxmarl/environments/overcooked/images/image_{params['random_reset_fn']}_{i}.png")

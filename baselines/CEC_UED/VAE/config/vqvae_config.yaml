@@ -27,6 +27,6 @@ render_freq: 5
 n_render_samples: 5
 
 # VQVAE config
-code_dim: 8
-num_codes: 256
-beta_vq: 0.5
+code_dim: 8 # encoder output channels == code dimension
+num_codes: 256 # codebook size (discrete vocab size)
+beta_vq: 0.5 # commitment loss weight

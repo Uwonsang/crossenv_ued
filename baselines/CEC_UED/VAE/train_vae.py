@@ -48,7 +48,7 @@ def concat_images_with_labels(images):
 
 def load_h5(path):
     with h5py.File(path, "r") as f:
-        return {k: f[k][:100].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
+        return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}
 
 def split_dataset(dataset, validation_ratio):
     num_data = len(dataset)

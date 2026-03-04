@@ -79,20 +79,19 @@ class Decoder(nn.Module):
 
 # VQ MODULE
 class VectorQuantizer(nn.Module):
-    num_codes: int
-    code_dim: int
-    beta: float = 0.25
+    config: dict
 
     @nn.compact
     def __call__(self, z_e):
         # z_e: (B, H, W, D)
         codebook = self.param(
             'codebook',
-            nn.initializers.uniform(scale=1.0 / self.num_codes),
-            (self.num_codes, self.code_dim)
+            nn.initializers.uniform(scale=1.0 / self.config["num_codes"]),
+            (self.config["num_codes"], self.config["code_dim"])
         )
 
-        z_flat = z_e.reshape(-1, self.code_dim)  # (BHW, D)
+        Batch, Height, Width, code_dim = z_e.shape
+        z_flat = z_e.reshape(-1, code_dim)  # (BHW, D)
 
         # distances: ||x - e||^2 == x^2 + e^2 - 2 z e
         dist = (
@@ -105,7 +104,7 @@ class VectorQuantizer(nn.Module):
         z_q = codebook[indices].reshape(z_e.shape) # (B, H, W, D)                                      # (N, D)
 
         codebook_loss = jnp.mean((jax.lax.stop_gradient(z_e) - z_q) ** 2)
-        commit_loss   = self.beta * jnp.mean((z_e - jax.lax.stop_gradient(z_q)) ** 2)
+        commit_loss   = self.config["beta_vq"] * jnp.mean((z_e - jax.lax.stop_gradient(z_q)) ** 2)
         vq_loss = codebook_loss + commit_loss
 
         # Straight-through estimator
@@ -121,9 +120,7 @@ class VQVAE(nn.Module):
     def __call__(self, x, rng):
         z_e = Encoder()(x)  # (B, code_dim)
 
-        z_q, vq_loss, indices = VectorQuantizer(self.config["num_codes"], 
-                                                 self.config["code_dim"], 
-                                                 self.config["beta_vq"])(z_e)
+        z_q, vq_loss, indices = VectorQuantizer(self.config)(z_e)
 
         logits = Decoder()(z_q)
 

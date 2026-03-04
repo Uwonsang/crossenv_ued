@@ -1,10 +1,8 @@
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
 import optax
 from flax.training.train_state import TrainState
-from flax.linen.initializers import constant, orthogonal
 import hydra
 from omegaconf import OmegaConf
 
@@ -20,6 +18,8 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from data_prep import restore_from_obs
 from map_viz import FilteredState
 from PIL import Image, ImageDraw, ImageFont
+from Models.vae import VAE
+from Models.vae import vae_loss, partial
 
 
 def concat_images_with_labels(images):
@@ -73,100 +73,6 @@ class DataLoader:
             batch_idx = indices[i * self.batch_size : (i + 1) * self.batch_size]
             yield jnp.array(self.data[batch_idx])
 
-class Encoder(nn.Module):
-
-    @nn.compact
-    def __call__(self, x):
-
-        x = nn.Conv(
-            features=16,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            features=12,
-            kernel_size=(3, 3),
-            strides=(2, 2),
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-
-        x = nn.Conv(
-            features=8,
-            kernel_size=(3, 3),
-            strides=(2, 2),
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-
-        x = x.reshape((x.shape[0], -1))
-        mean = nn.Dense(8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        log_std = nn.Dense(8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        return mean, log_std
-
-class Decoder(nn.Module):
-    
-    @nn.compact
-    def __call__(self, z):
-        z = nn.Dense(3 * 3 * 8, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
-        z = nn.relu(z)
-        z = z.reshape((z.shape[0], 3, 3, 8)) # (B,3,3,8)
-
-        z = nn.ConvTranspose(
-            features=12,
-            kernel_size=(5, 5),
-            strides=(2, 2),
-            padding='VALID',              
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(z)
-        z = nn.relu(z) # (B,9,9,12)
-
-        z = nn.ConvTranspose(
-            features=16,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding='SAME',
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(z)
-        z = nn.relu(z) # (B,9,9,16)
-
-        z = nn.Conv(
-            features=26,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding='SAME',
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-        )(z) # (B,9,9,26)
-        
-        return z
-
-class VAE(nn.Module):
-    image_shape: int
-    config: dict
-
-    @nn.compact
-    def __call__(self, x, rng):
-        # x: (B,9,9,26)
-        mean, log_std = Encoder()(x)
-        std = jnp.exp(log_std)
-
-        rng, _rng = jax.random.split(rng)
-        z = mean + std * jax.random.normal(_rng, mean.shape)
-
-        recon = Decoder()(z) 
-
-        return recon, mean, std
-
-
 def make_train(config, train_data, test_data):
     # for viz
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -187,16 +93,9 @@ def make_train(config, train_data, test_data):
         params = model.init(_rng, jnp.zeros((1, *input_shape)), jax.random.PRNGKey(0))
         train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(config["LR"]))
 
-        def vae_loss(params, apply_fn, x, rng):
-            logits, mean, std = apply_fn(params, x, rng)
-            x_flat      = x.reshape((x.shape[0], -1))
-            logits_flat = logits.reshape((logits.shape[0], -1))
-            recon_loss  = jnp.mean(optax.sigmoid_binary_cross_entropy(logits_flat, x_flat))
-            kl_loss     = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1))
-            return recon_loss + config["BETA"] * kl_loss, (recon_loss, kl_loss)
-
-        jit_update = jax.jit(jax.value_and_grad(vae_loss, has_aux=True), static_argnums=(1,))
-        jit_eval   = jax.jit(vae_loss, static_argnums=(1,))
+        loss_fn = partial(vae_loss, beta=config["BETA"])
+        jit_update = jax.jit(jax.value_and_grad(loss_fn, has_aux=True), static_argnums=(1,))
+        jit_eval   = jax.jit(loss_fn, static_argnums=(1,))
 
         for epoch in tqdm(range(num_epochs), desc="Epochs"):
             epoch_losses, epoch_recons, epoch_kls = [], [], []
@@ -225,7 +124,6 @@ def make_train(config, train_data, test_data):
 
 
                     if epoch % config["render_freq"] == 0 and epoch != 0:
-                        # GT render
                         restore_from_obs_batch = jax.vmap(restore_from_obs, in_axes=0)
                         
                         restored_gt = restore_from_obs_batch(test_batch)

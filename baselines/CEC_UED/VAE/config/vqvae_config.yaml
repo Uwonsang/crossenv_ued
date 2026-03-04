@@ -1,0 +1,32 @@
+"SEED": 0
+"BATCH_SIZE_TRAIN": 512
+"BATCH_SIZE_TEST": 1028
+"NUM_EPOCHS": 50
+"VALIDATION_RATIO": 0.1
+"LR": 1e-4
+"BETA": 0.5
+"LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset/layout_dataset_1e7.h5"
+# WandB Params
+"ENTITY": "overcooked_ai"                                          
+"PROJECT": "crossenv_ued_vae"
+"WANDB_MODE" : "online" # online or disabled
+# for viz
+"ENV_NAME": "overcooked"
+"ENV_KWARGS": 
+  "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
+  "max_steps": 400
+  "check_held_out": True  # if false, we don't check if the reset env is held out
+  # overcooked specific kwargs
+  "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
+  "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
+  "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit 
+
+# validation config
+validation_freq : 5
+render_freq: 5
+n_render_samples: 5
+
+# VQVAE config
+code_dim: 8
+num_codes: 256
+beta_vq: 0.5

@@ -18,9 +18,8 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from data_prep import restore_from_obs
 from map_viz import FilteredState
 from PIL import Image, ImageDraw, ImageFont
-from Models.vae import VAE
-from Models.vae import vae_loss
-from functools import partial
+from Models.vqvae import VQVAE
+from Models.vqvae import vqvae_loss
 
 
 def concat_images_with_labels(images):
@@ -89,14 +88,13 @@ def make_train(config, train_data, test_data):
     test_loader = DataLoader(test_data, config["BATCH_SIZE_TEST"], shuffle=True)
 
     def train(rng):
-        model = VAE(input_shape, config=config)
+        model = VQVAE(config=config)
         rng, _rng = jax.random.split(rng)
         params = model.init(_rng, jnp.zeros((1, *input_shape)), jax.random.PRNGKey(0))
         train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(config["LR"]))
 
-        loss_fn = partial(vae_loss, beta=config["BETA"])
-        jit_update = jax.jit(jax.value_and_grad(loss_fn, has_aux=True), static_argnums=(1,))
-        jit_eval   = jax.jit(loss_fn, static_argnums=(1,))
+        jit_update = jax.jit(jax.value_and_grad(vqvae_loss, has_aux=True), static_argnums=(1,))
+        jit_eval   = jax.jit(vqvae_loss, static_argnums=(1,))
 
         for epoch in tqdm(range(num_epochs), desc="Epochs"):
             epoch_losses, epoch_recons, epoch_kls = [], [], []
@@ -157,7 +155,7 @@ def make_train(config, train_data, test_data):
 
     return train
 
-@hydra.main(version_base=None, config_path="config", config_name="vae_config")
+@hydra.main(version_base=None, config_path="config", config_name="vqvae_config")
 def main(config):
     config = OmegaConf.to_container(config)
 
@@ -172,7 +170,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"VAE_seed{config['SEED']}"
+        name=f"VQVAE_seed{config['SEED']}"
     )
 
     rng = jax.random.PRNGKey(config["SEED"])

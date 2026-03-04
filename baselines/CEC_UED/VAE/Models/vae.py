@@ -106,4 +106,5 @@ def vae_loss(params, apply_fn, x, rng, beta):
     logits_flat = logits.reshape((logits.shape[0], -1))
     recon_loss  = jnp.mean(optax.sigmoid_binary_cross_entropy(logits_flat, x_flat))
     kl_loss     = jnp.mean(0.5 * jnp.mean(-2 * jnp.log(std) - 1.0 + std**2 + mean**2, axis=-1))
-    return recon_loss + beta * kl_loss, (recon_loss, kl_loss)
+    loss = recon_loss + beta * kl_loss
+    return loss, (recon_loss, kl_loss)

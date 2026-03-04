@@ -6,7 +6,7 @@ pod:
   spot: false
   network_volume_id: c4fddrd4z9
 options:
-  timeout: true
+  timeout: false
   time_limit: 21600
   terminate: true
 runtime:

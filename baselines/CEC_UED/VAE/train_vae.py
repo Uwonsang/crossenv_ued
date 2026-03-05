@@ -26,29 +26,34 @@ from utils import (
     restore_to_26ch
 )
 
-from functools import partial
-
 def make_train(config, train_data, test_data):
     # for viz
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     agent_view_size = env.agent_view_size
     viz = OvercookedVisualizer()
 
-    n_train_samples = train_data.shape[0]
-    n_test_samples = test_data.shape[0]
     input_shape = train_data.shape[1:]
     num_epochs = config["NUM_EPOCHS"]
+
+    steps_per_epoch = len(train_data) // config["BATCH_SIZE_TRAIN"]
+    total_steps = num_epochs * steps_per_epoch
+    
+    def linear_schedule(count):
+        frac = 1.0 - count / total_steps
+        frac = jnp.maximum(1e-9, frac)
+        return config["LR"] * frac
 
     train_loader = DataLoader(train_data, config["BATCH_SIZE_TRAIN"], shuffle=True)
     test_loader = DataLoader(test_data, config["BATCH_SIZE_TEST"], shuffle=True)
 
     def train(rng):
-        model = VAE(input_shape, config=config)
-        rng, _rng = jax.random.split(rng)
-        params = model.init(_rng, jnp.zeros((1, *input_shape)), jax.random.PRNGKey(0))
-        train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(config["LR"]))
+        model = VAE(config)
+        rng, _rng, _rng_init = jax.random.split(rng, 3)
+        params = model.init(_rng, jnp.zeros((1, *input_shape)), _rng_init)
+
+        tx = optax.adamw(learning_rate=linear_schedule, eps=1e-5, weight_decay=1e-4)
+        train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
         
-        # loss_fn = partial(vae_loss, beta=config["BETA"])
         jit_update = jax.jit(jax.value_and_grad(vae_loss, has_aux=True), static_argnums=(1,))
         jit_eval   = jax.jit(vae_loss, static_argnums=(1,))
 
@@ -92,7 +97,8 @@ def make_train(config, train_data, test_data):
                             for step in range(config["n_render_samples"])]
                         
                         # VAE_render
-                        vae_render, _, _ = train_state.apply_fn(train_state.params, test_batch, _rng_test)
+                        rng, _rng_render = jax.random.split(rng)
+                        vae_render, _, _ = train_state.apply_fn(train_state.params, test_batch, _rng_render)
                         vae_render = (jax.nn.sigmoid(vae_render) > 0.5).astype(jnp.uint8)
 
                         vae_render_26 = restore_to_26ch_batch(vae_render)

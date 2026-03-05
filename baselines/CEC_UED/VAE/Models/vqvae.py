@@ -8,32 +8,36 @@ import optax
 
 
 class Encoder(nn.Module):
+    code_dim: int
 
     @nn.compact
     def __call__(self, x):
 
         x = nn.Conv(
-            features=16,
+            features=32,
             kernel_size=(3, 3),
             strides=(1, 1),
+            padding='SAME',
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )(x)
         x = nn.relu(x)
 
         x = nn.Conv(
-            features=12,
+            features=64,
             kernel_size=(3, 3),
-            strides=(2, 2),
+            strides=(3, 3),
+            padding='VALID',
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )(x)
         x = nn.relu(x)
 
         x = nn.Conv(
-            features=8,
+            features=self.code_dim,
             kernel_size=(3, 3),
-            strides=(2, 2),
+            strides=(1, 1),
+            padding='SAME',
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )(x)
@@ -42,52 +46,55 @@ class Encoder(nn.Module):
         return x
 
 class Decoder(nn.Module):
+    output_channels: int
     
     @nn.compact
     def __call__(self, z):
 
         z = nn.ConvTranspose(
-            features=12,
-            kernel_size=(5, 5),
-            strides=(2, 2),
-            padding='VALID',              
+            features=64,
+            kernel_size=(3, 3),
+            strides=(1, 1),
+            padding='SAME',              
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )(z)
-        z = nn.relu(z) # (B,9,9,12)
+        z = nn.relu(z)
 
         z = nn.ConvTranspose(
-            features=16,
+            features=32,
             kernel_size=(3, 3),
             strides=(1, 1),
             padding='SAME',
             kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
         )(z)
-        z = nn.relu(z) # (B,9,9,16)
+        z = nn.relu(z)
 
-        z = nn.Conv(
-            features=26,
+        z = nn.ConvTranspose(
+            features=self.output_channels,
             kernel_size=(3, 3),
-            strides=(1, 1),
-            padding='SAME',
-            kernel_init=orthogonal(1.0),
+            strides=(3, 3),
+            padding='VALID',
+            kernel_init=orthogonal(np.sqrt(2)),
             bias_init=constant(0.0),
-        )(z) # (B,9,9,26)
+        )(z) 
         
         return z
 
 # VQ MODULE
 class VectorQuantizer(nn.Module):
-    config: dict
+    code_dim: int
+    num_codes: int
+    beta_vq: float
 
     @nn.compact
     def __call__(self, z_e):
         # z_e: (B, H, W, D)
         codebook = self.param(
             'codebook',
-            nn.initializers.uniform(scale=1.0 / self.config["num_codes"]),
-            (self.config["num_codes"], self.config["code_dim"])
+            nn.initializers.uniform(scale=1.0 / self.num_codes),
+            (self.num_codes, self.code_dim)
         )
 
         Batch, Height, Width, code_dim = z_e.shape
@@ -104,7 +111,7 @@ class VectorQuantizer(nn.Module):
         z_q = codebook[indices].reshape(z_e.shape) # (B, H, W, D)                                      # (N, D)
 
         codebook_loss = jnp.mean((jax.lax.stop_gradient(z_e) - z_q) ** 2)
-        commit_loss   = self.config["beta_vq"] * jnp.mean((z_e - jax.lax.stop_gradient(z_q)) ** 2)
+        commit_loss   = self.beta_vq * jnp.mean((z_e - jax.lax.stop_gradient(z_q)) ** 2)
         vq_loss = codebook_loss + commit_loss
 
         # Straight-through estimator
@@ -117,18 +124,18 @@ class VQVAE(nn.Module):
     config: dict
 
     @nn.compact
-    def __call__(self, x, rng):
-        z_e = Encoder()(x)  # (B, code_dim)
+    def __call__(self, x):
+        z_e = Encoder(self.config["code_dim"])(x)  # (B, code_dim)
 
-        z_q, vq_loss, indices = VectorQuantizer(self.config)(z_e)
+        z_q, vq_loss, indices = VectorQuantizer(self.config["code_dim"], self.config["num_codes"], self.config["beta_vq"])(z_e)
 
-        logits = Decoder()(z_q)
+        logits = Decoder(self.config["output_channels"])(z_q)
 
         return logits, vq_loss, indices
 
 
-def vqvae_loss(params, apply_fn, x, rng):
-    logits, vq_loss, _ = apply_fn(params, x, rng)
+def vqvae_loss(params, apply_fn, x):
+    logits, vq_loss, _ = apply_fn(params, x)
 
     recon_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(
         logits.reshape(logits.shape[0], -1),

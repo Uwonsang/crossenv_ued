@@ -9,6 +9,23 @@ import numpy as np
 import h5py
 
 
+def input_processing(images):
+    # ch 10~15 (pot, wall, onion_pile, _, plate_pile, goal)
+    TRAIN_CHANNELS = list(range(10)) + [10, 11, 12, 14, 15]
+    
+    return images[:, :, :, TRAIN_CHANNELS]
+
+def restore_to_26ch(pred_obs):
+
+    H, W = pred_obs.shape[:2]
+    full_obs = jnp.zeros((H, W, 26), dtype=jnp.uint8)
+    
+    TRAIN_CHANNELS = jnp.array(list(range(10)) + [10, 11, 12, 14, 15])
+    full_obs = full_obs.at[:, :, TRAIN_CHANNELS].set(pred_obs)
+
+    return full_obs
+
+    
 def load_h5(path):
     with h5py.File(path, "r") as f:
         return {k: f[k][:].reshape(-1, *f[k].shape[2:]) for k in f.keys()}

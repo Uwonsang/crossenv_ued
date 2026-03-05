@@ -16,9 +16,17 @@ import jaxmarl
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from map_viz import FilteredState
 from Models.vae import VAE, vae_loss
-from functools import partial
-from utils import restore_from_obs, split_dataset, DataLoader, concat_images_with_labels, load_h5
+from utils import (
+    restore_from_obs, 
+    split_dataset, 
+    DataLoader, 
+    concat_images_with_labels, 
+    load_h5, 
+    input_processing, 
+    restore_to_26ch
+)
 
+from functools import partial
 
 def make_train(config, train_data, test_data):
     # for viz
@@ -39,19 +47,20 @@ def make_train(config, train_data, test_data):
         rng, _rng = jax.random.split(rng)
         params = model.init(_rng, jnp.zeros((1, *input_shape)), jax.random.PRNGKey(0))
         train_state = TrainState.create(apply_fn=model.apply, params=params, tx=optax.adam(config["LR"]))
-
-        loss_fn = partial(vae_loss, beta=config["BETA"])
-        jit_update = jax.jit(jax.value_and_grad(loss_fn, has_aux=True), static_argnums=(1,))
-        jit_eval   = jax.jit(loss_fn, static_argnums=(1,))
+        
+        # loss_fn = partial(vae_loss, beta=config["BETA"])
+        jit_update = jax.jit(jax.value_and_grad(vae_loss, has_aux=True), static_argnums=(1,))
+        jit_eval   = jax.jit(vae_loss, static_argnums=(1,))
 
         for epoch in tqdm(range(num_epochs), desc="Epochs"):
+            beta = config["init_kl_penalty"] + epoch / num_epochs * (config["kl_penalty"] - config["init_kl_penalty"])
             epoch_losses, epoch_recons, epoch_kls = [], [], []
             epoch_test_losses, epoch_test_recons, epoch_test_kls = [], [], []
 
             for train_batch in tqdm(train_loader, desc="Training"):
                 rng, _rng_vae = jax.random.split(rng)
                 (loss, (recon_loss, kl_loss)), grads = jit_update(
-                    train_state.params, train_state.apply_fn, train_batch, _rng_vae)
+                    train_state.params, train_state.apply_fn, train_batch, _rng_vae, beta)
 
                 train_state = train_state.apply_gradients(grads=grads)
                 epoch_losses.append(float(loss))
@@ -64,16 +73,19 @@ def make_train(config, train_data, test_data):
             if epoch % config["validation_freq"] == 0 and epoch != 0:
                 for test_idx, (test_batch) in enumerate(tqdm(test_loader, desc="Testing")):
                     rng, _rng_test = jax.random.split(rng)
-                    test_loss, (test_recon, test_kl) = jit_eval(train_state.params, train_state.apply_fn, test_batch, _rng_test)
+                    test_loss, (test_recon, test_kl) = jit_eval(train_state.params, train_state.apply_fn, test_batch, _rng_test, beta)
                     epoch_test_losses.append(float(test_loss))
                     epoch_test_recons.append(float(test_recon))
                     epoch_test_kls.append(float(test_kl))
 
 
                     if epoch % config["render_freq"] == 0 and epoch != 0 and test_idx == 0:
+                        restore_to_26ch_batch = jax.vmap(restore_to_26ch, in_axes=0)
                         restore_from_obs_batch = jax.vmap(restore_from_obs, in_axes=0)
                         
-                        restored_gt = restore_from_obs_batch(test_batch)
+                        # GT_render
+                        restored_gt_26 = restore_to_26ch_batch(test_batch)
+                        restored_gt = restore_from_obs_batch(restored_gt_26)
                         test_states = FilteredState(**restored_gt)
                         test_frame = [
                             viz.custom_get_frame(jax.tree_map(lambda x: x[step], test_states), agent_view_size)
@@ -82,7 +94,9 @@ def make_train(config, train_data, test_data):
                         # VAE_render
                         vae_render, _, _ = train_state.apply_fn(train_state.params, test_batch, _rng_test)
                         vae_render = (jax.nn.sigmoid(vae_render) > 0.5).astype(jnp.uint8)
-                        restored_pred = restore_from_obs_batch(vae_render)
+
+                        vae_render_26 = restore_to_26ch_batch(vae_render)
+                        restored_pred = restore_from_obs_batch(vae_render_26)
                         test_states_pred = FilteredState(**restored_pred)
                         
                         vae_frame = [
@@ -131,10 +145,10 @@ def main(config):
     images_train, images_test = split_dataset(
         data["agent_0"], config["VALIDATION_RATIO"])
 
-    # processed_train = input_processing(images_train)
-    # processed_test = input_processing(images_test)
+    processed_train = input_processing(images_train)
+    processed_test = input_processing(images_test)
 
-    train_fn = make_train(config, images_train, images_test)
+    train_fn = make_train(config, processed_train, processed_test)
     out = train_fn(rng_train)
     
     # after training, save the model

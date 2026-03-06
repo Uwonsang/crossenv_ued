@@ -52,7 +52,7 @@ def make_train(config, train_data, test_data):
         rng, _rng = jax.random.split(rng)
         params = model.init(_rng, jnp.zeros((1, *input_shape)))
 
-        tx = optax.adam(learning_rate=linear_schedule, eps=1e-5)
+        tx = optax.adamw(learning_rate=linear_schedule, eps=1e-5, weight_decay=1e-4)
         train_state = TrainState.create(apply_fn=model.apply, params=params, tx=tx)
 
         jit_update = jax.jit(jax.value_and_grad(vqvae_loss, has_aux=True), static_argnums=(1,))
@@ -60,7 +60,7 @@ def make_train(config, train_data, test_data):
 
         for epoch in tqdm(range(num_epochs), desc="Epochs"):
             epoch_losses, epoch_recons, epoch_vqs = [], [], []
-            epoch_test_losses, epoch_test_recons, epoch_test_kls = [], [], []
+            epoch_test_losses, epoch_test_recons, epoch_test_vqs = [], [], []
 
             for train_batch in tqdm(train_loader, desc="Training"):
                 (loss, (recon_loss, vq_loss)), grads = jit_update(
@@ -72,15 +72,15 @@ def make_train(config, train_data, test_data):
                 epoch_vqs.append(float(vq_loss))
             
             wandb.log({
-                "loss": np.mean(epoch_losses), "recon_loss": np.mean(epoch_recons), "kl_loss": np.mean(epoch_vqs)}, step=epoch)
+                "loss": np.mean(epoch_losses), "recon_loss": np.mean(epoch_recons), "vq_loss": np.mean(epoch_vqs)}, step=epoch)
 
             if epoch % config["validation_freq"] == 0 and epoch != 0:
                 for test_idx, (test_batch) in enumerate(tqdm(test_loader, desc="Testing")):
 
-                    test_loss, (test_recon, test_kl) = jit_eval(train_state.params, train_state.apply_fn, test_batch)
+                    test_loss, (test_recon, test_vq) = jit_eval(train_state.params, train_state.apply_fn, test_batch)
                     epoch_test_losses.append(float(test_loss))
                     epoch_test_recons.append(float(test_recon))
-                    epoch_test_kls.append(float(test_kl))
+                    epoch_test_vqs.append(float(test_vq))
 
 
                     if epoch % config["render_freq"] == 0 and epoch != 0 and test_idx == 0:
@@ -113,8 +113,7 @@ def make_train(config, train_data, test_data):
                             wandb.log({f"comparison_{i:03d}": wandb.Image(canvas)}, step=epoch)
                 
                 wandb.log({
-                "test_loss": np.mean(epoch_test_losses), "test_recon_loss": np.mean(epoch_test_recons), 
-                            "test_kl_loss": np.mean(epoch_test_kls)}, step=epoch)
+                "test_recon_loss": np.mean(epoch_test_recons), "test_vq_loss": np.mean(epoch_test_vqs)}, step=epoch)
 
 
         return {"train_state": train_state, "key": rng}

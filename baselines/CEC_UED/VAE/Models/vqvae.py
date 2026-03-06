@@ -110,8 +110,19 @@ class VectorQuantizer(nn.Module):
         indices = jnp.argmin(dist, axis=1)  # (BHW,)
         z_q = codebook[indices].reshape(z_e.shape) # (B, H, W, D)                                      # (N, D)
 
-        codebook_loss = jnp.mean((jax.lax.stop_gradient(z_e) - z_q) ** 2)
-        commit_loss   = self.beta_vq * jnp.mean((z_e - jax.lax.stop_gradient(z_q)) ** 2)
+        codebook_loss = jnp.mean(
+            jnp.sum(
+                (jax.lax.stop_gradient(z_e) - z_q) ** 2,
+                axis=(-1, -2, -3)  # H, W, D 합산
+            )
+        ) 
+
+        commit_loss = self.beta_vq * jnp.mean(
+            jnp.sum(
+                (z_e - jax.lax.stop_gradient(z_q)) ** 2,
+                axis=(-1, -2, -3)
+            )
+        )
         vq_loss = codebook_loss + commit_loss
 
         # Straight-through estimator
@@ -137,10 +148,12 @@ class VQVAE(nn.Module):
 def vqvae_loss(params, apply_fn, x):
     logits, vq_loss, _ = apply_fn(params, x)
 
-    recon_loss = jnp.mean(optax.sigmoid_binary_cross_entropy(
-        logits.reshape(logits.shape[0], -1),
-        x.reshape(x.shape[0], -1).astype(jnp.float32)
-    ))
+    recon_loss = jnp.mean(
+        jnp.sum(optax.sigmoid_binary_cross_entropy(
+            logits.reshape(logits.shape[0], -1),
+            x.reshape(x.shape[0], -1).astype(jnp.float32)
+        ), axis=1)
+    )
     loss = recon_loss + vq_loss
 
     return loss, (recon_loss, vq_loss)

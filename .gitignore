@@ -178,3 +178,4 @@ multirun/*
 private.yaml
 wandb/*
 jaxmarl/environments/overcooked/images/*
+baselines/CEC_UED/VAE/checkpoints/*

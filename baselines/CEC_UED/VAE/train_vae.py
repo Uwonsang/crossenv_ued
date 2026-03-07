@@ -29,7 +29,7 @@ from utils import (
 
 def make_train(config, train_data, test_data):
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/{xpid}"
+    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}/{xpid}"
     # for viz
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     agent_view_size = env.agent_view_size

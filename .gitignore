@@ -179,3 +179,4 @@ private.yaml
 wandb/*
 jaxmarl/environments/overcooked/images/*
 baselines/CEC_UED/VAE/checkpoints/*
+baselines/CEC_UED/VAE/img_check_decoder/*

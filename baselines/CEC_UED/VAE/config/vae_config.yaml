@@ -5,15 +5,15 @@
 "VALIDATION_RATIO": 0.1
 "LR": 1e-4
 "LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset"
-"LAYOUT_DATA_FILE" : "layout_dataset_1e6_all.h5" # layout_dataset_1e6_forced_coord
+"LAYOUT_DATA_FILE" : "layout_dataset_1e7_all.h5" # layout_dataset_1e6_forced_coord
 "init_kl_penalty": 0
 "kl_penalty": 0.5
-"latent_dim": 32
-"output_channels": 15 # decoder output channels == output channels
+"latent_dim": 16
+"output_channels": 5 # decoder output channels == output channels
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_vae"
-"WANDB_MODE" : "online"
+"PROJECT": "crossenv_ued_vae_test"
+"WANDB_MODE" : "online" # online or disabled
 # for viz
 "ENV_NAME": "overcooked"
 "ENV_KWARGS": 

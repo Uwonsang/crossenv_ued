@@ -238,43 +238,6 @@ class Overcooked(MultiAgentEnv):
             
             counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
             return counter_circuit_reset
-        
-        @jax.jit
-        def random_coord_ring(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            return coord_ring_reset
-        
-        @jax.jit
-        def random_forced_coord(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            return forced_coord_reset
-        
-        @jax.jit
-        def random_cramped_room(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
-            return cramped_room_reset
-
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -289,35 +252,14 @@ class Overcooked(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        # random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
-        def random_reset_fn(k):
-            fn_name = params['random_reset_fn']
-            if fn_name == 'reset_all':
-                return random_og_5(k)
-            elif fn_name == 'reset_counter_circuit':
-                return random_counter_circuit(k)
-            elif fn_name == 'reset_coord_ring':
-                return random_coord_ring(k)
-            elif fn_name == 'reset_forced_coord':
-                return random_forced_coord(k)
-            elif fn_name == 'reset_cramped_room':
-                return random_cramped_room(k)
-            else:
-                return random_og_5(k)
-
+        random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
         obs, state = jax.lax.cond(self.random_reset, random_reset_fn, jitted_reset, key)
         key = jax.random.split(key)[0]
         (obs, state) = jax.lax.cond(jnp.logical_and(check_match(state), self.check_held_out), random_og_5, lambda k: (obs, state), key)
         
         return lax.stop_gradient(obs), lax.stop_gradient(state)
     
-    def custom_reset(
-            self,
-            key: chex.PRNGKey,
-            random_reset,
-            shuffle_inv_and_pot,
-            layout,
-    ) -> Tuple[Dict[str, chex.Array], State]:
+    def custom_reset(self, key: chex.PRNGKey, random_reset, shuffle_inv_and_pot, layout) -> Tuple[Dict[str, chex.Array], State]:
         """Reset environment state based on `self.random_reset`
 
         If True, everything is randomized, including agent inventories and positions, pot states and items on counters
@@ -575,6 +517,73 @@ class Overcooked(MultiAgentEnv):
 
         obs = self.get_obs(state)
         
+        return lax.stop_gradient(obs), lax.stop_gradient(state)
+
+    def custom_reset_vae(
+        self,
+        key: chex.PRNGKey,
+        decoder_apply_fn,
+        decoder_params,
+        latent_dim: int,
+        z=None,
+        shuffle_inv_and_pot: bool = False,
+    ) -> Tuple[Dict[str, chex.Array], State]:
+        """VAE decoder로 static 레이아웃(채널 10,11,12,14,15) 생성 후 custom_reset. 에이전트 초기화는 기존처럼 랜덤, obs 채널 16~25는 0으로 채움.
+
+        사용 예 (decoder는 baselines/CEC_UED/VAE에서 로드):
+          from baselines.CEC_UED.VAE.Models.vae import Decoder
+          ckpt = pickle.load(open(ckpt_path, 'rb'))
+          decoder = Decoder(5)
+          decoder_params = {"params": ckpt["params"]["Decoder_0"]}
+          obs, state = env.custom_reset_vae(key, decoder.apply, decoder_params, latent_dim=16)
+        """
+        key, subkey = jax.random.split(key)
+        if z is None:
+            z = jax.random.normal(subkey, (1, latent_dim))
+        elif z.ndim == 1:
+            z = z[None, :]
+        pred = decoder_apply_fn(decoder_params, z)
+        pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)
+
+        # --- VAE layout: static ch 10,11,12,14,15 → layout dict for custom_reset ---
+        # pred_5ch: (H, W, 5) order = pot(10), wall(11), onion_pile(12), plate_pile(14), goal(15)
+        def static_pred_to_layout_dict(pred_5ch, height=9, width=9):
+            """VAE decoder 출력 (9,9,5) binary → custom_reset이 받는 layout dict (wall_idx, goal_idx, pot_idx, onion_pile_idx, plate_pile_idx)."""
+            if pred_5ch.ndim == 4:
+                pred_5ch = pred_5ch[0]
+            flat = jnp.arange(height * width)
+            ch = pred_5ch.reshape(-1, 5)  # (81, 5)
+            pot_idx = flat[jnp.where(ch[:, 0] == 1)[0]]
+            wall_idx = flat[jnp.where(ch[:, 1] == 1)[0]]
+            onion_pile_idx = flat[jnp.where(ch[:, 2] == 1)[0]]
+            plate_pile_idx = flat[jnp.where(ch[:, 3] == 1)[0]]
+            goal_idx = flat[jnp.where(ch[:, 4] == 1)[0]]
+            return FrozenDict({
+                "wall_idx": wall_idx.astype(jnp.uint32),
+                "goal_idx": goal_idx.astype(jnp.uint32),
+                "pot_idx": pot_idx.astype(jnp.uint32),
+                "onion_pile_idx": onion_pile_idx.astype(jnp.uint32),
+                "plate_pile_idx": plate_pile_idx.astype(jnp.uint32),
+            })
+
+        layout = static_pred_to_layout_dict(pred, height=self.height, width=self.width)
+        obs, state = self.custom_reset(
+            key,
+            layout=layout,
+            random_reset=False,
+            shuffle_inv_and_pot=shuffle_inv_and_pot,
+        )
+
+        def zero_obs_ch16_25(obs):
+
+            obs = {
+                "agent_0": obs["agent_0"].at[:, :, 16:26].set(0),
+                "agent_1": obs["agent_1"].at[:, :, 16:26].set(0)}
+
+            return obs
+        
+        obs = zero_obs_ch16_25(obs)
+
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
     def get_obs(self, state: State) -> Dict[str, chex.Array]:

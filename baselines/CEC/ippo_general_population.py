@@ -599,7 +599,7 @@ def make_train(config, update_step=0, filepath=""):
 
                 save_interval = config["NUM_UPDATES"] // 19
                 step = int(metric["update_steps"])
-                if save_interval > 0 and step % save_interval == 0 and step > 0:
+                if save_interval > 0 and ((step % save_interval == 0 and step > 0) or step == config["NUM_UPDATES"]):
                     print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}")
                     ckpt_id = int(step // save_interval - 1)
                     os.makedirs(filepath, exist_ok=True)

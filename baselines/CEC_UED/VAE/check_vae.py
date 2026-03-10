@@ -10,16 +10,10 @@ import jaxmarl
 import imageio
 
 from Models.vae import Decoder
-from utils import restore_from_obs, restore_to_26ch
+from utils import restore_from_obs, restore_to_26ch, load_checkpoint
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from map_viz import FilteredState
 import jaxmarl
-
-
-def load_checkpoint(ckpt_path):
-    with open(ckpt_path, "rb") as f:
-        ckpt = pickle.load(f)
-    return ckpt["params"], ckpt["config"]
 
 def check_decoder(config):
     rng = jax.random.PRNGKey(config["SEED"])

@@ -8,6 +8,7 @@ from jaxmarl.environments.overcooked.overcooked import POT_EMPTY_STATUS
 from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import h5py
+import pickle
 
 
 # Static env only: pot(10), wall(11), onion_pile(12), plate_pile(14), goal(15)
@@ -180,6 +181,11 @@ def restore_from_obs(obs, agent_view_size=5):
     }
 
     return state
+
+def load_checkpoint(ckpt_path):
+    with open(ckpt_path, "rb") as f:
+        ckpt = pickle.load(f)
+    return ckpt["params"], ckpt["config"]
 
 if __name__ == "__main__":
     obs = jnp.load('/app/baselines/CEC_UED/VAE/dataset/env_states_3e6_lr-20260224-071423.h5')

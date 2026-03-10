@@ -178,5 +178,6 @@ multirun/*
 private.yaml
 wandb/*
 jaxmarl/environments/overcooked/images/*
+jaxmarl/environments/overcooked/images_test/*
 baselines/CEC_UED/VAE/checkpoints/*
 baselines/CEC_UED/VAE/img_check_decoder/*

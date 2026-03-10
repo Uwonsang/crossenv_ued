@@ -28,7 +28,7 @@ def check_decoder(config):
     agent_view_size = env.agent_view_size
     viz = OvercookedVisualizer()
     
-    ckpt_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260306-091647/vae_seed0_kl70.pkl"
+    ckpt_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl50.pkl"
     params, ckpt_config = load_checkpoint(ckpt_path)
 
     decoder_params = {"params": params["params"]["Decoder_0"]}

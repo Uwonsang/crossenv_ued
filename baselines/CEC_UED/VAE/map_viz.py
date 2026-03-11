@@ -12,7 +12,7 @@ import hydra
 from omegaconf import OmegaConf
 import jaxmarl
 import imageio
-from data_prep import restore_from_obs
+from utils import restore_from_obs
 
 
 def load_h5(path, config):
@@ -69,9 +69,10 @@ def layout_render(env_state_obs, config, save_dir):
 @hydra.main(version_base=None, config_path="config", config_name="collect_overcooked")
 def visualize_layout(config):
     config = OmegaConf.to_container(config)
-    data_path = '/app/baselines/CEC_UED/VAE/dataset/env_states_only_1e3_test.h5'
+    data_path = '/app/baselines/CEC_UED/VAE/dataset/layout_dataset_1e6_coord_ring.h5'
+    layout_name = data_path.split('/')[-1].split('.h5')[0].split('layout_dataset_')[1].split('_', 1)[1]
     env_state_obs = load_h5(data_path, config)
-    save_dir = f"/app/baselines/CEC_UED/VAE/dataset/img_use_obs_{config['use_obs']}"
+    save_dir = f"/app/baselines/CEC_UED/VAE/dataset/img_use_obs_{config['use_obs']}_{layout_name}"
     layout_render(env_state_obs, config, save_dir)
 
 

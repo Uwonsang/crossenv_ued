@@ -25,6 +25,7 @@ from .environments import (
     # InTheGrid_2p,
     # Hanabi,
     Overcooked,
+    Overcooked_VAE,
     # CoinGame,
     ToyCoop,
 )
@@ -142,6 +143,10 @@ def make(env_id: str, **env_kwargs):
     elif env_id == "coin_game":
         env_kwargs = filter_kwargs(env_kwargs, CoinGame)
         env = CoinGame(**env_kwargs)
+    
+    elif env_id == "overcooked_vae":
+        env_kwargs = filter_kwargs(env_kwargs, Overcooked_VAE)
+        env = Overcooked_VAE(**env_kwargs) 
 
     return env
 
@@ -172,6 +177,7 @@ registered_envs = [
     "storm_2p",
     "hanabi",
     "overcooked",
+    "overcooked_vae",
     "coin_game",
     "ToyCoop"
 ]

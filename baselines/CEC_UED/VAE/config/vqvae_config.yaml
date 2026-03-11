@@ -1,18 +1,15 @@
 "SEED": 0
-"BATCH_SIZE_TRAIN": 512
-"BATCH_SIZE_TEST": 4096
-"NUM_EPOCHS": 50
+"BATCH_SIZE_TRAIN": 4096
+"BATCH_SIZE_TEST": 1028
+"NUM_EPOCHS": 100
 "VALIDATION_RATIO": 0.1
 "LR": 1e-4
 "LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset"
-"LAYOUT_DATA_FILE" : "layout_dataset_1e7_all.h5" # layout_dataset_1e6_forced_coord
-"init_kl_penalty": 0
-"kl_penalty": 0.5
-"latent_dim": 16
-"output_channels": 5 # decoder output channels == output channels
+"LAYOUT_DATA_FILE" : "layout_dataset_1e6_forced_coord.h5" # layout_dataset_1e6_forced_coord
+"output_channels": 15 # decoder output channels == output channels
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_vae_test"
+"PROJECT": "crossenv_ued_vqvae"
 "WANDB_MODE" : "online" # online or disabled
 # for viz
 "ENV_NAME": "overcooked"
@@ -30,5 +27,7 @@ validation_freq : 5
 render_freq: 5
 n_render_samples: 5
 
-# Tuning config
-"TUNE": False
+# VQVAE config
+code_dim: 128 # encoder output channels == code dimension
+num_codes: 256 # codebook size (discrete vocab size)
+beta_vq: 0.5 # commitment loss weight

@@ -8,7 +8,7 @@
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
 "MAX_TRAIN_STEPS": 3e6 #checked
 "UPDATE_EPOCHS": 4 #checked
-"NUM_MINIBATCHES": 8 #checked
+"NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
 "GAE_LAMBDA": 0.95 #checked
 "CLIP_EPS": 0.2 #checked
@@ -54,7 +54,7 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
+"PROJECT": "crossenv_ued_vae_ippo"
 "WANDB_MODE" : "disabled"
 # VAE params
 "VAE_CKPT_PATH": "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl50.pkl"

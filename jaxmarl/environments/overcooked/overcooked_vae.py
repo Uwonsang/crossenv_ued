@@ -22,7 +22,6 @@ from jaxmarl.environments.overcooked.common import (
 from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
 
 from baselines.CEC_UED.VAE.Models.vae import Decoder
-from scipy.ndimage import label
 from baselines.CEC_UED.VAE.utils import load_checkpoint
 
 BASE_REW_SHAPING_PARAMS = {
@@ -514,12 +513,72 @@ class Overcooked_VAE(MultiAgentEnv):
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
     def custom_reset_vae(self, key: chex.PRNGKey, vae_decoder_params, vae_config):
-        
         STATIC_PAD = 8
         LATENT_DIM = vae_config['latent_dim']
         h, w = self.height, self.width
 
         decoder = Decoder(output_channel=vae_config['output_channels'])
+
+        def jax_layout_fn(pred_2d):
+            N = h * w
+            flat = pred_2d.reshape(-1, 5)  # (N, 5)
+
+            #0=pot, 1=wall, 2=onion_pile, 3=plate_pile, 4=goal
+            pot_idx = jnp.where(flat[:, 0] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            onion_pile_idx = jnp.where(flat[:, 2] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            plate_pile_idx = jnp.where(flat[:, 3] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            goal_idx = jnp.where(flat[:, 4] == 1, size=STATIC_PAD, fill_value=-1)[0]
+
+            occupied = flat[:, 0] | flat[:, 1] | flat[:, 2] | flat[:, 3] | flat[:, 4]
+            free = (1 - occupied).astype(jnp.bool_)
+            free_2d = free.reshape(h, w)
+            
+            labels = jnp.where(free, jnp.arange(N), N) 
+
+            def propagate(labels, _):
+                lab_2d = labels.reshape(h, w)
+                up    = jnp.pad(lab_2d[:-1, :], ((1,0),(0,0)), constant_values=N)
+                down  = jnp.pad(lab_2d[1:,  :], ((0,1),(0,0)), constant_values=N)
+                left  = jnp.pad(lab_2d[:, :-1], ((0,0),(1,0)), constant_values=N)
+                right = jnp.pad(lab_2d[:, 1:],  ((0,0),(0,1)), constant_values=N)
+                new_lab = jnp.minimum(lab_2d, jnp.minimum(
+                    jnp.minimum(up, down), jnp.minimum(left, right)))
+                new_lab = jnp.where(free_2d, new_lab, N)
+                return new_lab.flatten(), None
+
+            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
+
+            # --- filter isolated cells (size <= 1) ---
+            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            cell_counts = counts_per_label[propagated_labels]
+            filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
+
+            # --- unique component---
+            is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
+            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
+
+            # 1st component
+            best_label0 = jnp.argmax(rep_counts)
+            # 2nd component
+            rep_counts1 = rep_counts.at[best_label0].set(0)
+            best_label1 = jnp.argmax(rep_counts1)
+
+            valid = (rep_counts[best_label0] > 0) & (rep_counts1[best_label1] > 0)
+
+            # --- region probs ---
+            region0_mask = (filtered_labels == best_label0)
+            region1_mask = (filtered_labels == best_label1)
+
+            sum0 = region0_mask.sum()
+            sum1 = region1_mask.sum()
+
+            uniform = jnp.ones(N, ) / N
+            region0_probs = jnp.where(valid, region0_mask / jnp.where(sum0 > 0, sum0, 1.0), uniform)
+            region1_probs = jnp.where(valid, region1_mask / jnp.where(sum1 > 0, sum1, 1.0), uniform)
+
+            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
+
 
         def _single_attempt(key):
             key, subkey = jax.random.split(key)
@@ -528,73 +587,7 @@ class Overcooked_VAE(MultiAgentEnv):
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
-            def numpy_layout_fn(pred_2d_np):
-                flat = pred_2d_np.reshape(-1, 5)
-                pot_idx = np.where(flat[:, 0] == 1)[0]
-                onion_pile_idx = np.where(flat[:, 2] == 1)[0]
-                plate_pile_idx = np.where(flat[:, 3] == 1)[0]
-                goal_idx = np.where(flat[:, 4] == 1)[0]
-
-                occupied = flat[:, 0] | flat[:, 1] | flat[:, 2] | flat[:, 3] | flat[:, 4]
-                free = (1 - occupied)
-
-                labeled, num_features = label(free.reshape(h, w))
-                sizes = np.array([np.sum(labeled == i) for i in range(1, num_features + 1)])
-                filtered_labeled = np.where(np.isin(labeled, np.where(sizes <= 1)[0] + 1), 0, labeled)
-                filtered_free = (filtered_labeled > 0).astype(np.float32).flatten()
-
-                valid_labels = np.unique(filtered_labeled[filtered_labeled > 0])
-                num_valid = len(valid_labels)
-                if num_valid >= 2:
-                    valid_sizes = np.array([np.sum(filtered_labeled == l) for l in valid_labels])
-                    top2 = valid_labels[np.argsort(valid_sizes)[-2:]]
-                    region0_label = top2[1]  # largest region
-                    region1_label = top2[0]  # second largest region
-                    region0_probs = (filtered_labeled == region0_label).astype(np.float32).flatten()
-                    region1_probs = (filtered_labeled == region1_label).astype(np.float32).flatten()
-                    region0_probs /= region0_probs.sum()
-                    region1_probs /= region1_probs.sum()
-                    valid = np.array(True)
-                else:
-                    if filtered_free.sum() == 0:
-                        region0_probs = np.ones(h * w, dtype=np.float32) / (h * w)
-                        region1_probs = region0_probs.copy()
-                        valid = np.array(False)
-                    else:
-                        free_flat = filtered_free / filtered_free.sum()
-                        region0_probs = free_flat.copy()
-                        region1_probs = free_flat.copy()
-                        valid = np.array(True)
-
-                def pad(idx, max_n):
-                    out = np.full(max_n, -1, dtype=np.int32)
-                    n = min(len(idx), max_n)
-                    out[:n] = idx[:n]
-                    return out
-
-                return (
-                    pad(pot_idx,        STATIC_PAD),
-                    pad(onion_pile_idx, STATIC_PAD),
-                    pad(plate_pile_idx, STATIC_PAD),
-                    pad(goal_idx,       STATIC_PAD),
-                    region0_probs.astype(np.float32),
-                    region1_probs.astype(np.float32),
-                    valid,
-                )
-
-            # pure_callback to run numpy in JAX trace
-            result_shapes = (
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((h * w,),      jnp.float32),
-                jax.ShapeDtypeStruct((h * w,),      jnp.float32),
-                jax.ShapeDtypeStruct((),            jnp.bool_),
-            )
-
-            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax.pure_callback(
-                numpy_layout_fn, result_shapes, pred_2d)
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d)
 
             return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
 
@@ -633,7 +626,8 @@ class Overcooked_VAE(MultiAgentEnv):
 
         key, subkey = jax.random.split(key)
         region1_masked = region1_probs.at[agent0_flat].set(0.0)
-        region1_masked = region1_masked / jnp.sum(region1_masked)
+        masked_sum = jnp.sum(region1_masked)
+        region1_masked = jnp.where(masked_sum > 0, region1_masked / masked_sum, region1_probs)
         agent1_flat = jax.random.choice(subkey, h * w, p=region1_masked)
 
         agent_idx = jnp.array([agent0_flat, agent1_flat])

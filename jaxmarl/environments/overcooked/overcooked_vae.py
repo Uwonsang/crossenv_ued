@@ -164,6 +164,7 @@ class Overcooked_VAE(MultiAgentEnv):
         self.vae_decoder_params = vae_decoder_params
         self.vae_config = vae_config
         self.random_reset_fn = random_reset_fn
+        self.vae_decoder = Decoder(output_channel=self.vae_config['output_channels'])
     
     def action_to_string(self, action: int) -> str:
         return Actions(action).name
@@ -199,9 +200,6 @@ class Overcooked_VAE(MultiAgentEnv):
         )
     
     def reset(self, key: chex.PRNGKey, params=None):
-        params = {} if params is None else params
-        vae_decoder_params = params.get("vae_decoder_params", self.vae_decoder_params)
-        vae_config = params.get("vae_config", self.vae_config)
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -240,14 +238,14 @@ class Overcooked_VAE(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        obs, state = self.custom_reset_vae(key, vae_decoder_params=vae_decoder_params, vae_config=vae_config)
+        obs, state = self.custom_reset_vae(key)
         # TODO feasible test for vae
         
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(
             jnp.logical_and(check_match(state), self.check_held_out),
-            lambda k: self.custom_reset_vae(k, vae_decoder_params=vae_decoder_params, vae_config=vae_config),
+            lambda k: self.custom_reset_vae(k),
             lambda k: (obs, state), key)
 
         return lax.stop_gradient(obs), lax.stop_gradient(state)
@@ -512,12 +510,10 @@ class Overcooked_VAE(MultiAgentEnv):
         
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
-    def custom_reset_vae(self, key: chex.PRNGKey, vae_decoder_params, vae_config):
+    def custom_reset_vae(self, key: chex.PRNGKey):
         STATIC_PAD = 8
-        LATENT_DIM = vae_config['latent_dim']
+        LATENT_DIM = self.vae_config['latent_dim']
         h, w = self.height, self.width
-
-        decoder = Decoder(output_channel=vae_config['output_channels'])
 
         def jax_layout_fn(pred_2d):
             N = h * w
@@ -568,11 +564,10 @@ class Overcooked_VAE(MultiAgentEnv):
 
             return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
 
-
         def _single_attempt(key):
             key, subkey = jax.random.split(key)
             z = jax.random.normal(subkey, (1, LATENT_DIM))
-            pred = decoder.apply(vae_decoder_params, z)
+            pred = self.vae_decoder.apply(self.vae_decoder_params, z)
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
@@ -580,19 +575,10 @@ class Overcooked_VAE(MultiAgentEnv):
 
             return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
 
-        def cond_fn(carry):
-            *_, valid = carry
-            return ~valid
-
-        def body_fn(carry):
-            key = carry[0]
-            key, subkey = jax.random.split(key)
-            return _single_attempt(subkey)
-
         key, subkey = jax.random.split(key)
-        init = _single_attempt(subkey)
-        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = jax.lax.while_loop(
-            cond_fn, body_fn, init)
+        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey) 
+
+         #TODO jax.lax.while_loop is cause of low update speed need to use scan to roll the candidate
 
         # index to (x, y) pos (-1 is out of map range by uint32 casting)
         def idx_to_pos(idx):
@@ -1152,17 +1138,17 @@ if __name__ == "__main__":
     
     
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M")
-    env = initialize_environment(config)
-
-    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
-    import imageio
-
     vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl70.pkl"
     params, ckpt_config = load_checkpoint(vae_model_path)
     decoder_params = {"params": params["params"]["Decoder_0"]}
 
-    params={'random_reset_fn': 'reset_vae',
-            'vae_decoder_params': decoder_params, 'vae_config': ckpt_config} # reset_all or reset_counter_circuit, reset_coord_ring
+    config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
+    config["ENV_KWARGS"]["vae_config"] = ckpt_config
+
+    env = initialize_environment(config)
+
+    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
+    import imageio
     keys = jax.random.split(jax.random.PRNGKey(0), 100)
     def render_reset(key):
         obs, state = env.reset(key, params=params)
@@ -1172,7 +1158,7 @@ if __name__ == "__main__":
     save_path = "/app/jaxmarl/environments/overcooked/images_test"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
-        filename = f"image_{params['random_reset_fn']}_{i}.png"
+        filename = f"image_reset_vae_{i}.png"
         full_path = os.path.join(save_path, filename)
         imageio.imwrite(full_path, image)
         print(f"Saved {full_path}")

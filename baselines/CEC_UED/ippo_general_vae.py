@@ -286,9 +286,7 @@ def make_train(config, update_step=0):
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
 
-    obs, state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"],
-                                                                    "vae_decoder_params": config["ENV_KWARGS"]["vae_decoder_params"],
-                                                                    "vae_config": config["ENV_KWARGS"]["vae_config"]})
+    obs, state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
     env = LogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"], 
                                         "vae_decoder_params": config["ENV_KWARGS"]["vae_decoder_params"],
@@ -718,7 +716,6 @@ def main(config):
         rng = jax.random.PRNGKey(config["SEED"])
     
     # load vae decoder params
-    ckpt = pickle.load(open(config["VAE_CKPT_PATH"], 'rb'))
     params, ckpt_config = load_checkpoint(config["VAE_CKPT_PATH"])
     decoder_params = {"params": params["params"]["Decoder_0"]}
 

@@ -544,23 +544,45 @@ class Overcooked_VAE(MultiAgentEnv):
 
             propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
 
-            # --- find top 2 components ---
-            counts = jnp.bincount(propagated_labels, length=N + 1)
-            counts = counts.at[N].set(0)
-            best_label0 = jnp.argmax(counts)
-            counts2 = counts.at[best_label0].set(0)
-            best_label1 = jnp.argmax(counts2)
+            # --- filter isolated cells (size <= 1) ---
+            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            cell_counts = counts_per_label[propagated_labels]
+            filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
 
-            # --- valid check with filtered counts---
-            valid = (counts[best_label0] > 1) & (counts2[best_label1] > 1)
+            # --- unique component---
+            is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
+            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
+
+            # 1st component
+            best_label0 = jnp.argmax(rep_counts)
+            rep_counts0 = rep_counts[best_label0]
+
+            # 2nd component
+            rep_counts1 = rep_counts.at[best_label0].set(0)
+            best_label1 = jnp.argmax(rep_counts1)
+            rep_counts1_best = rep_counts1[best_label1]
+
+            has_first = rep_counts0 > 0
+            has_second = rep_counts1_best > 0
+            valid = has_first & has_second
 
             # --- region probs ---
-            region0_mask = (propagated_labels == best_label0)
-            region1_mask = (propagated_labels == best_label1)
+            region0_mask = (filtered_labels == best_label0)
+            region1_mask = (filtered_labels == best_label1)
 
-            uniform = jnp.ones((N,), dtype=jnp.float32) / N
-            region0_probs = jnp.where(valid, region0_mask / jnp.maximum(counts[best_label0], 1), uniform)
-            region1_probs = jnp.where(valid, region1_mask / jnp.maximum(counts2[best_label1], 1), uniform)
+            sum0 = region0_mask.sum()
+            sum1 = region1_mask.sum()
+
+            free_float = free.astype(jnp.float32)
+            free_sum = jnp.sum(free_float)
+            uniform = free_float / jnp.where(free_sum > 0, free_sum, 1.0)
+
+            region0_probs = jnp.where(has_first, region0_mask / jnp.where(sum0 > 0, sum0, 1.0), uniform)
+            
+            region1_probs = jnp.where(has_second,
+                            region1_mask.astype(jnp.float32) / jnp.where(sum1 > 0, sum1, 1.0),
+                            region0_mask.astype(jnp.float32) / jnp.where(sum0 > 0, sum0, 1.0))
 
             return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
 
@@ -602,7 +624,9 @@ class Overcooked_VAE(MultiAgentEnv):
         key, subkey = jax.random.split(key)
         region1_masked = region1_probs.at[agent0_flat].set(0.0)
         masked_sum = jnp.sum(region1_masked)
-        region1_masked = jnp.where(masked_sum > 0, region1_masked / masked_sum, region1_probs)
+        region1_masked = jnp.where(masked_sum > 0,
+                            region1_masked / masked_sum,
+                            region0_probs.at[agent0_flat].set(0.0) / jnp.maximum(jnp.sum(region0_probs.at[agent0_flat].set(0.0)), 1.0))
         agent1_flat = jax.random.choice(subkey, h * w, p=region1_masked)
 
         agent_idx = jnp.array([agent0_flat, agent1_flat])

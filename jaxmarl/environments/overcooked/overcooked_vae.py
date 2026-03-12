@@ -529,7 +529,7 @@ class Overcooked_VAE(MultiAgentEnv):
             plate_pile_idx = jnp.where(flat[:, 3] == 1, size=STATIC_PAD, fill_value=-1)[0]
             goal_idx = jnp.where(flat[:, 4] == 1, size=STATIC_PAD, fill_value=-1)[0]
 
-            occupied = flat[:, 0] | flat[:, 1] | flat[:, 2] | flat[:, 3] | flat[:, 4]
+            occupied = flat.sum(axis=-1) > 0
             free = (1 - occupied).astype(jnp.bool_)
             free_2d = free.reshape(h, w)
             
@@ -548,34 +548,23 @@ class Overcooked_VAE(MultiAgentEnv):
 
             propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
 
-            # --- filter isolated cells (size <= 1) ---
-            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
-            cell_counts = counts_per_label[propagated_labels]
-            filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
+            # --- find top 2 components ---
+            counts = jnp.bincount(propagated_labels, length=N + 1)
+            counts = counts.at[N].set(0)
+            best_label0 = jnp.argmax(counts)
+            counts2 = counts.at[best_label0].set(0)
+            best_label1 = jnp.argmax(counts2)
 
-            # --- unique component---
-            is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
-            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
-            rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
-
-            # 1st component
-            best_label0 = jnp.argmax(rep_counts)
-            # 2nd component
-            rep_counts1 = rep_counts.at[best_label0].set(0)
-            best_label1 = jnp.argmax(rep_counts1)
-
-            valid = (rep_counts[best_label0] > 0) & (rep_counts1[best_label1] > 0)
+            # --- valid check with filtered counts---
+            valid = (counts[best_label0] > 1) & (counts2[best_label1] > 1)
 
             # --- region probs ---
-            region0_mask = (filtered_labels == best_label0)
-            region1_mask = (filtered_labels == best_label1)
+            region0_mask = (propagated_labels == best_label0)
+            region1_mask = (propagated_labels == best_label1)
 
-            sum0 = region0_mask.sum()
-            sum1 = region1_mask.sum()
-
-            uniform = jnp.ones(N, ) / N
-            region0_probs = jnp.where(valid, region0_mask / jnp.where(sum0 > 0, sum0, 1.0), uniform)
-            region1_probs = jnp.where(valid, region1_mask / jnp.where(sum1 > 0, sum1, 1.0), uniform)
+            uniform = jnp.ones((N,), dtype=jnp.float32) / N
+            region0_probs = jnp.where(valid, region0_mask / jnp.maximum(counts[best_label0], 1), uniform)
+            region1_probs = jnp.where(valid, region1_mask / jnp.maximum(counts2[best_label1], 1), uniform)
 
             return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
 

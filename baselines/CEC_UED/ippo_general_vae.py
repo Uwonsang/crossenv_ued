@@ -342,6 +342,10 @@ def make_train(config, update_step=0):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
+        # TODO : rollout for calculate regret
+        # TODO : Adversarial update
+
+
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
         def _update_step(update_runner_state, unused):
@@ -805,27 +809,5 @@ def main(config):
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
     print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
     
-    
-    '''updates_x = jnp.arange(out["metrics"]["total_loss"][0].shape[0])
-    loss_table = jnp.stack([updates_x, out["metrics"]["total_loss"].mean(axis=0), out["metrics"]["actor_loss"].mean(axis=0), out["metrics"]["critic_loss"].mean(axis=0), out["metrics"]["entropy"].mean(axis=0), out["metrics"]["ratio"].mean(axis=0)], axis=1)    
-    loss_table = wandb.Table(data=loss_table.tolist(), columns=["updates", "total_loss", "actor_loss", "critic_loss", "entropy", "ratio"])'''
-    '''print('shape', out["metrics"]["returned_episode_returns"][0].shape)
-    updates_x = jnp.arange(out["metrics"]["returned_episode_returns"][0].shape[0])
-    returns_table = jnp.stack([updates_x, out["metrics"]["returned_episode_returns"].mean(axis=0)], axis=1)
-    returns_table = wandb.Table(data=returns_table.tolist(), columns=["updates", "returns"])
-    wandb.log({
-        "returns_plot": wandb.plot.line(returns_table, "updates", "returns", title="returns_vs_updates"),
-        "returns": out["metrics"]["returned_episode_returns"][:,-1].mean(),
-        
-    })'''
-
-'''
-"total_loss_plot": wandb.plot.line(loss_table, "updates", "total_loss", title="total_loss_vs_updates"),
-        "actor_loss_plot": wandb.plot.line(loss_table, "updates", "actor_loss", title="actor_loss_vs_updates"),
-        "critic_loss_plot": wandb.plot.line(loss_table, "updates", "critic_loss", title="critic_loss_vs_updates"),
-        "entropy_plot": wandb.plot.line(loss_table, "updates", "entropy", title="entropy_vs_updates"),
-        "ratio_plot": wandb.plot.line(loss_table, "updates", "ratio", title="ratio_vs_updates"),
-'''
-
 if __name__ == "__main__":
     main()

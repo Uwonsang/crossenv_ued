@@ -1115,18 +1115,19 @@ if __name__ == "__main__":
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config
-
     env = initialize_environment(config)
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
     keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    def render_reset(key):
-        obs, state = env.reset(key, params=params)
+    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
+    
+    def render_reset(z):
+        key_env = jax.random.PRNGKey(0)
+        obs, state = env.reset(key_env, params={**params, "z": z[None, :]})
         return render_fn(state)
-    images = jax.jit(jax.vmap(render_reset))(keys)
-    # for each image, save it as a png
-    save_path = "/app/jaxmarl/environments/overcooked/images_test"
+    images = jax.jit(jax.vmap(render_reset))(z_list)
+    save_path = "/app/jaxmarl/environments/overcooked/images/test_1"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
         filename = f"image_reset_vae_{i}.png"

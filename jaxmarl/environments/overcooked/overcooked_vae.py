@@ -200,6 +200,7 @@ class Overcooked_VAE(MultiAgentEnv):
         )
     
     def reset(self, key: chex.PRNGKey, params=None):
+        z = params.get("z")
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -238,14 +239,14 @@ class Overcooked_VAE(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        obs, state = self.custom_reset_vae(key)
+        obs, state = self.custom_reset_vae(key, z)
         # TODO feasible test for vae
         
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(
             jnp.logical_and(check_match(state), self.check_held_out),
-            lambda k: self.custom_reset_vae(k),
+            lambda k: self.custom_reset_vae(k, z),
             lambda k: (obs, state), key)
 
         return lax.stop_gradient(obs), lax.stop_gradient(state)
@@ -510,7 +511,7 @@ class Overcooked_VAE(MultiAgentEnv):
         
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
-    def custom_reset_vae(self, key: chex.PRNGKey):
+    def custom_reset_vae(self, key: chex.PRNGKey, z=None):
         STATIC_PAD = 8
         LATENT_DIM = self.vae_config['latent_dim']
         h, w = self.height, self.width
@@ -586,9 +587,9 @@ class Overcooked_VAE(MultiAgentEnv):
 
             return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
 
-        def _single_attempt(key):
+        def _single_attempt(key, z):
             key, subkey = jax.random.split(key)
-            z = jax.random.normal(subkey, (1, LATENT_DIM))
+            z = z[None, :] if z.ndim == 1 else z # z is a single latent vector (latent_dim,), but Decoder expects (B, latent_dim)
             pred = self.vae_decoder.apply(self.vae_decoder_params, z)
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
@@ -598,7 +599,7 @@ class Overcooked_VAE(MultiAgentEnv):
             return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
 
         key, subkey = jax.random.split(key)
-        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey) 
+        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
 
          #TODO jax.lax.while_loop is cause of low update speed need to use scan to roll the candidate
 

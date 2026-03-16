@@ -1154,11 +1154,21 @@ if __name__ == "__main__":
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-    keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
+    #keys = jax.random.split(jax.random.PRNGKey(0), 100)
+    #z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
+
+    ### 수정 부분
+    seed = int(time.time())
+
+    base_key = jax.random.PRNGKey(seed)
+    key_z, key_env = jax.random.split(base_key)
+
+    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"]))
+    keys = jax.random.split(key_env, 100)
+    ###
     
     def render_reset(z):
-        key_env = jax.random.PRNGKey(0)
+        # key_env = jax.random.PRNGKey(0) ## 이것도 변경 부분
         obs, state = env.reset(key_env, params={**params, "z": z[None, :]})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)

@@ -240,8 +240,43 @@ class Overcooked_VAE(MultiAgentEnv):
             return some_match
 
         obs, state = self.custom_reset_vae(key, z)
+
+
+
         # TODO feasible test for vae
-        
+        padding = (state.maze_map.shape[0] - self.height) // 2
+        maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
+
+        pot_count = jnp.sum(maze_map == OBJECT_TO_INDEX["pot"])
+        onion_count = jnp.sum(maze_map == OBJECT_TO_INDEX["onion_pile"])
+        plate_count = jnp.sum(maze_map == OBJECT_TO_INDEX["plate_pile"])
+        goal_count = jnp.sum(maze_map == OBJECT_TO_INDEX["goal"])
+
+        is_valid = (
+            (pot_count > 0) &
+            (onion_count > 0) &
+            (plate_count > 0) &
+            (goal_count > 0)
+        )
+
+        jax.debug.print(
+            "[layout check] pot={p}, onion={o}, plate={pl}, goal={g}, valid={v}",
+            p=pot_count,
+            o=onion_count,
+            pl=plate_count,
+            g=goal_count,
+            v=is_valid
+        )
+
+        # 일단 간단히: 필수 물체가 하나라도 없으면 한 번 더 생성
+        # key = jax.random.split(key)[0]
+        # obs, state = jax.lax.cond(
+        #     is_valid,
+        #     lambda k: (obs, state),
+        #     lambda k: self.custom_reset_vae(k, z),
+        #     key
+        # )
+
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(

@@ -353,7 +353,7 @@ def make_train(config, update_step=0):
             def _sample_z(k):
                 return z_gen.get_z(adversary_state, k)
 
-            z_new, z_old, logp, z_current, z_prior = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z)
+            z_new, z_old, z_log_probs, z_current, z_prior = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z)
 
             keys_env = jax.random.split(key_env, config["NUM_ENVS"])
 
@@ -363,9 +363,9 @@ def make_train(config, update_step=0):
 
             obsv, env_state = jax.vmap(_reset_env, in_axes=(0, 0), out_axes=0)(keys_env, z_new)
 
-            return obsv, env_state, adversary_state, z_new, z_old, logp, z_current, z_prior
+            return obsv, env_state, adversary_state, z_new, z_old, z_log_probs, z_current, z_prior
 
-        obsv, env_state, adversary_state, z_new, z_old, logp, z_current, z_prior = \
+        obsv, env_state, adversary_state, z_new, z_old, z_log_probs, z_current, z_prior = \
             _reset_all_envs(_rng, adversary_state)
         
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
@@ -377,7 +377,8 @@ def make_train(config, update_step=0):
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step, adversary_state = runner_state
+                (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
+                z_new, z_old, z_log_probs, z_current, z_prior, update_step) = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -415,26 +416,28 @@ def make_train(config, update_step=0):
                 # --- Manually reset only done envs (no auto-reset) ---
                 rng, _rng = jax.random.split(rng)
                 rng_reset = jax.random.split(_rng, config["NUM_ENVS"])
-                def _reset_if_done(done_i, rng_i, env_state_i, obsv_i):
+                #TODO : check the layout of reset, is it reset with after done?
+                def _reset_if_done(done_i, rng_i, env_state_i, obsv_i, z_new_i, z_old_i, logp_i, z_current_i, z_prior_i):
                     """Reset a single env if its episode is done, otherwise keep as is."""
                     def do_reset(_):
                         key_z, key_env = jax.random.split(rng_i)
-                        z_new_i, z_old_i, logp_i, z_current_i, z_prior_i = z_gen.get_z(
+                        z_new_i_new, z_old_i_new, logp_i_new, z_current_i_new, z_prior_i_new = z_gen.get_z(
                             adversary_state, key_z
                         )
                         obsv_new_i, env_state_new_i = env.reset(
                             key_env, params={"z": z_new_i}
                         )
-                        return obsv_new_i, env_state_new_i
+                        return (obsv_new_i, env_state_new_i,
+                                z_new_i_new, z_old_i_new, logp_i_new, z_current_i_new, z_prior_i_new)
 
                     def keep(_):
-                        return obsv_i, env_state_i
+                        return (obsv_i, env_state_i, z_new_i, z_old_i, logp_i, z_current_i, z_prior_i)
 
                     return jax.lax.cond(done_i, do_reset, keep, operand=None)
 
-                obsv, env_state = jax.vmap(
-                    _reset_if_done, in_axes=(0, 0, 0, 0), out_axes=(0, 0)
-                )(done_all, rng_reset, env_state, obsv)
+                obsv, env_state, z_new, z_old, z_log_probs, z_current, z_prior = jax.vmap(
+                    _reset_if_done, in_axes=(0, 0, 0, 0, 0, 0, 0, 0, 0), out_axes=(0, 0, 0, 0, 0, 0, 0)
+                )(done_all, rng_reset, env_state, obsv, z_new, z_old, z_log_probs, z_current, z_prior)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -449,19 +452,26 @@ def make_train(config, update_step=0):
                     info,
                     agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, adversary_state)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state,
+                                z_new, z_old, z_log_probs, z_current, z_prior, update_step)
                 return runner_state, transition
 
-            initial_hstate = runner_state[-3]
-            (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state) = runner_state
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps, adversary_state)
+            (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state, 
+            z_new, z_old, z_log_probs, z_current, z_prior) = runner_state
+            initial_hstate = hstate
+            eval_start_state = (env_state, obsv, done_batch, hstate, rng)
+
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, 
+            adversary_state, z_new, z_old, z_log_probs, z_current, z_prior, update_steps)
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps, adversary_state = runner_state
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state)
+            (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
+             z_new, z_old, z_log_probs, z_current, z_prior, update_steps) = runner_state
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
+                            z_new, z_old, z_log_probs, z_current, z_prior)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
@@ -648,11 +658,73 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
+            # TODO check the layout of evaluation
+            def _env_step_eval(runner_state_eval, unused):
+                train_state, env_state_eval, obsv_eval, done_eval, hstate_eval, rng_eval = runner_state_eval
+
+                rng_eval, _rng = jax.random.split(rng_eval)
+                obs_batch = batchify(obsv_eval, env.agents, config["NUM_ACTORS"])
+                agent_positions = {"agent_0": env_state_eval.env_state.agent_pos, "agent_1": env_state_eval.env_state.agent_pos}
+                agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
+                ac_in = (
+                    obs_batch[np.newaxis, :],
+                    done_eval[np.newaxis, :],
+                    agent_positions[np.newaxis, :],
+                )
+                hstate_eval, pi_eval, _ = network.apply(train_state.params, hstate_eval, ac_in)
+                action_eval = pi_eval.sample(seed=_rng)
+
+                env_act_eval = unbatchify(
+                    action_eval, env.agents, config["NUM_ENVS"], env.num_agents
+                )
+                env_act_eval = {k: v.squeeze() for k, v in env_act_eval.items()}
+
+                rng_eval, _rng = jax.random.split(rng_eval)
+                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
+                obsv_next, env_state_next, reward_eval, done_next, info_eval = jax.vmap(
+                    env.step_env, in_axes=(0, 0, 0)
+                )(rng_step, env_state_eval, env_act_eval)
+                shaped_reward_eval = info_eval['shaped_reward']
+                reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
+                reward_eval = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward_eval, shaped_reward_eval)
+
+                done_batch_next = batchify(done_next, env.agents, config["NUM_ACTORS"]).squeeze()
+
+                runner_state_eval_next = (
+                    train_state,
+                    env_state_next,
+                    obsv_next,
+                    done_batch_next,
+                    hstate_eval,
+                    rng_eval,
+                )
+
+                reward_eval = batchify(reward_eval, env.agents, config["NUM_ACTORS"]).squeeze()
+                return runner_state_eval_next, reward_eval
+
+            env_state0, obsv0, done_batch0, hstate0, rng0 = eval_start_state
+            runner_state_eval0 = (train_state, env_state0, obsv0, done_batch0, hstate0, rng0)    
+            runner_state_eval, reward_eval_seq = jax.lax.scan(
+                _env_step_eval, runner_state_eval0, None, config["NUM_STEPS"])
+            
+            # TODO : check the layout of reward
+            current_reward = jnp.transpose(traj_batch.reward, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
+            trained_reward = jnp.transpose(reward_eval_seq, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
+            current_reward = current_reward[:,0,:].sum(axis=1) # choose agent 0
+            trained_reward = trained_reward[:,0,:].sum(axis=1)
+
+            metric["current_reward_per_env"] = current_reward
+            metric["trained_reward_per_env"] = trained_reward
+
+            rng, _rng = jax.random.split(rng)
+            adversary_state, train_info = z_gen.train_step(adversary_state, _rng, current_reward, trained_reward, 
+                                                           z_new, z_old, z_log_probs, z_current, z_prior)
+            metric["adversary_train_info"] = train_info
+
+
             def callback(metric):
                 wandb.log(
                     {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
                         "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                         **metric["loss"],
@@ -662,7 +734,8 @@ def make_train(config, update_step=0):
             metric["update_steps"] = update_steps
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state)  # hstate resets automatically
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
+                            z_new, z_old, z_log_probs, z_current, z_prior)  # hstate resets automatically
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -674,6 +747,7 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
             adversary_state,
+            z_new, z_old, z_log_probs, z_current, z_prior
         )
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])

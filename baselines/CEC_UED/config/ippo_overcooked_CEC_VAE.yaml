@@ -5,7 +5,7 @@
 "NUM_STEPS": 256 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
+"TOTAL_TIMESTEPS": 3e6 #checked #for overcooked : 3e9
 "MAX_TRAIN_STEPS": 3e6 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
@@ -58,3 +58,26 @@
 "WANDB_MODE" : "disabled"
 # VAE params
 "VAE_CKPT_PATH": "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl50.pkl"
+
+"z_dim": 16 # replace with vae config
+
+"kl_coeff": 5.0
+"entropy_coeff": 0.01
+"use_mean_clipping": False
+"clip_mean_min": -0.5
+"clip_mean_max": 0.5
+"scale_log_std": 4.0
+"scale_std_offset": 1.0
+"use_std_scaling": False
+"vae_z_generator": "adversarial" # gaussian or adversarial
+"vae_z_change_prob": 0 # TODO check what is meaning
+"gen_hidden_dim": 128
+"use_kl": True
+"use_entropy": False
+"adversary_learning_rate": 0.0005
+"adversary_weight_decay": 0.0001
+"use_grad_clip": True
+"grad_clip_norm": 0.5
+"use_lr_scheduler": True
+"start_factor": 1.0
+"end_factor": 0.9

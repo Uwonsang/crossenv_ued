@@ -96,9 +96,8 @@ class AdversarialZ:
 
         z_current = distrax.Normal(mean, std)
         z_sample_new = z_current.sample(seed=key2)
-        log_prob = z_current.log_prob(z_sample_new)
 
-        return z_sample_new, z_sample_old, log_prob, z_current, z_prior
+        return z_sample_new, z_sample_old, z_prior
         
     def compute_policy_stats(self, apply_fn, params, old_dist_diag=None, key=None):
         """Compute policy distribution stats after update."""
@@ -117,22 +116,28 @@ class AdversarialZ:
         return entropy, kl_div
 
     def train_step(self, z_gen_state, key, current_reward, trained_reward, 
-                         z_new, z_old, z_log_probs, z_current, z_prior):
+                         z_new, z_old, z_prior):
 
-        # No grad
+        # No grad (baseline)
         key, k_diag = jax.random.split(key)
         z_normal_diag = jax.random.normal(k_diag, (self.batch_size, self.z_dim))
-        old_mean_diag, old_log_std_diag = self._apply_net(z_gen_state.apply_fn, z_gen_state.params, z_normal_diag)
-        old_std_diag = jnp.exp(old_log_std_diag) + 1e-6
-        old_dist_diag = distrax.Normal(old_mean_diag, old_std_diag)
+        baseline_mean_diag, baseline_log_std_diag = self._apply_net(z_gen_state.apply_fn, z_gen_state.params, z_normal_diag)
+        baseline_std_diag = jnp.exp(baseline_log_std_diag) + 1e-6
+        baseline_dist_diag = distrax.Normal(baseline_mean_diag, baseline_std_diag)
 
         def loss_fn(params):
             raw_regret = trained_reward - current_reward
             regret = (raw_regret - raw_regret.mean()) / (raw_regret.std() + 1e-8)
-            weighted_log_probs = z_log_probs.sum(axis=1) * regret 
 
-            kl_div = self.kl_divergence(z_current, old_dist_diag)
-            entropy = z_current.entropy().mean()
+            mean, log_std = self._apply_net(z_gen_state.apply_fn, params, z_old)
+            std = jnp.exp(log_std) + 1e-6
+            new_dist = distrax.Normal(mean, std)
+
+            log_probs = new_dist.log_prob(jax.lax.stop_gradient(z_new))
+            weighted_log_probs = log_probs.sum(axis=1) * regret
+            
+            kl_div = self.kl_divergence(new_dist, z_prior)
+            entropy = new_dist.entropy().mean()
 
             loss = (
                 -weighted_log_probs.mean()
@@ -148,7 +153,7 @@ class AdversarialZ:
         
         key, k_stats = jax.random.split(key)
         entropy_diag, kl_diag = self.compute_policy_stats(apply_fn=new_z_gen_state.apply_fn, params=new_z_gen_state.params, 
-                                            old_dist_diag=old_dist_diag, key=k_stats)
+                                            old_dist_diag=baseline_dist_diag, key=k_stats)
         
         train_info = {
             "loss": loss,

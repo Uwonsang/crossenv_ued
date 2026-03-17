@@ -93,43 +93,65 @@ def make_adjacent_access_mask(
     access_mask = jnp.logical_and(adjacent_mask, passable_mask)
     return access_mask
 
+def is_not_done(state: ReachabilityState):
+    return jnp.logical_not(state.done)
 
-def flood_step_until_target(flood_path_net, state: ReachabilityState) -> ReachabilityState:
+
+def _expand_flood_once(flood_input: chex.Array) -> chex.Array:
+    """
+    flood_path_net 없이 map_validate.py 내부에서 직접 flood 1-step 확장.
+    flood_input[..., 0] = occupied_map (1이면 막힘)
+    flood_input[..., 1] = current_flood
+    """
+    occupied_map = flood_input[..., 0]
+    current_flood = flood_input[..., 1]
+
+    up = shift_up(current_flood)
+    down = shift_down(current_flood)
+    left = shift_left(current_flood)
+    right = shift_right(current_flood)
+
+    expanded = jnp.logical_or(current_flood > 0, up > 0)
+    expanded = jnp.logical_or(expanded, down > 0)
+    expanded = jnp.logical_or(expanded, left > 0)
+    expanded = jnp.logical_or(expanded, right > 0)
+
+    # 벽 타일은 flood 불가
+    expanded = jnp.logical_and(expanded, occupied_map == 0)
+
+    expanded = expanded.astype(jnp.float32)
+    flood_out = jnp.stack([occupied_map, expanded], axis=-1)
+    return flood_out
+
+
+def flood_step_until_target(state: ReachabilityState) -> ReachabilityState:
     flood_input = state.flood_input
     flood_count = state.flood_count
     target_mask = state.target_mask
 
-    occupied_map = flood_input[..., 0]
-
-    flood_out = flood_path_net._conv(flood_input)
-    flood_out = jnp.clip(flood_out, a_min=0, a_max=1)
-    flood_out = jnp.stack([occupied_map, flood_out[..., -1]], axis=-1)
-
+    flood_out = _expand_flood_once(flood_input)
     new_flood_count = flood_count + flood_out[..., -1]
 
     reached_target = jnp.any(jnp.logical_and(new_flood_count > 0, target_mask))
     no_change = jnp.all(flood_input == flood_out)
     done = jnp.logical_or(reached_target, no_change)
 
-    new_state = ReachabilityState(
+    return ReachabilityState(
         flood_input=flood_out,
         flood_count=new_flood_count,
         target_mask=target_mask,
         done=done,
     )
-    return new_state
 
 
 def is_target_reachable(
-    flood_path_net,
     env_map: chex.Array,
     start_mask: chex.Array,
     target_mask: chex.Array,
     passable_tiles: Tuple[int, ...],
 ):
     """
-    start_mask 에서 시작해서
-    target_mask 중 하나라도 reachable 한지 검사한다.
+    start_mask 에서 시작해서 target_mask 중 하나라도 reachable 한지 검사한다.
     """
     passable_mask = make_passable_mask(env_map, passable_tiles)
     occupied_map = jnp.logical_not(passable_mask).astype(jnp.float32)
@@ -148,7 +170,7 @@ def is_target_reachable(
 
     final_state = jax.lax.while_loop(
         cond_fun=is_not_done,
-        body_fun=lambda s: flood_step_until_target(flood_path_net, s),
+        body_fun=flood_step_until_target,
         init_val=init_state,
     )
 
@@ -178,13 +200,12 @@ def count_required_objects(env_map: chex.Array, object_to_index: dict):
 
 def validate_layout(
     maze_map: chex.Array,
-    flood_path_net,
     passable_tiles: Tuple[int, ...],
     object_to_index: dict,
     player_tiles: Tuple[int, ...],
 ) -> LayoutValidationResult:
     """
-    1. object counting 검사
+    1. 필수 object counting 검사
     2. player 시작 위치에서 각 object 옆 칸까지 갈 수 있는지 검사
     """
     pot_count, onion_count, plate_count, goal_count, count_ok = count_required_objects(
@@ -216,28 +237,24 @@ def validate_layout(
     )
 
     onion_reachable = is_target_reachable(
-        flood_path_net,
         maze_map,
         start_mask,
         onion_access_mask,
         passable_tiles,
     )
     plate_reachable = is_target_reachable(
-        flood_path_net,
         maze_map,
         start_mask,
         plate_access_mask,
         passable_tiles,
     )
     pot_reachable = is_target_reachable(
-        flood_path_net,
         maze_map,
         start_mask,
         pot_access_mask,
         passable_tiles,
     )
     goal_reachable = is_target_reachable(
-        flood_path_net,
         maze_map,
         start_mask,
         goal_access_mask,
@@ -253,7 +270,7 @@ def validate_layout(
 
     valid = count_ok & reachable_ok
 
-    result = LayoutValidationResult(
+    return LayoutValidationResult(
         pot_count=pot_count,
         onion_count=onion_count,
         plate_count=plate_count,
@@ -266,7 +283,7 @@ def validate_layout(
         reachable_ok=reachable_ok,
         valid=valid,
     )
-    return result
+
 
 
 def debug_print_layout_result(result):

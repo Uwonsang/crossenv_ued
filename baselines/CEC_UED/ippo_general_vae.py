@@ -25,7 +25,6 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
@@ -131,7 +130,6 @@ class ScannedRNN(nn.Module):
         return nn.OptimizedLSTMCell(features=hidden_size).initialize_carry(
             jax.random.PRNGKey(0), (batch_size, hidden_size)
         )
-
 
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
@@ -241,7 +239,6 @@ class ActorCriticRNN(nn.Module):
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
-
 class Transition(NamedTuple):
     global_done: jnp.ndarray
     done: jnp.ndarray
@@ -287,11 +284,9 @@ def make_train(config, update_step=0):
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
 
-    # Initialize z generator
-    z_gen = AdversarialZ(config, jax.random.PRNGKey(config["SEED"]), run_dir=None)
-    init_z = jax.random.normal(jax.random.PRNGKey(config["SEED"]), (1, config["ENV_KWARGS"]['vae_config']['latent_dim']))
-
-    obs, state = env.reset(jax.random.PRNGKey(0), params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"], "z": init_z})
+    rng, _rng1, _rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
+    init_z = jax.random.normal(_rng1, (config["NUM_ENVS"], config["ENV_KWARGS"]['vae_config']['latent_dim']))
+    obs, state = env.reset(_rng2, params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"], "z": init_z})
 
     env = LogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
@@ -305,6 +300,10 @@ def make_train(config, update_step=0):
         return config["LR"] * frac
 
     def train(rng, model_params=None, update_step=0):
+        # Initialize z generator
+        rng, _rng = jax.random.split(rng)
+        z_gen = AdversarialZ(config, linear_schedule, _rng)
+
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -425,7 +424,7 @@ def make_train(config, update_step=0):
                             adversary_state, key_z
                         )
                         obsv_new_i, env_state_new_i = env.reset(
-                            key_env, params={"z": z_new_i}
+                            key_env, params={"z": z_new_i_new}
                         )
                         return (obsv_new_i, env_state_new_i,
                                 z_new_i_new, z_old_i_new, logp_i_new, z_current_i_new, z_prior_i_new)
@@ -459,7 +458,7 @@ def make_train(config, update_step=0):
             (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state, 
             z_new, z_old, z_log_probs, z_current, z_prior) = runner_state
             initial_hstate = hstate
-            eval_start_state = (env_state, obsv, done_batch, hstate, rng)
+            eval_start_state = (env_state, obsv, done_batch, hstate, rng, update_steps)
 
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, 
             adversary_state, z_new, z_old, z_log_probs, z_current, z_prior, update_steps)
@@ -470,6 +469,12 @@ def make_train(config, update_step=0):
             # CALCULATE ADVANTAGE
             (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
              z_new, z_old, z_log_probs, z_current, z_prior, update_steps) = runner_state
+
+            z_sample_info = {
+                'z_sample/mean': z_new.mean(),
+                'z_sample/std': z_new.std(),
+                'log_prob': z_log_probs.mean()}
+
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
                             z_new, z_old, z_log_probs, z_current, z_prior)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
@@ -660,7 +665,7 @@ def make_train(config, update_step=0):
 
             # TODO check the layout of evaluation
             def _env_step_eval(runner_state_eval, unused):
-                train_state, env_state_eval, obsv_eval, done_eval, hstate_eval, rng_eval = runner_state_eval
+                train_state, env_state_eval, obsv_eval, done_eval, hstate_eval, rng_eval, update_step = runner_state_eval
 
                 rng_eval, _rng = jax.random.split(rng_eval)
                 obs_batch = batchify(obsv_eval, env.agents, config["NUM_ACTORS"])
@@ -697,17 +702,17 @@ def make_train(config, update_step=0):
                     done_batch_next,
                     hstate_eval,
                     rng_eval,
+                    update_step,
                 )
 
                 reward_eval = batchify(reward_eval, env.agents, config["NUM_ACTORS"]).squeeze()
                 return runner_state_eval_next, reward_eval
 
-            env_state0, obsv0, done_batch0, hstate0, rng0 = eval_start_state
-            runner_state_eval0 = (train_state, env_state0, obsv0, done_batch0, hstate0, rng0)    
+            env_state0, obsv0, done_batch0, hstate0, rng0, update_step = eval_start_state
+            runner_state_eval0 = (train_state, env_state0, obsv0, done_batch0, hstate0, rng0, update_step)    
             runner_state_eval, reward_eval_seq = jax.lax.scan(
                 _env_step_eval, runner_state_eval0, None, config["NUM_STEPS"])
             
-            # TODO : check the layout of reward
             current_reward = jnp.transpose(traj_batch.reward, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
             trained_reward = jnp.transpose(reward_eval_seq, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
             current_reward = current_reward[:,0,:].sum(axis=1) # choose agent 0
@@ -719,8 +724,6 @@ def make_train(config, update_step=0):
             rng, _rng = jax.random.split(rng)
             adversary_state, train_info = z_gen.train_step(adversary_state, _rng, current_reward, trained_reward, 
                                                            z_new, z_old, z_log_probs, z_current, z_prior)
-            metric["adversary_train_info"] = train_info
-
 
             def callback(metric):
                 wandb.log(
@@ -730,12 +733,21 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
+                z_gen.log_train_info(metric["adversary"])
+                
+                save_interval = config["NUM_UPDATES"] // 19
+                step = int(metric["update_steps"])
+                if (step % save_interval == 0 or step == config["NUM_UPDATES"] - 1):
+                    z_gen.save(metric["adversary_params"], step)
+            
+            metric["adversary"] = {**train_info, **z_sample_info}
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["adversary_params"] = adversary_state.params
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                            z_new, z_old, z_log_probs, z_current, z_prior)  # hstate resets automatically
+                            z_new, z_old, z_log_probs, z_current, z_prior)
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -850,6 +862,7 @@ def main(config):
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    config["filepath"] = filepath
     
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
@@ -873,7 +886,7 @@ def main(config):
     # save model
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1], 'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]}
+        ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1}
         pickle.dump(ckpt, f)
 
     # plot reward vs update step with seaborn

@@ -32,38 +32,38 @@ class AdversaryNet(nn.Module):
         return mean, log_std
 
 class AdversarialZ:
-    def __init__(self, config, key, run_dir: str = None):
-        self.z_dim         = config["ENV_KWARGS"]['vae_config']['latent_dim']
-        self.batch_size    = config["NUM_ENVS"]
-        self.hidden_dim    = config["gen_hidden_dim"]
-        self.use_wandb     = config["WANDB_MODE"] # have to fix
-        self.kl_coeff      = config["kl_coeff"]
-        self.entropy_coeff = config["entropy_coeff"]
+    def __init__(self, config, lr_schedule, key):
+        self.z_dim = config["ENV_KWARGS"]['vae_config']['latent_dim']
+        self.batch_size = config["NUM_ENVS"]
+        self.hidden_dim = config["gen_hidden_dim"]
+        self.wandb_mode = config["WANDB_MODE"]
+        self.kl_coeff = config["kl_coeff"] if config["use_kl"] else 0
+        self.entropy_coeff = config["entropy_coeff"] if config["use_entropy"] else 0
 
         self.use_mean_clipping = config["use_mean_clipping"]
-        self.clip_mean_min     = getattr(config, 'clip_mean_min', -0.5)
-        self.clip_mean_max     = getattr(config, 'clip_mean_max',  0.5)
+        self.clip_mean_min     = config.get('clip_mean_min', -0.5)
+        self.clip_mean_max     = config.get('clip_mean_max',  0.5)
         self.use_std_scaling   = config["use_std_scaling"]
-        self.scale_log_std     = getattr(config, 'scale_log_std',   1.0)
-        self.scale_std_offset  = getattr(config, 'scale_std_offset', 0.0)
+        self.scale_log_std     = config.get('scale_log_std',   1.0)
+        self.scale_std_offset  = config.get('scale_std_offset', 0)
 
-        if not self.use_wandb and run_dir is not None:
-            self.log_dir  = os.path.join(run_dir, "logs")
-            self.save_dir = os.path.join(run_dir, "models")
-            os.makedirs(self.log_dir,  exist_ok=True)
+        if config["filepath"] is not None:
+            self.save_dir = os.path.join(config["filepath"], "models")
             os.makedirs(self.save_dir, exist_ok=True)
 
         self.net = AdversaryNet(z_dim=self.z_dim, hidden_dim=self.hidden_dim)
-        tx = self._build_optimizer(config)
-        dummy_z = jnp.zeros((1, self.z_dim))
-        params = self.net.init(key, dummy_z)
+        params = self.net.init(key, jnp.zeros((1, self.z_dim)))
+        tx = self._build_optimizer(config, lr_schedule)
         self.init_state = TrainState.create(apply_fn=self.net.apply, params=params, tx=tx)
 
-    def _build_optimizer(self, config):
-
-        lr = config["adversary_learning_rate"]
+    def _build_optimizer(self, config, lr_schedule):
+        lr = lr_schedule if config["use_lr_scheduler"] else config["adversary_learning_rate"]
         wd = config["adversary_weight_decay"]
-        transforms = [optax.adamw(learning_rate=lr, weight_decay=wd)] # TODO: grad_clip, lr_scheduler
+
+        transforms = [ ] 
+        if config["use_grad_clip"]:
+            transforms.append(optax.clip_by_global_norm(config["grad_clip_norm"]))
+        transforms.append(optax.adamw(learning_rate=lr, weight_decay=wd))
         
         return optax.chain(*transforms)
 
@@ -73,7 +73,7 @@ class AdversarialZ:
         if self.use_mean_clipping:
             current_mean = jnp.mean(mean)
             shift = jnp.where(current_mean < self.clip_mean_min,  self.clip_mean_min - current_mean,
-                    jnp.where(current_mean > self.clip_mean_max, self.clip_mean_max - current_mean, 0.0))
+                    jnp.where(current_mean > self.clip_mean_max, self.clip_mean_max - current_mean, 0))
             mean = mean + shift
 
         if self.use_std_scaling:
@@ -82,9 +82,7 @@ class AdversarialZ:
         return mean, log_std
 
     def get_z(self, z_gen_state, key):
-        """Returns (z_new, z_old, log_prob, prior_mean, prior_std).
-        prior_mean/std returned for use in train_step KL calculation.
-        """
+        
         key, key1, key2 = jax.random.split(key, 3)
         z_prior = distrax.Normal(
             loc=jnp.zeros((self.z_dim,)),
@@ -102,19 +100,19 @@ class AdversarialZ:
 
         return z_sample_new, z_sample_old, log_prob, z_current, z_prior
         
-    def compute_policy_stats(self, apply_fn, params, old_dist=None, key=None):
+    def compute_policy_stats(self, apply_fn, params, old_dist_diag=None, key=None):
         """Compute policy distribution stats after update."""
 
         z_normal = jax.random.normal(key, (self.batch_size, self.z_dim))
         mean, log_std = self._apply_net(apply_fn, params, z_normal)
-        std = jnp.exp(log_std) # TODO: check add the number [jnp.exp(log_std) + 1e-6]
+        std = jnp.exp(log_std) + 1e-6
 
         new_dist = distrax.Normal(mean, std)
         entropy = new_dist.entropy().mean()
 
         kl_div = 0.0
-        if old_dist is not None:
-            kl_div = self.kl_divergence(old_dist, new_dist).mean()
+        if old_dist_diag is not None:
+            kl_div = self.kl_divergence(new_dist, old_dist_diag).mean()
 
         return entropy, kl_div
 
@@ -125,7 +123,7 @@ class AdversarialZ:
         key, k_diag = jax.random.split(key)
         z_normal_diag = jax.random.normal(k_diag, (self.batch_size, self.z_dim))
         old_mean_diag, old_log_std_diag = self._apply_net(z_gen_state.apply_fn, z_gen_state.params, z_normal_diag)
-        old_std_diag = jnp.exp(old_log_std_diag)  # TODO: check add the number [jnp.exp(old_log_std_diag) + 1e-6]
+        old_std_diag = jnp.exp(old_log_std_diag) + 1e-6
         old_dist_diag = distrax.Normal(old_mean_diag, old_std_diag)
 
         def loss_fn(params):
@@ -150,44 +148,47 @@ class AdversarialZ:
         
         key, k_stats = jax.random.split(key)
         entropy_diag, kl_diag = self.compute_policy_stats(apply_fn=new_z_gen_state.apply_fn, params=new_z_gen_state.params, 
-                                            old_dist=old_dist_diag, key=k_stats)
+                                            old_dist_diag=old_dist_diag, key=k_stats)
         
         train_info = {
             "loss": loss,
-            "episode_rewards_current": current_reward.mean(),
-            "episode_rewards_trained": trained_reward.mean(),
+            "episode_current_reward": current_reward.mean(),
+            "episode_trained_reward": trained_reward.mean(),
             "regret": raw_regret.mean(),
             "weighted_log_probs": weighted_log_probs.mean(),
             "kl_divergence": kl_div,
             "policy_update": kl_diag,
-            "entropy": entropy_diag}
+            "entropy": entropy_diag 
+            }
 
         return new_z_gen_state, train_info
 
 
-    def log_train_info(self, train_info, steps):
+    def log_train_info(self, metric):
+        
         log_data = {
-            'adversary/before_reward': float(train_info['before_reward']),
-            'adversary/after_reward': float(train_info['after_reward']),
-            'adversary/regret': float(train_info['regret']),
-            'adversary/loss': float(train_info['loss']),
-            'adversary/kl_divergence': float(train_info['kl_divergence']),
-            'adversary/entropy': float(train_info['entropy']),
-            'adversary/weighted_log_probs': float(train_info['weighted_log_probs']),
-            'adversary/z_sample/log_prob': float(train_info['log_prob']),
-            'adversary/policy_update': float(train_info['policy_update']),
+            'adversary/loss': metric['loss'],
+            'adversary/episode_current_reward': metric['episode_current_reward'],
+            'adversary/episode_trained_reward': metric['episode_trained_reward'],
+            'adversary/regret': metric['regret'],
+            'adversary/weighted_log_probs': metric['weighted_log_probs'],
+            'adversary/kl_divergence': metric['kl_divergence'],
+            'adversary/policy_update': metric['policy_update'],
+            'adversary/entropy': metric['entropy'],
+            'adversary/z_sample/mean': metric['z_sample/mean'],
+            'adversary/z_sample/std': metric['z_sample/std'],
+            'adversary/z_sample/log_prob': metric['log_prob']
         }
-        if self.use_wandb:
-            wandb.log(log_data, step=steps)
-        else:
-            for k, v in log_data.items():
-                self.writer.add_scalar(k, v, steps)
+        
+        if self.wandb_mode == "online":
+            wandb.log(log_data)
+ 
 
-    def save(self, z_gen_state, steps):
+    def save(self, z_gen_state_params, steps):
         path = os.path.join(self.save_dir, "adversary", f"adversary_{steps}.pkl")
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, 'wb') as f:
-            pickle.dump(z_gen_state.params, f)
+            pickle.dump({'params': jax.device_get(z_gen_state_params)}, f)
 
     def restore(self, z_gen_state, steps):
         path = os.path.join(self.save_dir, "adversary", f"adversary_{steps}.pkl")

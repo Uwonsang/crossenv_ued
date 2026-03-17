@@ -251,9 +251,7 @@ class Overcooked_VAE(MultiAgentEnv):
 
         validation_result = validate_layout(
             maze_map=maze_map,
-            passable_tiles=self.passable_tiles,
             object_to_index=OBJECT_TO_INDEX,
-            player_tiles=(OBJECT_TO_INDEX["player"], OBJECT_TO_INDEX["player2"]),
         )
 
         debug_print_layout_result(validation_result)

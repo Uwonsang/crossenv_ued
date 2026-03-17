@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, Optional
 
 import chex
 import jax
@@ -38,15 +38,9 @@ def make_tile_mask(env_map: chex.Array, tile_idx: int) -> chex.Array:
 
 def make_multi_tile_mask(env_map: chex.Array, tile_indices: Tuple[int, ...]) -> chex.Array:
     mask = jnp.zeros(env_map.shape, dtype=bool)
-
     for tile_idx in tile_indices:
         mask = jnp.logical_or(mask, env_map == tile_idx)
-
     return mask
-
-
-def make_passable_mask(env_map: chex.Array, passable_tiles: Tuple[int, ...]) -> chex.Array:
-    return make_multi_tile_mask(env_map, passable_tiles)
 
 
 def shift_up(mask: chex.Array) -> chex.Array:
@@ -73,17 +67,62 @@ def shift_right(mask: chex.Array) -> chex.Array:
     return shifted
 
 
+def _get_existing_tile_indices(object_to_index: dict, candidate_keys: Tuple[str, ...]) -> Tuple[int, ...]:
+    vals = []
+    for k in candidate_keys:
+        if k in object_to_index:
+            vals.append(object_to_index[k])
+    return tuple(vals)
+
+
+def infer_player_tiles(object_to_index: dict) -> Tuple[int, ...]:
+    return _get_existing_tile_indices(
+        object_to_index,
+        ("player", "player2", "agent", "agent1", "agent2"),
+    )
+
+
+def infer_blocking_tiles(object_to_index: dict) -> Tuple[int, ...]:
+    """
+    플레이어가 '올라설 수 없는' 타일들을 모은다.
+    없는 key는 자동 무시.
+    """
+    return _get_existing_tile_indices(
+        object_to_index,
+        (
+            "wall",
+            "counter",
+            "pot",
+            "onion_pile",
+            "plate_pile",
+            "goal",
+        ),
+    )
+
+
+def make_passable_mask(env_map: chex.Array, object_to_index: dict) -> chex.Array:
+    blocking_tiles = infer_blocking_tiles(object_to_index)
+
+    if len(blocking_tiles) == 0:
+        # blocking 정보를 하나도 모르겠으면 전 칸 passable 취급
+        return jnp.ones(env_map.shape, dtype=bool)
+
+    blocked_mask = make_multi_tile_mask(env_map, blocking_tiles)
+    passable_mask = jnp.logical_not(blocked_mask)
+    return passable_mask
+
+
 def make_adjacent_access_mask(
     env_map: chex.Array,
     object_tile_idx: int,
-    passable_tiles: Tuple[int, ...],
+    object_to_index: dict,
 ) -> chex.Array:
     """
-    object 타일 그 자체가 아니라,
-    object 상하좌우 중 '서 있을 수 있는 칸(passable)'을 target으로 만든다.
+    object 타일 자체가 아니라,
+    object 상하좌우 중 플레이어가 설 수 있는 칸(passable)을 target 으로 만든다.
     """
     object_mask = make_tile_mask(env_map, object_tile_idx)
-    passable_mask = make_passable_mask(env_map, passable_tiles)
+    passable_mask = make_passable_mask(env_map, object_to_index)
 
     adjacent_mask = shift_up(object_mask)
     adjacent_mask = jnp.logical_or(adjacent_mask, shift_down(object_mask))
@@ -93,13 +132,13 @@ def make_adjacent_access_mask(
     access_mask = jnp.logical_and(adjacent_mask, passable_mask)
     return access_mask
 
+
 def is_not_done(state: ReachabilityState):
     return jnp.logical_not(state.done)
 
 
 def _expand_flood_once(flood_input: chex.Array) -> chex.Array:
     """
-    flood_path_net 없이 map_validate.py 내부에서 직접 flood 1-step 확장.
     flood_input[..., 0] = occupied_map (1이면 막힘)
     flood_input[..., 1] = current_flood
     """
@@ -116,10 +155,9 @@ def _expand_flood_once(flood_input: chex.Array) -> chex.Array:
     expanded = jnp.logical_or(expanded, left > 0)
     expanded = jnp.logical_or(expanded, right > 0)
 
-    # 벽 타일은 flood 불가
     expanded = jnp.logical_and(expanded, occupied_map == 0)
-
     expanded = expanded.astype(jnp.float32)
+
     flood_out = jnp.stack([occupied_map, expanded], axis=-1)
     return flood_out
 
@@ -148,12 +186,9 @@ def is_target_reachable(
     env_map: chex.Array,
     start_mask: chex.Array,
     target_mask: chex.Array,
-    passable_tiles: Tuple[int, ...],
+    object_to_index: dict,
 ):
-    """
-    start_mask 에서 시작해서 target_mask 중 하나라도 reachable 한지 검사한다.
-    """
-    passable_mask = make_passable_mask(env_map, passable_tiles)
+    passable_mask = make_passable_mask(env_map, object_to_index)
     occupied_map = jnp.logical_not(passable_mask).astype(jnp.float32)
 
     start_mask = jnp.logical_and(start_mask, passable_mask)
@@ -178,10 +213,6 @@ def is_target_reachable(
     return reachable
 
 
-def is_not_done(state: ReachabilityState):
-    return jnp.logical_not(state.done)
-
-
 def count_required_objects(env_map: chex.Array, object_to_index: dict):
     pot_count = jnp.sum(env_map == object_to_index["pot"])
     onion_count = jnp.sum(env_map == object_to_index["onion_pile"])
@@ -200,65 +231,60 @@ def count_required_objects(env_map: chex.Array, object_to_index: dict):
 
 def validate_layout(
     maze_map: chex.Array,
-    passable_tiles: Tuple[int, ...],
     object_to_index: dict,
-    player_tiles: Tuple[int, ...],
 ) -> LayoutValidationResult:
-    """
-    1. 필수 object counting 검사
-    2. player 시작 위치에서 각 object 옆 칸까지 갈 수 있는지 검사
-    """
     pot_count, onion_count, plate_count, goal_count, count_ok = count_required_objects(
         maze_map,
         object_to_index,
     )
 
-    start_mask = make_multi_tile_mask(maze_map, player_tiles)
+    player_tiles = infer_player_tiles(object_to_index)
+    start_mask = make_multi_tile_mask(maze_map, player_tiles) if len(player_tiles) > 0 else jnp.zeros(maze_map.shape, dtype=bool)
 
     onion_access_mask = make_adjacent_access_mask(
         maze_map,
         object_to_index["onion_pile"],
-        passable_tiles,
+        object_to_index,
     )
     plate_access_mask = make_adjacent_access_mask(
         maze_map,
         object_to_index["plate_pile"],
-        passable_tiles,
+        object_to_index,
     )
     pot_access_mask = make_adjacent_access_mask(
         maze_map,
         object_to_index["pot"],
-        passable_tiles,
+        object_to_index,
     )
     goal_access_mask = make_adjacent_access_mask(
         maze_map,
         object_to_index["goal"],
-        passable_tiles,
+        object_to_index,
     )
 
     onion_reachable = is_target_reachable(
         maze_map,
         start_mask,
         onion_access_mask,
-        passable_tiles,
+        object_to_index,
     )
     plate_reachable = is_target_reachable(
         maze_map,
         start_mask,
         plate_access_mask,
-        passable_tiles,
+        object_to_index,
     )
     pot_reachable = is_target_reachable(
         maze_map,
         start_mask,
         pot_access_mask,
-        passable_tiles,
+        object_to_index,
     )
     goal_reachable = is_target_reachable(
         maze_map,
         start_mask,
         goal_access_mask,
-        passable_tiles,
+        object_to_index,
     )
 
     reachable_ok = (
@@ -283,7 +309,6 @@ def validate_layout(
         reachable_ok=reachable_ok,
         valid=valid,
     )
-
 
 
 def debug_print_layout_result(result):

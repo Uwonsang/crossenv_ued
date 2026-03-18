@@ -240,8 +240,24 @@ class Overcooked_VAE(MultiAgentEnv):
             return some_match
 
         obs, state = self.custom_reset_vae(key, z)
-        # TODO feasible test for vae
+
+        # 수율 테스트 코드 
+        from map_validate import validate_layout, debug_print_layout_result
+
+        padding = (state.maze_map.shape[0] - self.height) // 2
+        maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
+
+        validation_result = validate_layout(
+            maze_map=maze_map,
+            object_to_index=OBJECT_TO_INDEX,
+        )
+
+        debug_print_layout_result(validation_result)
+
+        # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
+        is_valid = validation_result.valid 
         
+
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(
@@ -1119,11 +1135,16 @@ if __name__ == "__main__":
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-    keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
+
+    seed = int(time.time())
+    base_key = jax.random.PRNGKey(seed)
+    key_z, key_env = jax.random.split(base_key)
+
+    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"]))
+    keys = jax.random.split(key_env, 100)
     
     def render_reset(z):
-        key_env = jax.random.PRNGKey(0)
+        # key_env = jax.random.PRNGKey(0) ## 이것도 변경 부분
         obs, state = env.reset(key_env, params={**params, "z": z[None, :]})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)

@@ -241,7 +241,7 @@ class Overcooked_VAE(MultiAgentEnv):
 
         obs, state = self.custom_reset_vae(key, z)
 
-        # TODO feasible test for vae
+        # 수율 테스트 코드 
         from map_validate import validate_layout, debug_print_layout_result
 
         padding = (state.maze_map.shape[0] - self.height) // 2
@@ -1135,14 +1135,13 @@ if __name__ == "__main__":
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-    seed = int(time.time())
 
+    seed = int(time.time())
     base_key = jax.random.PRNGKey(seed)
     key_z, key_env = jax.random.split(base_key)
 
     z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"]))
     keys = jax.random.split(key_env, 100)
-
     
     def render_reset(z):
         # key_env = jax.random.PRNGKey(0) ## 이것도 변경 부분

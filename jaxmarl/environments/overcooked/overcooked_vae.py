@@ -241,8 +241,6 @@ class Overcooked_VAE(MultiAgentEnv):
 
         obs, state = self.custom_reset_vae(key, z)
 
-
-
         # TODO feasible test for vae
         from map_validate import validate_layout, debug_print_layout_result
 
@@ -255,38 +253,10 @@ class Overcooked_VAE(MultiAgentEnv):
         )
 
         debug_print_layout_result(validation_result)
-        is_valid = validation_result.valid
+
+        # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
+        is_valid = validation_result.valid 
         
-        # TODO : 밑은 곧 지울 것들
-        # pot_count = jnp.sum(maze_map == OBJECT_TO_INDEX["pot"])
-        # onion_count = jnp.sum(maze_map == OBJECT_TO_INDEX["onion_pile"])
-        # plate_count = jnp.sum(maze_map == OBJECT_TO_INDEX["plate_pile"])
-        # goal_count = jnp.sum(maze_map == OBJECT_TO_INDEX["goal"])
-
-        # is_valid = (
-        #     (pot_count > 0) &
-        #     (onion_count > 0) &
-        #     (plate_count > 0) &
-        #     (goal_count > 0)
-        # )
-
-        # jax.debug.print(
-        #     "[layout check] pot={p}, onion={o}, plate={pl}, goal={g}, valid={v}",
-        #     p=pot_count,
-        #     o=onion_count,
-        #     pl=plate_count,
-        #     g=goal_count,
-        #     v=is_valid
-        # )
-
-        # 일단 간단히: 필수 물체가 하나라도 없으면 한 번 더 생성
-        # key = jax.random.split(key)[0]
-        # obs, state = jax.lax.cond(
-        #     is_valid,
-        #     lambda k: (obs, state),
-        #     lambda k: self.custom_reset_vae(k, z),
-        #     key
-        # )
 
         # Held out test
         key = jax.random.split(key)[0]
@@ -1165,10 +1135,6 @@ if __name__ == "__main__":
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-    #keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    #z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
-
-    ### 수정 부분
     seed = int(time.time())
 
     base_key = jax.random.PRNGKey(seed)
@@ -1176,7 +1142,7 @@ if __name__ == "__main__":
 
     z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"]))
     keys = jax.random.split(key_env, 100)
-    ###
+
     
     def render_reset(z):
         # key_env = jax.random.PRNGKey(0) ## 이것도 변경 부분

@@ -88,14 +88,15 @@ class AdversarialZ:
             loc=jnp.zeros((self.z_dim,)),
             scale=jnp.ones((self.z_dim,)))
 
-        z_sample_old = z_prior.sample(seed=key1)
+        z_sample_old = z_prior.sample(seed=key1) #(z_dim,)
 
         mean, log_std = self._apply_net(
-            z_gen_state.apply_fn, z_gen_state.params, z_sample_old)
+            z_gen_state.apply_fn, z_gen_state.params, z_sample_old[None, :]) # (1, z_dim)
+        mean, log_std = mean.squeeze(axis=0), log_std.squeeze(axis=0) # (z_dim,)
         std = jnp.exp(log_std) + 1e-6
 
         z_current = distrax.Normal(mean, std)
-        z_sample_new = z_current.sample(seed=key2)
+        z_sample_new = z_current.sample(seed=key2) #(z_dim,)
 
         return z_sample_new, z_sample_old, z_prior
         
@@ -107,11 +108,11 @@ class AdversarialZ:
         std = jnp.exp(log_std) + 1e-6
 
         new_dist = distrax.Normal(mean, std)
-        entropy = new_dist.entropy().mean()
+        entropy = new_dist.entropy().sum(axis=-1)
 
         kl_div = 0.0
         if old_dist_diag is not None:
-            kl_div = self.kl_divergence(new_dist, old_dist_diag).mean()
+            kl_div = self.kl_divergence(new_dist, old_dist_diag)
 
         return entropy, kl_div
 
@@ -125,24 +126,24 @@ class AdversarialZ:
         baseline_std_diag = jnp.exp(baseline_log_std_diag) + 1e-6
         baseline_dist_diag = distrax.Normal(baseline_mean_diag, baseline_std_diag)
 
+        z_gen_apply_fn = z_gen_state.apply_fn
         def loss_fn(params):
             raw_regret = trained_reward - current_reward
             regret = (raw_regret - raw_regret.mean()) / (raw_regret.std() + 1e-8)
 
-            mean, log_std = self._apply_net(z_gen_state.apply_fn, params, z_old)
+            mean, log_std = self._apply_net(z_gen_apply_fn, params, z_old)
             std = jnp.exp(log_std) + 1e-6
             new_dist = distrax.Normal(mean, std)
-
             log_probs = new_dist.log_prob(jax.lax.stop_gradient(z_new))
-            weighted_log_probs = log_probs.sum(axis=1) * regret
+            weighted_log_probs = log_probs.sum(axis=-1) * regret
             
             kl_div = self.kl_divergence(new_dist, z_prior)
-            entropy = new_dist.entropy().mean()
+            entropy = new_dist.entropy().sum(axis=-1)
 
             loss = (
                 -weighted_log_probs.mean()
-                + self.kl_coeff * kl_div
-                - self.entropy_coeff * entropy
+                + self.kl_coeff * kl_div.mean()
+                - self.entropy_coeff * entropy.mean()
             )
             
             return loss, (weighted_log_probs, kl_div, entropy, raw_regret)
@@ -161,9 +162,9 @@ class AdversarialZ:
             "episode_trained_reward": trained_reward.mean(),
             "regret": raw_regret.mean(),
             "weighted_log_probs": weighted_log_probs.mean(),
-            "kl_divergence": kl_div,
-            "policy_update": kl_diag,
-            "entropy": entropy_diag 
+            "kl_divergence": kl_div.mean(),
+            "policy_update": kl_diag.mean(),
+            "entropy": entropy_diag.mean() 
             }
 
         return new_z_gen_state, train_info
@@ -212,6 +213,6 @@ class AdversarialZ:
         var0 = std0 ** 2
 
         kl_per_dim = jnp.log(std0 / std1) + (var1 + (mean1 - mean0) ** 2) / (2.0 * var0) - 0.5
-        kl_div = kl_per_dim.sum(axis=-1).mean()
+        kl_div = kl_per_dim.sum(axis=-1)
         
         return kl_div

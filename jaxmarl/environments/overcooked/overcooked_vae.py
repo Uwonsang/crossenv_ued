@@ -589,7 +589,6 @@ class Overcooked_VAE(MultiAgentEnv):
 
         def _single_attempt(key, z):
             key, subkey = jax.random.split(key)
-            z = z[None, :] if z.ndim == 1 else z # z is a single latent vector (latent_dim,), but Decoder expects (B, latent_dim)
             pred = self.vae_decoder.apply(self.vae_decoder_params, z)
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
@@ -1120,7 +1119,7 @@ if __name__ == "__main__":
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
     keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"]))
+    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"])) # (100, 16)
     
     def render_reset(z):
         key_env = jax.random.PRNGKey(0)

@@ -1114,11 +1114,15 @@ class Overcooked_VAE(MultiAgentEnv):
 
 
 if __name__ == "__main__":
-    from jaxmarl.environments.overcooked import overcooked_layouts
+    import argparse
     import os
     import time
     from omegaconf import OmegaConf
     from baselines.CEC_UED.ippo_general_vae import initialize_environment
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    
     _config_path = "/app/baselines/CEC_UED/config/ippo_overcooked_CEC_VAE.yaml"
     config = OmegaConf.load(_config_path)
     config = OmegaConf.to_container(config, resolve=True)
@@ -1134,15 +1138,14 @@ if __name__ == "__main__":
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-
-    keys = jax.random.split(jax.random.PRNGKey(0), 100)
-    z_list = jax.random.normal(jax.random.PRNGKey(0), (100, ckpt_config["latent_dim"])) # (100, 16)    
+    key = jax.random.PRNGKey(args.seed)
+    key, key_z, key_env = jax.random.split(key, 3)
+    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"])) # (100, 16)   
     def render_reset(z):
-        # key_env = jax.random.PRNGKey(0) ## 이것도 변경 부분
-        obs, state = env.reset(key_env, params={**params, "z": z[None, :]})
+        obs, state = env.reset(key_env, params={"z": z[None, :]})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)
-    save_path = "/app/jaxmarl/environments/overcooked/images/test_1"
+    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{seed}"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
         filename = f"image_reset_vae_{i}.png"

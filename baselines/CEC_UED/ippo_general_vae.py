@@ -30,7 +30,10 @@ import time
 import yaml
 from baselines.CEC_UED.VAE.utils import load_checkpoint
 from baselines.CEC_UED.regret_z_generator import AdversarialZ
-
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
+from flax import struct
+import chex
+import imageio
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -250,6 +253,12 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
 
+@struct.dataclass
+class FilteredState:
+    agent_dir_idx: chex.Array
+    agent_inv: chex.Array
+    maze_map: chex.Array
+
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -264,6 +273,8 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
+    agent_view_size = env.agent_view_size
+    viz = OvercookedVisualizer()
     
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -408,13 +419,16 @@ def make_train(config, update_step=0):
                 
                 # remove shaped rewards
                 del info['shaped_reward']
+                
+                filtered_state = {
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
+                    "agent_inv": env_state.env_state.agent_inv[0],
+                    "maze_map": env_state.env_state.maze_map[0]}
 
                 done_all = done["__all__"]
-
                 # --- Manually reset only done envs (no auto-reset) ---
                 rng, _rng = jax.random.split(rng)
                 rng_reset = jax.random.split(_rng, config["NUM_ENVS"])
-
                 #TODO : check the layout of reset, is it reset with after done?
                 def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, z_new_i, z_old_i, z_prior_i, adversary_state):
                     """Reset a single env if its episode is done, otherwise keep as is."""
@@ -451,7 +465,8 @@ def make_train(config, update_step=0):
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state,
                                 z_new, z_old, z_prior, update_step)
-                return runner_state, transition
+
+                return runner_state, (transition, FilteredState(**filtered_state))
 
             (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state, 
             z_new, z_old, z_prior) = runner_state
@@ -460,7 +475,7 @@ def make_train(config, update_step=0):
 
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, 
             adversary_state, z_new, z_old, z_prior, update_steps)
-            runner_state, traj_batch = jax.lax.scan(
+            runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
@@ -703,12 +718,17 @@ def make_train(config, update_step=0):
                     update_step,
                 )
 
+                filtered_state = {
+                    "agent_dir_idx": env_state_next.env_state.agent_dir_idx[0],
+                    "agent_inv": env_state_next.env_state.agent_inv[0],
+                    "maze_map": env_state_next.env_state.maze_map[0]}
+
                 reward_eval = batchify(reward_eval, env.agents, config["NUM_ACTORS"]).squeeze()
-                return runner_state_eval_next, reward_eval
+                return runner_state_eval_next, (reward_eval, FilteredState(**filtered_state))
 
             env_state0, obsv0, done_batch0, hstate0, rng0, update_step = eval_start_state
             runner_state_eval0 = (train_state, env_state0, obsv0, done_batch0, hstate0, rng0, update_step)    
-            runner_state_eval, reward_eval_seq = jax.lax.scan(
+            runner_state_eval, (reward_eval_seq, test_filtered_state) = jax.lax.scan(
                 _env_step_eval, runner_state_eval0, None, config["NUM_STEPS"])
             
             current_reward = jnp.transpose(traj_batch.reward, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
@@ -733,15 +753,31 @@ def make_train(config, update_step=0):
                 )
                 z_gen.log_train_info(metric["adversary"])
                 
-                save_interval = config["NUM_UPDATES"] // 19
                 step = int(metric["update_steps"])
+                save_interval = max(1, config["NUM_UPDATES"] // 19)
                 if (step % save_interval == 0 or step == config["NUM_UPDATES"] - 1):
                     z_gen.save(metric["adversary_params"], step)
+
+                def save_frames(filtered_state, step, file_path):
+                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
+                        for step in range(config["NUM_STEPS"])]
+                    
+                    file_path = os.path.join(file_path, str(step))
+                    os.makedirs(file_path, exist_ok=True)
+                    for i, frame in enumerate(frames):
+                        imageio.imwrite(os.path.join(file_path, f"layout_{i:03d}.png"), frame)
             
+                if config["save_frames"]:
+                    jax.debug.print("Saving frames")
+                    save_frames(metric["train_filtered_state"], step, "/app/ckpts/ippo/overcooked_vae/train_images")
+                    save_frames(metric["test_filtered_state"], step, "/app/ckpts/ippo/overcooked_vae/test_images")
+
             metric["adversary"] = {**train_info, **z_sample_info}
             metric["returns"] = returns
             metric["update_steps"] = update_steps
             metric["adversary_params"] = adversary_state.params
+            metric["train_filtered_state"] = train_filtered_state
+            metric["test_filtered_state"] = test_filtered_state
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,

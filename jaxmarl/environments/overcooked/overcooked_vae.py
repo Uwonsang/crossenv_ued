@@ -241,23 +241,22 @@ class Overcooked_VAE(MultiAgentEnv):
 
         obs, state = self.custom_reset_vae(key, z)
 
-        # 수율 테스트 코드 
-        from map_validate import validate_layout, debug_print_layout_result
+        # # 수율 테스트 코드 
+        # from map_validate import validate_layout, debug_print_layout_result
 
-        padding = (state.maze_map.shape[0] - self.height) // 2
-        maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
+        # padding = (state.maze_map.shape[0] - self.height) // 2
+        # maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
 
-        validation_result = validate_layout(
-            maze_map=maze_map,
-            object_to_index=OBJECT_TO_INDEX,
-        )
+        # validation_result = validate_layout(
+        #     maze_map=maze_map,
+        #     object_to_index=OBJECT_TO_INDEX,
+        # )
 
-        debug_print_layout_result(validation_result)
+        # debug_print_layout_result(validation_result)
 
-        # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
-        is_valid = validation_result.valid 
+        # # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
+        # is_valid = validation_result.valid 
         
-
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(
@@ -627,7 +626,7 @@ class Overcooked_VAE(MultiAgentEnv):
         plate_pile_pos = static_pos(plate_pile_idx)
         onion_pile_pos = static_pos(onion_pile_idx)
 
-        wall_map = pred_2d[:, :, 1].astype(jnp.bool_)
+        wall_map = (pred_2d.sum(axis=-1) > 0).astype(jnp.bool_)
         pot_status = jnp.full((STATIC_PAD,), POT_EMPTY_STATUS)
 
         onion_pos = jnp.array([[-1, -1]], dtype=jnp.uint32)

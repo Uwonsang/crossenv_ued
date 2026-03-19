@@ -775,10 +775,15 @@ def make_train(config, update_step=0):
             metric["adversary"] = {**train_info, **z_sample_info}
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            metric["adversary_params"] = adversary_state.params
-            metric["train_filtered_state"] = train_filtered_state
-            metric["test_filtered_state"] = test_filtered_state
-            jax.experimental.io_callback(callback, None, metric)
+
+            callback_metric = {
+                **metric,
+                "adversary_params": adversary_state.params,
+                "train_filtered_state": train_filtered_state,
+                "test_filtered_state": test_filtered_state,
+            }
+
+            jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
                             z_new, z_old, z_prior)

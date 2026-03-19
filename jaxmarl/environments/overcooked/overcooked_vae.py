@@ -20,9 +20,9 @@ from jaxmarl.environments.overcooked.common import (
     DIR_TO_VEC,
     make_overcooked_map)
 from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
-from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
-from jaxmarl.environments.overcooked.layouts import single_cramped_room
 
+from baselines.CEC_UED.VAE.Models.vae import Decoder
+from baselines.CEC_UED.VAE.utils import load_checkpoint
 
 BASE_REW_SHAPING_PARAMS = {
     "PLACEMENT_IN_POT_REW": 10, # reward for putting ingredients 
@@ -68,7 +68,7 @@ URGENCY_CUTOFF = 40 # When this many time steps remain, the urgency layer is fli
 DELIVERY_REWARD = 20
 
 
-class Overcooked(MultiAgentEnv):
+class Overcooked_VAE(MultiAgentEnv):
     """Vanilla Overcooked"""
     def __init__(
             self,
@@ -77,7 +77,10 @@ class Overcooked(MultiAgentEnv):
             max_steps: int = 256,
             single_agent: bool = False,
             check_held_out: bool = False,
-            shuffle_inv_and_pot: bool = False
+            shuffle_inv_and_pot: bool = False,
+            vae_decoder_params=None,
+            vae_config=None,
+            random_reset_fn: str = "reset_all",
     ):
         # Sets self.num_agents to 2
         super().__init__(num_agents=2)
@@ -156,6 +159,12 @@ class Overcooked(MultiAgentEnv):
         self.held_out_goal = None
         self.held_out_wall = None
         self.held_out_pot = None
+
+        # Defaults used by reset(key) when params are not provided (e.g. auto-reset in MultiAgentEnv.step)
+        self.vae_decoder_params = vae_decoder_params
+        self.vae_config = vae_config
+        self.random_reset_fn = random_reset_fn
+        self.vae_decoder = Decoder(output_channel=self.vae_config['output_channels'])
     
     def action_to_string(self, action: int) -> str:
         return Actions(action).name
@@ -189,98 +198,39 @@ class Overcooked(MultiAgentEnv):
             dones,
             {"shaped_reward": shaped_rewards},
         )
-
-    def reset(self,
-              key: chex.PRNGKey, params={'random_reset_fn': 'reset_all'}):
-
-        jitted_reset = lambda k: self.custom_reset(k, layout=self.layout, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-        jitted_reset = jax.jit(jitted_reset)
-
-        @jax.jit
-        def random_og_5(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            def sampled_0(key, sampled_num):
-                return reset_sub_dict(key, make_asymm_advantages_9x9)
-            def sampled_1(key, sampled_num):
-                def reset_coord_ring(key, sampled_num):
-                    return reset_sub_dict(key, make_coord_ring_9x9)
-                return jax.lax.cond(sampled_num==1, reset_coord_ring, sampled_2, key, sampled_num)
-            def sampled_2(key, sampled_num):
-                def reset_counter_circuit(key, sampled_num):
-                    return reset_sub_dict(key, make_counter_circuit_9x9)
-                return jax.lax.cond(sampled_num==2, reset_counter_circuit, sampled_3, key, sampled_num)
-            def sampled_3(key, sampled_num):
-                def reset_forced_coord(key, sampled_num):
-                    return reset_sub_dict(key, make_forced_coord_9x9)
-                return jax.lax.cond(sampled_num==3, reset_forced_coord, sampled_4, key, sampled_num)
-            def sampled_4(key, sampled_num):
-                return reset_sub_dict(key, make_cramped_room_9x9)
-
-            # sample an index from 0 to 4
-            index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset, key = jax.lax.cond(index == 0, sampled_0, sampled_1, key, index)
-            return sampled_reset
-
-        @jax.jit
-        def random_counter_circuit(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
-            return counter_circuit_reset
-        
-        @jax.jit
-        def random_coord_ring(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            return coord_ring_reset
-        
-        @jax.jit
-        def random_forced_coord(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            return forced_coord_reset
-        
-        @jax.jit
-        def random_cramped_room(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
-            return cramped_room_reset
-
+    
+    def reset(self, key: chex.PRNGKey, params=None):
+        z = params.get("z")
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
                 return jnp.array(False)
-            goal_match = lambda g_pos: jnp.all(g_pos == state_.goal_pos)
-            pot_match = lambda p_pos: jnp.all(p_pos == state_.pot_pos)
+
+            h, w = self.height, self.width
+            sentinel = jnp.array([w, h], dtype=jnp.uint32)  # out-of-bounds sentinel
+            
+            def _canon_pos(pos, max_n: int):
+                # pad/truncate
+                out = jnp.tile(sentinel[None, :], (max_n, 1))
+                m = min(pos.shape[0], max_n)
+                pos = out.at[:m].set(pos[:m].astype(jnp.uint32))
+
+                # mask invalid
+                valid = jnp.logical_and(pos[:, 0] < w, pos[:, 1] < h)
+                pos = jnp.where(valid[:, None], pos, sentinel[None, :])
+
+                # sort
+                k = pos[:, 0] + (w + 1) * pos[:, 1]
+                return pos[jnp.argsort(k)]
+
+            def goal_match(g_pos):
+                max_n = state_.goal_pos.shape[0]
+                return jnp.all(_canon_pos(g_pos, max_n) == _canon_pos(state_.goal_pos, max_n))
+
+            def pot_match(p_pos):
+                max_n = state_.pot_pos.shape[0]
+                return jnp.all(_canon_pos(p_pos, max_n) == _canon_pos(state_.pot_pos, max_n))
+
             wall_match = lambda w_map: jnp.all(w_map == state_.wall_map)
             some_goal_match = jax.vmap(goal_match)(self.held_out_goal)
             some_pot_match = jax.vmap(pot_match)(self.held_out_pot)
@@ -289,35 +239,34 @@ class Overcooked(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        # random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
-        def random_reset_fn(k):
-            fn_name = params['random_reset_fn']
-            if fn_name == 'reset_all':
-                return random_og_5(k)
-            elif fn_name == 'reset_counter_circuit':
-                return random_counter_circuit(k)
-            elif fn_name == 'reset_coord_ring':
-                return random_coord_ring(k)
-            elif fn_name == 'reset_forced_coord':
-                return random_forced_coord(k)
-            elif fn_name == 'reset_cramped_room':
-                return random_cramped_room(k)
-            else:
-                return random_og_5(k)
+        obs, state = self.custom_reset_vae(key, z)
 
-        obs, state = jax.lax.cond(self.random_reset, random_reset_fn, jitted_reset, key)
-        key = jax.random.split(key)[0]
-        (obs, state) = jax.lax.cond(jnp.logical_and(check_match(state), self.check_held_out), random_og_5, lambda k: (obs, state), key)
+        # # 수율 테스트 코드 
+        # from map_validate import validate_layout, debug_print_layout_result
+
+        # padding = (state.maze_map.shape[0] - self.height) // 2
+        # maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
+
+        # validation_result = validate_layout(
+        #     maze_map=maze_map,
+        #     object_to_index=OBJECT_TO_INDEX,
+        # )
+
+        # debug_print_layout_result(validation_result)
+
+        # # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
+        # is_valid = validation_result.valid 
         
+        # Held out test
+        key = jax.random.split(key)[0]
+        obs, state = jax.lax.cond(
+            jnp.logical_and(check_match(state), self.check_held_out),
+            lambda k: self.custom_reset_vae(k, z),
+            lambda k: (obs, state), key)
+
         return lax.stop_gradient(obs), lax.stop_gradient(state)
     
-    def custom_reset(
-            self,
-            key: chex.PRNGKey,
-            random_reset,
-            shuffle_inv_and_pot,
-            layout,
-    ) -> Tuple[Dict[str, chex.Array], State]:
+    def custom_reset(self, key: chex.PRNGKey, random_reset, shuffle_inv_and_pot, layout) -> Tuple[Dict[str, chex.Array], State]:
         """Reset environment state based on `self.random_reset`
 
         If True, everything is randomized, including agent inventories and positions, pot states and items on counters
@@ -575,6 +524,157 @@ class Overcooked(MultiAgentEnv):
 
         obs = self.get_obs(state)
         
+        return lax.stop_gradient(obs), lax.stop_gradient(state)
+
+    def custom_reset_vae(self, key: chex.PRNGKey, z=None):
+        STATIC_PAD = 8
+        LATENT_DIM = self.vae_config['latent_dim']
+        h, w = self.height, self.width
+
+        def jax_layout_fn(pred_2d):
+            N = h * w
+            flat = pred_2d.reshape(-1, 5)  # (N, 5)
+
+            #0=pot, 1=wall, 2=onion_pile, 3=plate_pile, 4=goal
+            pot_idx = jnp.where(flat[:, 0] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            onion_pile_idx = jnp.where(flat[:, 2] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            plate_pile_idx = jnp.where(flat[:, 3] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            goal_idx = jnp.where(flat[:, 4] == 1, size=STATIC_PAD, fill_value=-1)[0]
+
+            occupied = flat.sum(axis=-1) > 0
+            free = (1 - occupied).astype(jnp.bool_)
+            free_2d = free.reshape(h, w)
+            
+            labels = jnp.where(free, jnp.arange(N), N) 
+
+            def propagate(labels, _):
+                lab_2d = labels.reshape(h, w)
+                up    = jnp.pad(lab_2d[:-1, :], ((1,0),(0,0)), constant_values=N)
+                down  = jnp.pad(lab_2d[1:,  :], ((0,1),(0,0)), constant_values=N)
+                left  = jnp.pad(lab_2d[:, :-1], ((0,0),(1,0)), constant_values=N)
+                right = jnp.pad(lab_2d[:, 1:],  ((0,0),(0,1)), constant_values=N)
+                new_lab = jnp.minimum(lab_2d, jnp.minimum(
+                    jnp.minimum(up, down), jnp.minimum(left, right)))
+                new_lab = jnp.where(free_2d, new_lab, N)
+                return new_lab.flatten(), None
+
+            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
+
+            # --- filter isolated cells (size <= 1) ---
+            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            cell_counts = counts_per_label[propagated_labels]
+            filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
+
+            # --- unique component---
+            is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
+            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
+
+            # 1st component
+            best_label0 = jnp.argmax(rep_counts)
+            rep_counts0 = rep_counts[best_label0]
+
+            # 2nd component
+            rep_counts1 = rep_counts.at[best_label0].set(0)
+            best_label1 = jnp.argmax(rep_counts1)
+            rep_counts1_best = rep_counts1[best_label1]
+
+            has_first = rep_counts0 > 0
+            has_second = rep_counts1_best > 0
+            valid = has_first & has_second
+
+            # --- region probs ---
+            region0_mask = (filtered_labels == best_label0)
+            region1_mask = (filtered_labels == best_label1)
+
+            sum0 = region0_mask.sum()
+            sum1 = region1_mask.sum()
+
+            free_float = free.astype(jnp.float32)
+            free_sum = jnp.sum(free_float)
+            uniform = free_float / jnp.where(free_sum > 0, free_sum, 1.0)
+
+            region0_probs = jnp.where(has_first, region0_mask / jnp.where(sum0 > 0, sum0, 1.0), uniform)
+            
+            region1_probs = jnp.where(has_second,
+                            region1_mask.astype(jnp.float32) / jnp.where(sum1 > 0, sum1, 1.0),
+                            region0_mask.astype(jnp.float32) / jnp.where(sum0 > 0, sum0, 1.0))
+
+            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
+
+        def _single_attempt(key, z):
+            key, subkey = jax.random.split(key)
+            pred = self.vae_decoder.apply(self.vae_decoder_params, z)
+            pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
+            pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
+
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d)
+
+            return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
+
+        key, subkey = jax.random.split(key)
+        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
+
+         #TODO jax.lax.while_loop is cause of low update speed need to use scan to roll the candidate
+
+        # index to (x, y) pos (-1 is out of map range by uint32 casting)
+        def idx_to_pos(idx):
+            return jnp.stack([idx % w, idx // w], axis=-1).astype(jnp.uint32)
+        static_pos = jax.vmap(idx_to_pos, in_axes=0)
+        goal_pos = static_pos(goal_idx)
+        pot_pos = static_pos(pot_idx)
+        plate_pile_pos = static_pos(plate_pile_idx)
+        onion_pile_pos = static_pos(onion_pile_idx)
+
+        wall_map = (pred_2d.sum(axis=-1) > 0).astype(jnp.bool_)
+        pot_status = jnp.full((STATIC_PAD,), POT_EMPTY_STATUS)
+
+        onion_pos = jnp.array([[-1, -1]], dtype=jnp.uint32)
+        plate_pos = jnp.array([[-1, -1]], dtype=jnp.uint32)
+        dish_pos  = jnp.array([[-1, -1]], dtype=jnp.uint32)
+
+        key, subkey = jax.random.split(key)
+        agent0_flat = jax.random.choice(subkey, h * w, p=region0_probs)
+
+        key, subkey = jax.random.split(key)
+        region1_masked = region1_probs.at[agent0_flat].set(0.0)
+        masked_sum = jnp.sum(region1_masked)
+        region1_masked = jnp.where(masked_sum > 0,
+                            region1_masked / masked_sum,
+                            region0_probs.at[agent0_flat].set(0.0) / jnp.maximum(jnp.sum(region0_probs.at[agent0_flat].set(0.0)), 1.0))
+        agent1_flat = jax.random.choice(subkey, h * w, p=region1_masked)
+
+        agent_idx = jnp.array([agent0_flat, agent1_flat])
+        agent_pos = jnp.stack([agent_idx % w, agent_idx // w], axis=-1).astype(jnp.uint32)
+
+        key, subkey = jax.random.split(key)
+        agent_dir_idx = jax.random.choice(subkey, jnp.arange(len(DIR_TO_VEC), dtype=jnp.int32), shape=(self.num_agents,))
+        agent_dir = DIR_TO_VEC.at[agent_dir_idx].get()
+
+        maze_map = make_overcooked_map(
+            wall_map, goal_pos, agent_pos, agent_dir_idx,
+            plate_pile_pos, onion_pile_pos, pot_pos, pot_status,
+            onion_pos, plate_pos, dish_pos,
+            pad_obs=True, num_agents=self.num_agents, agent_view_size=self.agent_view_size
+        )
+
+        state = State(
+            agent_pos=agent_pos,
+            agent_dir=agent_dir,
+            agent_dir_idx=agent_dir_idx,
+            agent_inv=jnp.array([OBJECT_TO_INDEX['empty'], OBJECT_TO_INDEX['empty']]),
+            goal_pos=goal_pos,
+            pot_pos=pot_pos,
+            wall_map=wall_map,
+            maze_map=maze_map,
+            time=0,
+            terminal=False,
+        )
+
+        # obs: channel 16~25 zero padding
+        obs = self.get_obs(state)
+        obs = {k: v.at[:, :, 16:26].set(0) for k, v in obs.items()}
+
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
     def get_obs(self, state: State) -> Dict[str, chex.Array]:
@@ -1013,31 +1113,41 @@ class Overcooked(MultiAgentEnv):
 
 
 if __name__ == "__main__":
-    from jaxmarl.environments.overcooked import overcooked_layouts
+    import argparse
     import os
+    import time
+    from omegaconf import OmegaConf
+    from baselines.CEC_UED.ippo_general_vae import initialize_environment
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    
+    _config_path = "/app/baselines/CEC_UED/config/ippo_overcooked_CEC_VAE.yaml"
+    config = OmegaConf.load(_config_path)
+    config = OmegaConf.to_container(config, resolve=True)
+    
+    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M")
+    vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl70.pkl"
+    params, ckpt_config = load_checkpoint(vae_model_path)
+    decoder_params = {"params": params["params"]["Decoder_0"]}
 
-    env_kwargs = {
-        'layout': overcooked_layouts["cramped_room_9"],
-        'random_reset': True,
-        'max_steps': 256,
-        'single_agent': False,
-        'check_held_out': False,
-        'shuffle_inv_and_pot': False
-    }
-    # env_kwargs = filter_kwargs(env_kwargs, Overcooked)
-    env = Overcooked(**env_kwargs)
+    config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
+    config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    env = initialize_environment(config)
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
-
-    params={'random_reset_fn': 'reset_forced_coord'} # reset_all or reset_counter_circuit, reset_coord_ring
-    keys = jax.random.split(jax.random.PRNGKey(0), 10)
-    def render_reset(key):
-        obs, state = env.reset(key, params=params)
+    key = jax.random.PRNGKey(args.seed)
+    key, key_z, key_env = jax.random.split(key, 3)
+    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"])) # (100, 16)   
+    def render_reset(z):
+        obs, state = env.reset(key_env, params={"z": z[None, :]})
         return render_fn(state)
-    images = jax.vmap(render_reset)(keys)
-    # for each image, save it as a png
-    os.makedirs("/app/jaxmarl/environments/overcooked/images", exist_ok=True)
+    images = jax.jit(jax.vmap(render_reset))(z_list)
+    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{seed}"
+    os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
-        imageio.imwrite(f"/app/jaxmarl/environments/overcooked/images/image_{params['random_reset_fn']}_{i}.png", image)
-        print(f"Saved app/jaxmarl/environments/overcooked/images/image_{params['random_reset_fn']}_{i}.png")
+        filename = f"image_reset_vae_{i}.png"
+        full_path = os.path.join(save_path, filename)
+        imageio.imwrite(full_path, image)
+        print(f"Saved {full_path}")

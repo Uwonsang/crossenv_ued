@@ -227,54 +227,29 @@ class Overcooked(MultiAgentEnv):
             sampled_reset, key = jax.lax.cond(index == 0, sampled_0, sampled_1, key, index)
             return sampled_reset
 
-        @jax.jit
-        def random_counter_circuit(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
-            return counter_circuit_reset
-        
-        @jax.jit
-        def random_coord_ring(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            return coord_ring_reset
-        
-        @jax.jit
-        def random_forced_coord(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            return forced_coord_reset
-        
-        @jax.jit
-        def random_cramped_room(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-            
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
-            return cramped_room_reset
 
+        def _single_layout_reset(layout_fn):
+            @jax.jit
+            def reset_fn(key):
+                key, subkey = jax.random.split(key)
+                sampled_layout_dict = layout_fn(subkey, ik=True)
+                return self.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
+            return reset_fn
+
+        random_counter_circuit = _single_layout_reset(make_counter_circuit_9x9)
+        random_coord_ring = _single_layout_reset(make_coord_ring_9x9)
+        random_forced_coord = _single_layout_reset(make_forced_coord_9x9)
+        random_cramped_room = _single_layout_reset(make_cramped_room_9x9)
+        random_asymm_advantages = _single_layout_reset(make_asymm_advantages_9x9)
+
+        _fn_map = {
+            'reset_all': random_og_5,
+            'reset_counter_circuit': random_counter_circuit,
+            'reset_coord_ring': random_coord_ring,
+            'reset_forced_coord': random_forced_coord,
+            'reset_cramped_room': random_cramped_room,
+            'reset_asymm_advantages': random_asymm_advantages,
+        }
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -291,19 +266,7 @@ class Overcooked(MultiAgentEnv):
 
         # random_reset_fn = lambda k: jax.lax.cond(params['random_reset_fn'] == 'reset_all', random_og_5, random_counter_circuit, k)
         def random_reset_fn(k):
-            fn_name = params['random_reset_fn']
-            if fn_name == 'reset_all':
-                return random_og_5(k)
-            elif fn_name == 'reset_counter_circuit':
-                return random_counter_circuit(k)
-            elif fn_name == 'reset_coord_ring':
-                return random_coord_ring(k)
-            elif fn_name == 'reset_forced_coord':
-                return random_forced_coord(k)
-            elif fn_name == 'reset_cramped_room':
-                return random_cramped_room(k)
-            else:
-                return random_og_5(k)
+            return _fn_map.get(params['random_reset_fn'], random_og_5)(k)
 
         obs, state = jax.lax.cond(self.random_reset, random_reset_fn, jitted_reset, key)
         key = jax.random.split(key)[0]

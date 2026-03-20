@@ -117,10 +117,10 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             batch_size, num_envs, flattened_obs_dim = obs.shape
             if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
+                reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
             # reshaped_obs = obs.reshape(-1, *self.config["obs_dim"])
@@ -165,7 +165,9 @@ class ActorCriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
 
@@ -627,7 +629,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="repro_config", config_name="fcp_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
     if config['TRAIN_KWARGS']['finetune']:
@@ -642,6 +644,8 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
+    with open("private.yaml") as f:
+        private_info = yaml.load(f, Loader=yaml.FullLoader)
     wandb.login(key=private_info["wandb_key"])
     wandb.init(
         entity=config["ENTITY"],
@@ -654,7 +658,7 @@ def main(config):
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
+    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}'
 
     #####################
     # Load frozen params
@@ -693,7 +697,7 @@ def main(config):
         ik_filepath = f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             ik_filepath += f"/{config['ENV_KWARGS']['layout']}"
-        ik_filepath += f"/ikTrue/graph{config['GRAPH_NET']}"
+        ik_filepath += f"/ikTrue"
         with open(f"{ik_filepath}/seed{config['SEED']}_ckpt19_improved.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
@@ -706,11 +710,9 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
     
-
-
-
     if len(frozen_param_stack) == 0:
         ckpt_id_list = [0, 10, 19]
+        update_step_list = [1204, 13244, 22887]
         if config['ENV_KWARGS']['random_reset']:
             ckpt_id_list = [9, 19, 29]
         elif config['ENV_KWARGS']['partial_obs']:  # handle partial obs for toy env 
@@ -718,14 +720,18 @@ def main(config):
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
         seed_list = range(6)
-        for ckpt_id in ckpt_id_list:
+        custom_path = os.path.join(config['FCP_filepath'], config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
+        for ckpt_id, update_step in zip(ckpt_id_list, update_step_list):
             for ckpt_seed in seed_list:
+                print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl")
                 if os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"
                 elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"
                 elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"
+                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl"):
+                    path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl"
                 else:
                     continue
                 with open(path_to_open, "rb") as f:

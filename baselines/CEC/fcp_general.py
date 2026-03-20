@@ -123,22 +123,6 @@ class ActorCriticRNN(nn.Module):
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
-            # reshaped_obs = obs.reshape(-1, *self.config["obs_dim"])
-            # # use 2 conv nets
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"]*2,
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(reshaped_obs)
-            # embedding = nn.relu(embedding)
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"],
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(embedding)
-            # embedding = nn.relu(embedding)
 
             embedding = nn.Conv(
                 features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
@@ -644,9 +628,12 @@ def main(config):
         finetune_appendage += "_no_lstm"
     if config['ENV_KWARGS']['incentivize_strat'] != 2:
         finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
-    with open("private.yaml") as f:
-        private_info = yaml.load(f, Loader=yaml.FullLoader)
-    wandb.login(key=private_info["wandb_key"])
+    
+    if config["WANDB_MODE"] == "online":
+        with open("private.yaml") as f:
+            private_info = yaml.load(f, Loader=yaml.FullLoader)
+        wandb.login(key=private_info["wandb_key"])
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],

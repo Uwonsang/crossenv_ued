@@ -803,7 +803,7 @@ def make_train(config, update_step=0):
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, 'metrics': metric}
+        return {"runner_state": runner_state}
 
     return train
 
@@ -911,81 +911,15 @@ def main(config):
     model_state = train_state[0]
     rng = train_state[5]
     adversary_state = train_state[6]
-    metrics = out['metrics']
 
-    reward = metrics['returns']
-    update_step = metrics['update_steps']
-    loss = metrics['loss']
-    value_loss = loss['value_loss']
-    actor_loss = loss['actor_loss']
-    entropy_loss = loss['entropy']
-    final_update_step = update_step[-1]
-    update_step = update_step * config['NUM_ENVS'] * config['NUM_STEPS']
-
-    
     # save model
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'adversary_params': adversary_state.params}
         pickle.dump(ckpt, f)
 
-    # plot reward vs update step with seaborn
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    sns.set_context('paper')
-    # add previous ckpt's first and last update step and reward
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
-        # plot_update_step = jnp.concatenate([, previous_ckpt['last_update_step'][None], update_step])    
-        # plot_reward = jnp.concatenate([previous_ckpt['first_reward'][None], previous_ckpt['last_reward'][None], reward])
-        plot_update_step = update_step
-        plot_reward = reward
-    else:
-        plot_update_step = update_step
-        plot_reward = reward
-
-    value_step = jnp.arange(value_loss.shape[0])
-    
-
-    # plot all losses in subplots
-    fig, axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 to add ratio plot
-    fig.suptitle('Training Losses')
-    
-    # Plot total loss
-    sns.lineplot(x=value_step, y=loss['total_loss'], ax=axs[0, 0])
-    axs[0, 0].set_title('Total Loss')
-    axs[0, 0].set_xlabel('Steps')
-    
-    # Plot value loss
-    sns.lineplot(x=value_step, y=value_loss, ax=axs[0, 1])
-    axs[0, 1].set_title('Value Loss')
-    axs[0, 1].set_xlabel('Steps')
-    
-    # Plot actor loss
-    sns.lineplot(x=value_step, y=loss['actor_loss'], ax=axs[1, 0])
-    axs[1, 0].set_title('Actor Loss')
-    axs[1, 0].set_xlabel('Steps')
-    
-    # Plot entropy loss
-    sns.lineplot(x=value_step, y=entropy_loss, ax=axs[1, 1])
-    axs[1, 1].set_title('Entropy Loss')
-    axs[1, 1].set_xlabel('Steps')
-    
-    # Plot ratio
-    sns.lineplot(x=value_step, y=loss['ratio'], ax=axs[2, 0])
-    axs[2, 0].set_title('Policy Ratio')
-    axs[2, 0].set_xlabel('Steps')
-    
-    # Hide the empty subplot
-    sns.lineplot(x=plot_update_step, y=plot_reward, ax=axs[2, 1])
-    axs[2, 1].set_title('Reward')
-    axs[2, 1].set_xlabel('Steps')
-    
-    plt.tight_layout()
-    plt.savefig(f'{filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    plt.close()
-
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
     print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    
+
 if __name__ == "__main__":
     main()

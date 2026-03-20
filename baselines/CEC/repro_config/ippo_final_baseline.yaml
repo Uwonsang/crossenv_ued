@@ -56,3 +56,4 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled" # disabled, online, offline
+"model_name": "IPPO"

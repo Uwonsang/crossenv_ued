@@ -20,6 +20,16 @@ def input_processing(images):
     return images[:, :, :, STATIC_TRAIN_CHANNELS]
 
 
+def input_processing_crop(images):
+    """images: (..., H, W, 26) → (..., 5, 5, 5)"""
+    
+    
+    images = images[..., STATIC_TRAIN_CHANNELS]  # (batch, H, W, 5) -> 
+
+    cropped_images = images[..., :5, :5, :]     # (batch, 5, 5, 5)
+    
+    return cropped_images
+
 def restore_to_26ch(pred_obs):
     """pred_obs: (..., H, W, 5) → (..., H, W, 26)"""
     H, W = pred_obs.shape[:2]

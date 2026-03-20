@@ -5,9 +5,9 @@
 "VALIDATION_RATIO": 0.1
 "LR": 1e-4
 "LAYOUT_DATA_PATH" : "/app/baselines/CEC_UED/VAE/dataset"
-"LAYOUT_DATA_FILE" : "layout_dataset_1e7_all.h5" # layout_dataset_1e6_forced_coord
+"LAYOUT_DATA_FILE" : "layout_dataset_1e6_coord_ring.h5" # layout_dataset_1e6_forced_coord
 "init_kl_penalty": 0
-"kl_penalty": 0.5
+"kl_penalty": 0.1
 "latent_dim": 16
 "output_channels": 5 # decoder output channels == output channels
 # WandB Params

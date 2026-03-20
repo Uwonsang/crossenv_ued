@@ -734,7 +734,7 @@ def main(config):
     model_state = train_state[0]
     rng = runner_state[-1]
     
-    num_updates = (config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
+    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
         
     # save model
     os.makedirs(filepath, exist_ok=True)

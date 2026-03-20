@@ -713,7 +713,7 @@ def main(config):
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
 
-    num_updates = (config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
+    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 
     # save model
     os.makedirs(filepath, exist_ok=True)

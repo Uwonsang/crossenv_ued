@@ -27,7 +27,7 @@ import wandb
 import functools
 import pdb
 from jax_tqdm import scan_tqdm
-
+import yaml
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]

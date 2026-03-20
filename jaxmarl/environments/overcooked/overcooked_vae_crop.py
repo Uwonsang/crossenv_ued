@@ -21,7 +21,7 @@ from jaxmarl.environments.overcooked.common import (
     make_overcooked_map)
 from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
 
-from baselines.CEC_UED.VAE.Models.vae import Decoder
+from baselines.CEC_UED.VAE.Models.vae import Decoder_crop
 from baselines.CEC_UED.VAE.utils import load_checkpoint
 
 BASE_REW_SHAPING_PARAMS = {
@@ -68,7 +68,7 @@ URGENCY_CUTOFF = 40 # When this many time steps remain, the urgency layer is fli
 DELIVERY_REWARD = 20
 
 
-class Overcooked_VAE(MultiAgentEnv):
+class Overcooked_VAE_CROP(MultiAgentEnv):
     """Vanilla Overcooked"""
     def __init__(
             self,
@@ -164,7 +164,7 @@ class Overcooked_VAE(MultiAgentEnv):
         self.vae_decoder_params = vae_decoder_params
         self.vae_config = vae_config
         self.random_reset_fn = random_reset_fn
-        self.vae_decoder = Decoder(output_channel=self.vae_config['output_channels'])
+        self.vae_decoder = Decoder_crop(output_channel=self.vae_config['output_channels'])
     
     def action_to_string(self, action: int) -> str:
         return Actions(action).name
@@ -589,12 +589,24 @@ class Overcooked_VAE(MultiAgentEnv):
         def _single_attempt(key, z):
             key, subkey = jax.random.split(key)
             pred = self.vae_decoder.apply(self.vae_decoder_params, z)
-            pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
-            pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
+            pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 5, 5, 5)
+            pred_2d = pred[0]  # (5, 5, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
-            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d)
+            # padding to 9x9 (For the area excluded from the top-left vae_h x vae_w)
+            vae_h, vae_w = pred_2d.shape[:2]
+            pred_2d_padded = jnp.zeros((h, w, 5), dtype=pred_2d.dtype)
+            pred_2d_padded = pred_2d_padded.at[:vae_h, :vae_w, :].set(pred_2d)
+            
+            # force the excluded area to be "wall" so it is not treated as free space.
+            out_mask = jnp.ones((h, w), dtype=jnp.bool_)
+            out_mask = out_mask.at[:vae_h, :vae_w].set(False)
+            pred_2d_padded = pred_2d_padded.at[:, :, 1].set(
+                jnp.where(out_mask, jnp.array(1, dtype=pred_2d_padded.dtype), pred_2d_padded[:, :, 1])
+            )
 
-            return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d_padded)
+
+            return key, pred_2d_padded, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
 
         key, subkey = jax.random.split(key)
         key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
@@ -1111,24 +1123,25 @@ if __name__ == "__main__":
     config = OmegaConf.to_container(config, resolve=True)
     
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M")
-    vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl70.pkl"
+    vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e6_coord_ring/crop/lr-20260320-131854/vae_seed0_kl70.pkl"
     params, ckpt_config = load_checkpoint(vae_model_path)
-    decoder_params = {"params": params["params"]["Decoder_0"]}
+    decoder_params = {"params": params["params"]["Encoder_crop_0"]}
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    config["ENV_NAME"] = "overcooked_vae_crop"
     env = initialize_environment(config)
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
     key = jax.random.PRNGKey(args.seed)
     key, key_z, key_env = jax.random.split(key, 3)
-    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"])) # (100, 16)   
+    z_list = jax.random.normal(key_z, (100, 16)) # (100, 16)   
     def render_reset(z):
         obs, state = env.reset(key_env, params={"z": z[None, :]})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)
-    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{seed}"
+    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{args.seed}_crop"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
         filename = f"image_reset_vae_{i}.png"

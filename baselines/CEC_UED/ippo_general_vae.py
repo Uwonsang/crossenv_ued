@@ -41,7 +41,7 @@ def initialize_environment(config):
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
-    if config["ENV_NAME"] == "overcooked" or config["ENV_NAME"] == "overcooked_vae":
+    if config["ENV_NAME"] == "overcooked" or config["ENV_NAME"] == "overcooked_vae" or config["ENV_NAME"] == "overcooked_vae_crop":
         def reset_env(key):
             def reset_sub_dict(key, fn):
                 key, subkey = jax.random.split(key)

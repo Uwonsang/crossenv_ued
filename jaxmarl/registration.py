@@ -26,6 +26,7 @@ from .environments import (
     # Hanabi,
     Overcooked,
     Overcooked_VAE,
+    Overcooked_VAE_CROP,
     # CoinGame,
     ToyCoop,
 )
@@ -146,7 +147,12 @@ def make(env_id: str, **env_kwargs):
     
     elif env_id == "overcooked_vae":
         env_kwargs = filter_kwargs(env_kwargs, Overcooked_VAE)
-        env = Overcooked_VAE(**env_kwargs) 
+        env = Overcooked_VAE(**env_kwargs)
+    
+    elif env_id == "overcooked_vae_crop":
+        env_kwargs = filter_kwargs(env_kwargs, Overcooked_VAE_CROP)
+        env = Overcooked_VAE_CROP(**env_kwargs)
+ 
 
     return env
 
@@ -178,6 +184,7 @@ registered_envs = [
     "hanabi",
     "overcooked",
     "overcooked_vae",
+    "overcooked_vae_crop",
     "coin_game",
     "ToyCoop"
 ]

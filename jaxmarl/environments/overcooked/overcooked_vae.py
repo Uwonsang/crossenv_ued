@@ -1133,6 +1133,7 @@ if __name__ == "__main__":
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    config["ENV_NAME"] = "overcooked_vae"
     env = initialize_environment(config)
 
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
@@ -1144,7 +1145,7 @@ if __name__ == "__main__":
         obs, state = env.reset(key_env, params={"z": z[None, :]})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)
-    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{seed}"
+    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{args.seed}"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
         filename = f"image_reset_vae_{i}.png"

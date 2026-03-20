@@ -13,7 +13,7 @@
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_vae_test"
-"WANDB_MODE" : "online" # online or disabled
+"WANDB_MODE" : "disabled" # online or disabled
 # for viz
 "ENV_NAME": "overcooked"
 "ENV_KWARGS": 

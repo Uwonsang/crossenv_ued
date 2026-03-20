@@ -16,7 +16,7 @@ import time
 
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from map_viz import FilteredState
-from Models.vae import vae_loss
+from Models.vae import vae_loss, VAE_crop
 from utils import (
     restore_from_obs, 
     split_dataset, 
@@ -37,98 +37,12 @@ from flax.linen.initializers import constant, orthogonal
 import numpy as np
 import optax
 
-class Encoder(nn.Module):
-    latent_dim: int
-
-    @nn.compact
-    def __call__(self, x):
-        # (B, 5, 5, C)
-        x = nn.Conv(
-            features=32,
-            kernel_size=(3, 3),
-            strides=(1, 1),  # 5→5
-            padding='SAME',
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-
-        # (B, 5, 5, 32)
-        x = nn.Conv(
-            features=64,
-            kernel_size=(5, 5),
-            strides=(5, 5),  # 5→1
-            padding='VALID',
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(x)
-        x = nn.relu(x)
-
-        # (B, 1, 1, 64)
-        x = x.reshape((x.shape[0], -1))  # (B, 64)
-
-        mean   = nn.Dense(self.latent_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        logvar = nn.Dense(self.latent_dim, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
-        return mean, logvar
-
-
-class Decoder(nn.Module):
-    output_channel: int
-
-    @nn.compact
-    def __call__(self, z):
-        # (B, latent_dim)
-        z = nn.Dense(1 * 1 * 64, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(z)
-        z = nn.relu(z)
-        z = z.reshape((z.shape[0], 1, 1, 64))
-
-        # (B, 1, 1, 64)  →  (B, 5, 5, 32)
-        # VALID: (1-1)*5 + 5 = 5 ✓
-        z = nn.ConvTranspose(
-            features=32,
-            kernel_size=(5, 5),
-            strides=(5, 5),
-            padding='VALID',
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(z)
-        z = nn.relu(z)
-
-        # (B, 5, 5, 32)  →  (B, 5, 5, output_channel)
-        z = nn.ConvTranspose(
-            features=self.output_channel,
-            kernel_size=(3, 3),
-            strides=(1, 1),
-            padding='SAME',
-            kernel_init=orthogonal(np.sqrt(2)),
-            bias_init=constant(0.0),
-        )(z)
-
-        # (B, 5, 5, output_channel)
-        return z
-
-
-class VAE(nn.Module):
-    config: dict
-
-    @nn.compact
-    def __call__(self, x, rng):
-        # x: (B, 5, 5, C)
-        mean, logvar = Encoder(self.config["latent_dim"])(x)
-        std = jnp.exp(0.5 * logvar)
-
-        rng, _rng = jax.random.split(rng)
-        z = mean + std * jax.random.normal(_rng, mean.shape)
-
-        recon = Decoder(self.config["output_channels"])(z)
-        # recon: (B, 5, 5, output_channels)
-
-        return recon, mean, logvar
-
 
 def make_train(config, train_data, test_data):
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}/{xpid}"
+    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}/crop/{xpid}"
+    print(f"Checkpoint path: {checkpoint_path}")
+    
     # for viz
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     agent_view_size = env.agent_view_size
@@ -152,7 +66,7 @@ def make_train(config, train_data, test_data):
     best_recon_wrt_kl = {kl: 1e9 for kl in kl_spectrum}
 
     def train(rng):
-        model = VAE(config)
+        model = VAE_crop(config)
         rng, _rng, _rng_init = jax.random.split(rng, 3)
         params = model.init(_rng, jnp.zeros((1, *input_shape)), _rng_init)
 
@@ -224,11 +138,11 @@ def make_train(config, train_data, test_data):
                 
                 wandb.log({"test_recon_loss": mean_recon, "test_kl_loss": mean_kl}, step=epoch)
 
-                os.makedirs(os.path.join(checkpoint_path, "crop"), exist_ok=True)
+                os.makedirs(os.path.join(checkpoint_path), exist_ok=True)
                 for kl in best_recon_wrt_kl:
                     if mean_kl < kl and mean_recon < best_recon_wrt_kl[kl]:
                         best_recon_wrt_kl[kl] = mean_recon
-                        ckpt_path = f"{checkpoint_path}/crop/vae_seed{config['SEED']}_kl{kl}.pkl"
+                        ckpt_path = f"{checkpoint_path}/vae_seed{config['SEED']}_kl{kl}.pkl"
                         with open(ckpt_path, "wb") as f:
                             pickle.dump({'params': train_state.params, 'config': config, "key": rng}, f)
 

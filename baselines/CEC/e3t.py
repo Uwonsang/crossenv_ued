@@ -23,8 +23,6 @@ from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
-from graph_layer import make_graph_toy_coop, GATLayer, make_graph_overcooked
-
 import wandb
 import functools
 import pdb
@@ -137,28 +135,12 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             batch_size, num_envs, flattened_obs_dim = obs.shape
-            # if self.config["ENV_NAME"] == "overcooked":
-            #     reshaped_obs = obs.reshape(-1, 7,7,26)
-            # else:
-            #     reshaped_obs = obs.reshape(-1, 5,5,3)
-            reshaped_obs = obs.reshape(-1, *self.config["obs_dim"])
-            # # use 2 conv nets
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"]*2,
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(reshaped_obs)
-            # embedding = nn.relu(embedding)
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"],
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(embedding)
-            # embedding = nn.relu(embedding)
+            if self.config["ENV_NAME"] == "overcooked":
+                reshaped_obs = obs.reshape(-1, 9,9,26)
+            else:
+                reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
                 features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
@@ -174,12 +156,6 @@ class ActorCriticRNN(nn.Module):
                 bias_init=constant(0.0),
             )(embedding)
             embedding = nn.relu(embedding)
-
-            # reshaped_obs = obs.reshape(-1, flattened_obs_dim)
-            # reshaped_agent_positions = agent_positions.reshape((-1, 2, 2))
-            # make_graph_fn = make_graph_overcooked if self.config["ENV_NAME"] == "overcooked" else make_graph_toy_coop
-            # node_feats, adj_mat = jax.vmap(make_graph_fn)(reshaped_obs, reshaped_agent_positions)
-            # embedding = GATLayer(self.config["FC_DIM_SIZE"], num_heads=2)(node_feats, adj_mat)
 
             embedding = embedding.reshape((batch_size, num_envs, -1))
         else:
@@ -202,7 +178,7 @@ class ActorCriticRNN(nn.Module):
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
         #########
-        # Model of other agent
+        # Model of other agent (patner_prediction module-> 7,8,9 index in original e3t paper)
         #########
         prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(embedding)
         prediction_other = nn.leaky_relu(prediction_other)
@@ -237,14 +213,7 @@ class ActorCriticRNN(nn.Module):
                 actor_mean
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 2
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 3
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        
@@ -675,12 +644,12 @@ def make_train(config, update_step=0):
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        return {"runner_state": runner_state, 'metrics': metric}
+        return {"runner_state": runner_state}
 
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="repro_config", config_name="e3t_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
     if config['TRAIN_KWARGS']['finetune']:
@@ -693,17 +662,24 @@ def main(config):
     else:
         fcp_prefix = ""
         finetune_appendage = "_e3t"
+
+    if config["WANDB_MODE"] == "online":
+        with open("private.yaml") as f:
+            private_info = yaml.load(f, Loader=yaml.FullLoader)
+        wandb.login(key=private_info["wandb_key"])
+
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
-        mode=config["WANDB_MODE"]
+        mode=config["WANDB_MODE"],
+        name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config['ENV_KWARGS']['random_reset_fn']}/graph{config["GRAPH_NET"]}"
+    filepath = f"{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config['ENV_KWARGS']['random_reset_fn']}"
     print(f"Working on: \n{filepath}\n")
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -725,7 +701,7 @@ def main(config):
         finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             finetune_filepath += f"/{config['ENV_KWARGS']['layout']}"
-        finetune_filepath = f"{finetune_filepath}/ikFalse/graph{config['GRAPH_NET']}"
+        finetune_filepath = f"{finetune_filepath}/ikFalse"
         fcp_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
         print("Loading fcp checkpoint for finetuning")
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{fcp_ckpt_num}_e3t.pkl", "rb") as f:  # need to resume from last checkpoint
@@ -747,120 +723,18 @@ def main(config):
     train_state = runner_state[0]
     model_state = train_state[0]
     rng = runner_state[-1]
-    metrics = out['metrics']
-
-    reward = metrics['returns']
-    update_step = metrics['update_steps']
-    loss = metrics['loss']
-    value_loss = loss['value_loss']
-    actor_loss = loss['actor_loss']
-    entropy_loss = loss['entropy']
-    final_update_step = update_step[-1]
-    update_step = update_step * config['NUM_ENVS'] * config['NUM_STEPS']
-
+    num_updates = (config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'final_update_step': final_update_step + 1, 'first_update_step': update_step[0], 'last_update_step': update_step[-1], 'first_reward': reward[0], 'middle_reward': reward[len(reward)//2], 'last_reward': reward[-1]}
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-
-    # plot reward w wandb
-    for i, us in enumerate(update_step):
-        r = reward[i]
-        try:
-            wandb.log(
-                {
-                    "returns": r,
-                    "env_step": us,
-                    'seed': config["SEED"]
-                }
-            )
-        except:
-            pass
-
-
-
-
-    # plot reward vs update step with seaborn
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    sns.set_context('paper')
-    # add previous ckpt's first and last update step and reward
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
-        # plot_update_step = jnp.concatenate([, previous_ckpt['last_update_step'][None], update_step])    
-        # plot_reward = jnp.concatenate([previous_ckpt['first_reward'][None], previous_ckpt['last_reward'][None], reward])
-        plot_update_step = update_step
-        plot_reward = reward
-    else:
-        plot_update_step = update_step
-        plot_reward = reward
-
-    value_step = jnp.arange(value_loss.shape[0])
+    print(f"Saved model to {filepath}/e3t_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
+    print(f"--------------------------------")
     
-
-    # plot all losses in subplots
-    fig, axs = plt.subplots(3, 2, figsize=(12, 12))  # Changed to 3x2 to add ratio plot
-    fig.suptitle('Training Losses')
-    
-    # Plot total loss
-    sns.lineplot(x=value_step, y=loss['total_loss'], ax=axs[0, 0])
-    axs[0, 0].set_title('Total Loss')
-    axs[0, 0].set_xlabel('Steps')
-    
-    # Plot value loss
-    sns.lineplot(x=value_step, y=value_loss, ax=axs[0, 1])
-    axs[0, 1].set_title('Value Loss')
-    axs[0, 1].set_xlabel('Steps')
-    
-    # Plot actor loss
-    sns.lineplot(x=value_step, y=loss['actor_loss'], ax=axs[1, 0])
-    axs[1, 0].set_title('Actor Loss')
-    axs[1, 0].set_xlabel('Steps')
-    
-    # Plot entropy loss
-    sns.lineplot(x=value_step, y=entropy_loss, ax=axs[1, 1])
-    axs[1, 1].set_title('Entropy Loss')
-    axs[1, 1].set_xlabel('Steps')
-    
-    # Plot ratio
-    sns.lineplot(x=value_step, y=loss['ratio'], ax=axs[2, 0])
-    axs[2, 0].set_title('Policy Ratio')
-    axs[2, 0].set_xlabel('Steps')
-    
-    # Hide the empty subplot
-    sns.lineplot(x=plot_update_step, y=plot_reward, ax=axs[2, 1])
-    axs[2, 1].set_title('Reward')
-    axs[2, 1].set_xlabel('Steps')
-    
-    plt.tight_layout()
-    plt.savefig(f'{filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    plt.close()
-
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
-    
-    
-    '''updates_x = jnp.arange(out["metrics"]["total_loss"][0].shape[0])
-    loss_table = jnp.stack([updates_x, out["metrics"]["total_loss"].mean(axis=0), out["metrics"]["actor_loss"].mean(axis=0), out["metrics"]["critic_loss"].mean(axis=0), out["metrics"]["entropy"].mean(axis=0), out["metrics"]["ratio"].mean(axis=0)], axis=1)    
-    loss_table = wandb.Table(data=loss_table.tolist(), columns=["updates", "total_loss", "actor_loss", "critic_loss", "entropy", "ratio"])'''
-    '''print('shape', out["metrics"]["returned_episode_returns"][0].shape)
-    updates_x = jnp.arange(out["metrics"]["returned_episode_returns"][0].shape[0])
-    returns_table = jnp.stack([updates_x, out["metrics"]["returned_episode_returns"].mean(axis=0)], axis=1)
-    returns_table = wandb.Table(data=returns_table.tolist(), columns=["updates", "returns"])
-    wandb.log({
-        "returns_plot": wandb.plot.line(returns_table, "updates", "returns", title="returns_vs_updates"),
-        "returns": out["metrics"]["returned_episode_returns"][:,-1].mean(),
-        
-    })'''
-
-'''
-"total_loss_plot": wandb.plot.line(loss_table, "updates", "total_loss", title="total_loss_vs_updates"),
-        "actor_loss_plot": wandb.plot.line(loss_table, "updates", "actor_loss", title="actor_loss_vs_updates"),
-        "critic_loss_plot": wandb.plot.line(loss_table, "updates", "critic_loss", title="critic_loss_vs_updates"),
-        "entropy_plot": wandb.plot.line(loss_table, "updates", "entropy", title="entropy_vs_updates"),
-        "ratio_plot": wandb.plot.line(loss_table, "updates", "ratio", title="ratio_vs_updates"),
-'''
 
 if __name__ == "__main__":
     main()

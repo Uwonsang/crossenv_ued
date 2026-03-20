@@ -1,0 +1,16 @@
+name: ippo_general_pop_forced_coord_9
+pod:
+  template_id: zoz2x6nnmx
+  gpu: NVIDIA GeForce RTX 5090
+  gpu_count: 1
+  spot: false
+  network_volume_id: c4fddrd4z9
+options:
+  timeout: false
+  time_limit: 21600
+  terminate: true
+runtime:
+  cmds:
+  - cd /workerspace/crossenv_ued
+  - pip install -e .
+  - bash baselines/CEC/shell/bash_ippo_pop.sh forced_coord_9 0

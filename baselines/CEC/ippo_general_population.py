@@ -586,6 +586,8 @@ def make_train(config, update_step=0, filepath=""):
             }
             rng = update_state[-1]
 
+            ckpt_id_counter = {"value": -1}
+
             def callback(metric):
                 wandb.log(
                     {
@@ -599,11 +601,12 @@ def make_train(config, update_step=0, filepath=""):
 
                 save_interval = config["NUM_UPDATES"] // 19
                 step = int(metric["update_steps"])
-                if save_interval > 0 and step % save_interval == 0 and step > 0:
+                if save_interval > 0 and ((step % save_interval == 0 and step > 0) or step == (config["NUM_UPDATES"] -1)):
                     print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}")
-                    ckpt_id = int(step // save_interval - 1)
+                    ckpt_id_counter["value"] += 1
+                    ckpt_id = ckpt_id_counter["value"]
                     os.makedirs(filepath, exist_ok=True)
-                    with open(f"{filepath}/seed{config['SEED']}_ckpt{ckpt_id}.pkl", "wb") as f:
+                    with open(f"{filepath}/seed{config['SEED']}_ckpt{ckpt_id}_update{step}.pkl", "wb") as f:
                         pickle.dump({
                             'params': jax.device_get(metric["params"]),
                             'final_update_step': step,

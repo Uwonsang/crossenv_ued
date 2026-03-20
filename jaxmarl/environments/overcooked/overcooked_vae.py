@@ -22,7 +22,6 @@ from jaxmarl.environments.overcooked.common import (
 from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
 
 from baselines.CEC_UED.VAE.Models.vae import Decoder
-from scipy.ndimage import label
 from baselines.CEC_UED.VAE.utils import load_checkpoint
 
 BASE_REW_SHAPING_PARAMS = {
@@ -165,6 +164,7 @@ class Overcooked_VAE(MultiAgentEnv):
         self.vae_decoder_params = vae_decoder_params
         self.vae_config = vae_config
         self.random_reset_fn = random_reset_fn
+        self.vae_decoder = Decoder(output_channel=self.vae_config['output_channels'])
     
     def action_to_string(self, action: int) -> str:
         return Actions(action).name
@@ -200,9 +200,7 @@ class Overcooked_VAE(MultiAgentEnv):
         )
     
     def reset(self, key: chex.PRNGKey, params=None):
-        params = {} if params is None else params
-        vae_decoder_params = params.get("vae_decoder_params", self.vae_decoder_params)
-        vae_config = params.get("vae_config", self.vae_config)
+        z = params.get("z")
 
         def check_match(state_):  # says whether or not the observation is in the held out set
             if self.held_out_goal is None or self.held_out_pot is None or self.held_out_wall is None:
@@ -241,14 +239,29 @@ class Overcooked_VAE(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        obs, state = self.custom_reset_vae(key, vae_decoder_params=vae_decoder_params, vae_config=vae_config)
-        # TODO feasible test for vae
+        obs, state = self.custom_reset_vae(key, z)
+
+        # # 수율 테스트 코드 
+        # from map_validate import validate_layout, debug_print_layout_result
+
+        # padding = (state.maze_map.shape[0] - self.height) // 2
+        # maze_map = state.maze_map[padding:-padding, padding:-padding, 0]
+
+        # validation_result = validate_layout(
+        #     maze_map=maze_map,
+        #     object_to_index=OBJECT_TO_INDEX,
+        # )
+
+        # debug_print_layout_result(validation_result)
+
+        # # TODO : 나중에 사용할 수도 있는 is_valid 변수. 지금은 그냥 출력만 함
+        # is_valid = validation_result.valid 
         
         # Held out test
         key = jax.random.split(key)[0]
         obs, state = jax.lax.cond(
             jnp.logical_and(check_match(state), self.check_held_out),
-            lambda k: self.custom_reset_vae(k, vae_decoder_params=vae_decoder_params, vae_config=vae_config),
+            lambda k: self.custom_reset_vae(k, z),
             lambda k: (obs, state), key)
 
         return lax.stop_gradient(obs), lax.stop_gradient(state)
@@ -513,104 +526,96 @@ class Overcooked_VAE(MultiAgentEnv):
         
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
-    def custom_reset_vae(self, key: chex.PRNGKey, vae_decoder_params, vae_config):
-        
+    def custom_reset_vae(self, key: chex.PRNGKey, z=None):
         STATIC_PAD = 8
-        LATENT_DIM = vae_config['latent_dim']
+        LATENT_DIM = self.vae_config['latent_dim']
         h, w = self.height, self.width
 
-        decoder = Decoder(output_channel=vae_config['output_channels'])
+        def jax_layout_fn(pred_2d):
+            N = h * w
+            flat = pred_2d.reshape(-1, 5)  # (N, 5)
 
-        def _single_attempt(key):
+            #0=pot, 1=wall, 2=onion_pile, 3=plate_pile, 4=goal
+            pot_idx = jnp.where(flat[:, 0] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            onion_pile_idx = jnp.where(flat[:, 2] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            plate_pile_idx = jnp.where(flat[:, 3] == 1, size=STATIC_PAD, fill_value=-1)[0]
+            goal_idx = jnp.where(flat[:, 4] == 1, size=STATIC_PAD, fill_value=-1)[0]
+
+            occupied = flat.sum(axis=-1) > 0
+            free = (1 - occupied).astype(jnp.bool_)
+            free_2d = free.reshape(h, w)
+            
+            labels = jnp.where(free, jnp.arange(N), N) 
+
+            def propagate(labels, _):
+                lab_2d = labels.reshape(h, w)
+                up    = jnp.pad(lab_2d[:-1, :], ((1,0),(0,0)), constant_values=N)
+                down  = jnp.pad(lab_2d[1:,  :], ((0,1),(0,0)), constant_values=N)
+                left  = jnp.pad(lab_2d[:, :-1], ((0,0),(1,0)), constant_values=N)
+                right = jnp.pad(lab_2d[:, 1:],  ((0,0),(0,1)), constant_values=N)
+                new_lab = jnp.minimum(lab_2d, jnp.minimum(
+                    jnp.minimum(up, down), jnp.minimum(left, right)))
+                new_lab = jnp.where(free_2d, new_lab, N)
+                return new_lab.flatten(), None
+
+            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
+
+            # --- filter isolated cells (size <= 1) ---
+            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            cell_counts = counts_per_label[propagated_labels]
+            filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
+
+            # --- unique component---
+            is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
+            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
+
+            # 1st component
+            best_label0 = jnp.argmax(rep_counts)
+            rep_counts0 = rep_counts[best_label0]
+
+            # 2nd component
+            rep_counts1 = rep_counts.at[best_label0].set(0)
+            best_label1 = jnp.argmax(rep_counts1)
+            rep_counts1_best = rep_counts1[best_label1]
+
+            has_first = rep_counts0 > 0
+            has_second = rep_counts1_best > 0
+            valid = has_first & has_second
+
+            # --- region probs ---
+            region0_mask = (filtered_labels == best_label0)
+            region1_mask = (filtered_labels == best_label1)
+
+            sum0 = region0_mask.sum()
+            sum1 = region1_mask.sum()
+
+            free_float = free.astype(jnp.float32)
+            free_sum = jnp.sum(free_float)
+            uniform = free_float / jnp.where(free_sum > 0, free_sum, 1.0)
+
+            region0_probs = jnp.where(has_first, region0_mask / jnp.where(sum0 > 0, sum0, 1.0), uniform)
+            
+            region1_probs = jnp.where(has_second,
+                            region1_mask.astype(jnp.float32) / jnp.where(sum1 > 0, sum1, 1.0),
+                            region0_mask.astype(jnp.float32) / jnp.where(sum0 > 0, sum0, 1.0))
+
+            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
+
+        def _single_attempt(key, z):
             key, subkey = jax.random.split(key)
-            z = jax.random.normal(subkey, (1, LATENT_DIM))
-            pred = decoder.apply(vae_decoder_params, z)
+            pred = self.vae_decoder.apply(self.vae_decoder_params, z)
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
-            def numpy_layout_fn(pred_2d_np):
-                flat = pred_2d_np.reshape(-1, 5)
-                pot_idx = np.where(flat[:, 0] == 1)[0]
-                onion_pile_idx = np.where(flat[:, 2] == 1)[0]
-                plate_pile_idx = np.where(flat[:, 3] == 1)[0]
-                goal_idx = np.where(flat[:, 4] == 1)[0]
-
-                occupied = flat[:, 0] | flat[:, 1] | flat[:, 2] | flat[:, 3] | flat[:, 4]
-                free = (1 - occupied)
-
-                labeled, num_features = label(free.reshape(h, w))
-                sizes = np.array([np.sum(labeled == i) for i in range(1, num_features + 1)])
-                filtered_labeled = np.where(np.isin(labeled, np.where(sizes <= 1)[0] + 1), 0, labeled)
-                filtered_free = (filtered_labeled > 0).astype(np.float32).flatten()
-
-                valid_labels = np.unique(filtered_labeled[filtered_labeled > 0])
-                num_valid = len(valid_labels)
-                if num_valid >= 2:
-                    valid_sizes = np.array([np.sum(filtered_labeled == l) for l in valid_labels])
-                    top2 = valid_labels[np.argsort(valid_sizes)[-2:]]
-                    region0_label = top2[1]  # largest region
-                    region1_label = top2[0]  # second largest region
-                    region0_probs = (filtered_labeled == region0_label).astype(np.float32).flatten()
-                    region1_probs = (filtered_labeled == region1_label).astype(np.float32).flatten()
-                    region0_probs /= region0_probs.sum()
-                    region1_probs /= region1_probs.sum()
-                    valid = np.array(True)
-                else:
-                    if filtered_free.sum() == 0:
-                        region0_probs = np.ones(h * w, dtype=np.float32) / (h * w)
-                        region1_probs = region0_probs.copy()
-                        valid = np.array(False)
-                    else:
-                        free_flat = filtered_free / filtered_free.sum()
-                        region0_probs = free_flat.copy()
-                        region1_probs = free_flat.copy()
-                        valid = np.array(True)
-
-                def pad(idx, max_n):
-                    out = np.full(max_n, -1, dtype=np.int32)
-                    n = min(len(idx), max_n)
-                    out[:n] = idx[:n]
-                    return out
-
-                return (
-                    pad(pot_idx,        STATIC_PAD),
-                    pad(onion_pile_idx, STATIC_PAD),
-                    pad(plate_pile_idx, STATIC_PAD),
-                    pad(goal_idx,       STATIC_PAD),
-                    region0_probs.astype(np.float32),
-                    region1_probs.astype(np.float32),
-                    valid,
-                )
-
-            # pure_callback to run numpy in JAX trace
-            result_shapes = (
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((STATIC_PAD,), jnp.int32),
-                jax.ShapeDtypeStruct((h * w,),      jnp.float32),
-                jax.ShapeDtypeStruct((h * w,),      jnp.float32),
-                jax.ShapeDtypeStruct((),            jnp.bool_),
-            )
-
-            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax.pure_callback(
-                numpy_layout_fn, result_shapes, pred_2d)
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d)
 
             return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
 
-        def cond_fn(carry):
-            *_, valid = carry
-            return ~valid
-
-        def body_fn(carry):
-            key = carry[0]
-            key, subkey = jax.random.split(key)
-            return _single_attempt(subkey)
-
         key, subkey = jax.random.split(key)
-        init = _single_attempt(subkey)
-        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = jax.lax.while_loop(
-            cond_fn, body_fn, init)
+        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
+
+         #TODO jax.lax.while_loop is cause of low update speed need to use scan to roll the candidate
 
         # index to (x, y) pos (-1 is out of map range by uint32 casting)
         def idx_to_pos(idx):
@@ -621,7 +626,7 @@ class Overcooked_VAE(MultiAgentEnv):
         plate_pile_pos = static_pos(plate_pile_idx)
         onion_pile_pos = static_pos(onion_pile_idx)
 
-        wall_map = pred_2d[:, :, 1].astype(jnp.bool_)
+        wall_map = (pred_2d.sum(axis=-1) > 0).astype(jnp.bool_)
         pot_status = jnp.full((STATIC_PAD,), POT_EMPTY_STATUS)
 
         onion_pos = jnp.array([[-1, -1]], dtype=jnp.uint32)
@@ -633,7 +638,10 @@ class Overcooked_VAE(MultiAgentEnv):
 
         key, subkey = jax.random.split(key)
         region1_masked = region1_probs.at[agent0_flat].set(0.0)
-        region1_masked = region1_masked / jnp.sum(region1_masked)
+        masked_sum = jnp.sum(region1_masked)
+        region1_masked = jnp.where(masked_sum > 0,
+                            region1_masked / masked_sum,
+                            region0_probs.at[agent0_flat].set(0.0) / jnp.maximum(jnp.sum(region0_probs.at[agent0_flat].set(0.0)), 1.0))
         agent1_flat = jax.random.choice(subkey, h * w, p=region1_masked)
 
         agent_idx = jnp.array([agent0_flat, agent1_flat])
@@ -1105,41 +1113,41 @@ class Overcooked_VAE(MultiAgentEnv):
 
 
 if __name__ == "__main__":
-    from jaxmarl.environments.overcooked import overcooked_layouts
+    import argparse
     import os
     import time
+    from omegaconf import OmegaConf
+    from baselines.CEC_UED.ippo_general_vae import initialize_environment
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
+    
+    _config_path = "/app/baselines/CEC_UED/config/ippo_overcooked_CEC_VAE.yaml"
+    config = OmegaConf.load(_config_path)
+    config = OmegaConf.to_container(config, resolve=True)
+    
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M")
-
-    env_kwargs = {
-        'layout': overcooked_layouts["cramped_room_9"],
-        'random_reset': True,
-        'max_steps': 256,
-        'single_agent': False,
-        'check_held_out': False,
-        'shuffle_inv_and_pot': False
-    }
-    # env_kwargs = filter_kwargs(env_kwargs, Overcooked)
-    env = Overcooked_VAE(**env_kwargs)
-
-    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
-    import imageio
-
     vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl70.pkl"
     params, ckpt_config = load_checkpoint(vae_model_path)
     decoder_params = {"params": params["params"]["Decoder_0"]}
 
-    params={'random_reset_fn': 'reset_vae',
-            'vae_decoder_params': decoder_params, 'vae_config': ckpt_config} # reset_all or reset_counter_circuit, reset_coord_ring
-    keys = jax.random.split(jax.random.PRNGKey(0), 30)
-    def render_reset(key):
-        obs, state = env.reset(key, params=params)
+    config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
+    config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    env = initialize_environment(config)
+
+    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
+    import imageio
+    key = jax.random.PRNGKey(args.seed)
+    key, key_z, key_env = jax.random.split(key, 3)
+    z_list = jax.random.normal(key_z, (100, ckpt_config["latent_dim"])) # (100, 16)   
+    def render_reset(z):
+        obs, state = env.reset(key_env, params={"z": z[None, :]})
         return render_fn(state)
-    images = jax.vmap(render_reset)(keys)
-    # for each image, save it as a png
-    save_path = "/app/jaxmarl/environments/overcooked/images_test"
+    images = jax.jit(jax.vmap(render_reset))(z_list)
+    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{seed}"
     os.makedirs(save_path, exist_ok=True)
     for i, image in enumerate(images):
-        filename = f"image_{params['random_reset_fn']}_{i}.png"
+        filename = f"image_reset_vae_{i}.png"
         full_path = os.path.join(save_path, filename)
         imageio.imwrite(full_path, image)
         print(f"Saved {full_path}")

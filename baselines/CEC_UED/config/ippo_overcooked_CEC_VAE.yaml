@@ -6,9 +6,9 @@
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
-"MAX_TRAIN_STEPS": 3e6 #checked
+"MAX_TRAIN_STEPS": 3e9 #checked
 "UPDATE_EPOCHS": 4 #checked
-"NUM_MINIBATCHES": 8 #checked
+"NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
 "GAE_LAMBDA": 0.95 #checked
 "CLIP_EPS": 0.2 #checked
@@ -22,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 400
+  "max_steps": 256
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -54,7 +54,26 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
+"PROJECT": "crossenv_ued_vae_ippo"
 "WANDB_MODE" : "disabled"
+"model_name": "IPPO_CEC_VAE"
 # VAE params
-"VAE_CKPT_PATH": "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl50.pkl"
+"VAE_CKPT_PATH": "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e7_all/lr-20260307-080520/vae_seed0_kl70.pkl"
+"z_dim": 16 # replace with vae config
+"kl_coeff": 5.0
+"entropy_coeff": 0.01
+"use_mean_clipping": False
+"clip_mean_min": -0.5
+"clip_mean_max": 0.5
+"use_std_scaling": False
+"scale_log_std": 4.0
+"scale_std_offset": 1.0
+"gen_hidden_dim": 128
+"use_kl": True
+"use_entropy": False
+"adversary_learning_rate": 0.0005
+"adversary_weight_decay": 0.0001
+"use_grad_clip": False
+"grad_clip_norm": 0.5
+"use_lr_scheduler": False
+"save_frames": False

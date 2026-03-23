@@ -23,6 +23,7 @@ from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layout
 
 from baselines.CEC_UED.VAE.Models.vae import Decoder_crop
 from baselines.CEC_UED.VAE.utils import load_checkpoint
+from jaxmarl.environments.overcooked.map_validate import validate_layout
 
 BASE_REW_SHAPING_PARAMS = {
     "PLACEMENT_IN_POT_REW": 10, # reward for putting ingredients 
@@ -54,6 +55,7 @@ class State:
     pot_pos: chex.Array
     wall_map: chex.Array
     maze_map: chex.Array
+    selected_z_idx: chex.Array
     time: int
     terminal: bool
 
@@ -81,6 +83,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             vae_decoder_params=None,
             vae_config=None,
             random_reset_fn: str = "reset_all",
+            z_list_size: int = 10
     ):
         # Sets self.num_agents to 2
         super().__init__(num_agents=2)
@@ -165,6 +168,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
         self.vae_config = vae_config
         self.random_reset_fn = random_reset_fn
         self.vae_decoder = Decoder_crop(output_channel=self.vae_config['output_channels'])
+        self.z_list_size = z_list_size
     
     def action_to_string(self, action: int) -> str:
         return Actions(action).name
@@ -239,16 +243,37 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             some_match = jnp.all(temp, axis=0).any()
             return some_match
 
-        obs, state = self.custom_reset_vae(key, z)
-        
-        # Held out test
-        key = jax.random.split(key)[0]
+        key, key_cond = jax.random.split(key)
+        obs, state = self._reset_vae_candidates(key, z)
+
         obs, state = jax.lax.cond(
             jnp.logical_and(check_match(state), self.check_held_out),
-            lambda k: self.custom_reset_vae(k, z),
-            lambda k: (obs, state), key)
+            lambda k: self._reset_vae_candidates(k, z),
+            lambda k: (obs, state),
+            key_cond,
+        )
 
         return lax.stop_gradient(obs), lax.stop_gradient(state)
+
+    def _reset_vae_candidates(self, rng_key, z):
+
+        sk1, sk2 = jax.random.split(rng_key)
+        keys = jax.random.split(sk1, z.shape[0])
+        obsv, statev = jax.vmap(self.custom_reset_vae, in_axes=(0, 0))(keys, z)
+
+        padding = (statev.maze_map.shape[1] - self.height) // 2
+        maze_maps = statev.maze_map[:, padding:-padding, padding:-padding, 0]
+
+        valid_mask = jax.vmap(lambda m: validate_layout(maze_map=m, object_to_index=OBJECT_TO_INDEX).valid)(maze_maps)
+
+        scores = jnp.where(valid_mask, jax.random.uniform(sk2, valid_mask.shape), -1.0)
+        idx = jnp.argmax(scores)
+
+        obs = jax.tree_map(lambda x: x[idx], obsv)
+        state = jax.tree_map(lambda x: x[idx], statev)
+        state = state.replace(selected_z_idx=idx.astype(jnp.int32))
+
+        return obs, state
     
     def custom_reset(self, key: chex.PRNGKey, random_reset, shuffle_inv_and_pot, layout) -> Tuple[Dict[str, chex.Array], State]:
         """Reset environment state based on `self.random_reset`
@@ -502,6 +527,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             pot_pos=pot_pos,
             wall_map=wall_map.astype(jnp.bool_),
             maze_map=maze_map,
+            selected_z_idx=jnp.array(-1, dtype=jnp.int32),
             time=0,
             terminal=False,
         )
@@ -512,7 +538,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
 
     def custom_reset_vae(self, key: chex.PRNGKey, z=None):
         STATIC_PAD = 8
-        LATENT_DIM = self.vae_config['latent_dim']
+        
         h, w = self.height, self.width
 
         def jax_layout_fn(pred_2d):
@@ -588,7 +614,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
 
         def _single_attempt(key, z):
             key, subkey = jax.random.split(key)
-            pred = self.vae_decoder.apply(self.vae_decoder_params, z)
+            pred = self.vae_decoder.apply(self.vae_decoder_params, z[None, :])
             pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 5, 5, 5)
             pred_2d = pred[0]  # (5, 5, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
@@ -610,8 +636,6 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
 
         key, subkey = jax.random.split(key)
         key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
-
-         #TODO jax.lax.while_loop is cause of low update speed need to use scan to roll the candidate
 
         # index to (x, y) pos (-1 is out of map range by uint32 casting)
         def idx_to_pos(idx):
@@ -663,6 +687,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             pot_pos=pot_pos,
             wall_map=wall_map,
             maze_map=maze_map,
+            selected_z_idx=jnp.array(-1, dtype=jnp.int32),
             time=0,
             terminal=False,
         )
@@ -1100,6 +1125,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             "agent_dir": spaces.Discrete(4),
             "goal_pos": spaces.Box(0, max(w, h), (2,), dtype=jnp.uint32),
             "maze_map": spaces.Box(0, 255, (w + agent_view_size, h + agent_view_size, 3), dtype=jnp.uint32),
+            "selected_z_idx": spaces.Box(-1, self.z_list_size, (), dtype=jnp.int32),
             "time": spaces.Discrete(self.max_steps),
             "terminal": spaces.Discrete(2),
         })
@@ -1113,6 +1139,7 @@ if __name__ == "__main__":
     import os
     import time
     from omegaconf import OmegaConf
+    from tqdm import tqdm
     from baselines.CEC_UED.ippo_general_vae import initialize_environment
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=0)
@@ -1124,11 +1151,13 @@ if __name__ == "__main__":
     
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M")
     vae_model_path = "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e6_coord_ring/crop/lr-20260320-131854/vae_seed0_kl70.pkl"
+    vae_save_layout = vae_model_path.split("/")[6]
     params, ckpt_config = load_checkpoint(vae_model_path)
-    decoder_params = {"params": params["params"]["Encoder_crop_0"]}
+    decoder_params = {"params": params["params"]["Decoder_crop_0"]}
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    config["ENV_KWARGS"]["z_list_size"] = 10
     config["ENV_NAME"] = "overcooked_vae_crop"
     env = initialize_environment(config)
 
@@ -1136,15 +1165,15 @@ if __name__ == "__main__":
     import imageio
     key = jax.random.PRNGKey(args.seed)
     key, key_z, key_env = jax.random.split(key, 3)
-    z_list = jax.random.normal(key_z, (100, 16)) # (100, 16)   
+    z_list = jax.random.normal(key_z, (100, config["ENV_KWARGS"]["z_list_size"], ckpt_config["latent_dim"])) # (100, 10, 16)
+
     def render_reset(z):
-        obs, state = env.reset(key_env, params={"z": z[None, :]})
+        obs, state = env.reset(key_env, params={"z": z})
         return render_fn(state)
     images = jax.jit(jax.vmap(render_reset))(z_list)
-    save_path = f"/app/jaxmarl/environments/overcooked/images/test_seed_{args.seed}_crop"
+    save_path = f"/app/jaxmarl/environments/overcooked/images/{vae_save_layout}/crop_seed_{args.seed}"
     os.makedirs(save_path, exist_ok=True)
-    for i, image in enumerate(images):
+    for i, image in tqdm(enumerate(images)):
         filename = f"image_reset_vae_{i}.png"
         full_path = os.path.join(save_path, filename)
         imageio.imwrite(full_path, image)
-        print(f"Saved {full_path}")

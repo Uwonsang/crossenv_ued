@@ -46,6 +46,7 @@ class AdversarialZ:
         self.use_std_scaling   = config["use_std_scaling"]
         self.scale_log_std     = config.get('scale_log_std',   1.0)
         self.scale_std_offset  = config.get('scale_std_offset', 0)
+        self.z_list_size = config["z_list_size"]
 
         if config["filepath"] is not None:
             self.save_dir = os.path.join(config["filepath"], "models")
@@ -85,20 +86,19 @@ class AdversarialZ:
         
         key, key1, key2 = jax.random.split(key, 3)
         z_prior = distrax.Normal(
-            loc=jnp.zeros((self.z_dim,)),
-            scale=jnp.ones((self.z_dim,)))
+            loc=jnp.zeros((self.z_list_size, self.z_dim,)),
+            scale=jnp.ones((self.z_list_size, self.z_dim,)))
 
-        z_sample_old = z_prior.sample(seed=key1) #(z_dim,)
+        z_sample_old = z_prior.sample(seed=key1) #(z_list_size, z_dim)
 
         mean, log_std = self._apply_net(
-            z_gen_state.apply_fn, z_gen_state.params, z_sample_old[None, :]) # (1, z_dim)
-        mean, log_std = mean.squeeze(axis=0), log_std.squeeze(axis=0) # (z_dim,)
+            z_gen_state.apply_fn, z_gen_state.params, z_sample_old) # (z_list_size, z_dim)
         std = jnp.exp(log_std) + 1e-6
 
         z_current = distrax.Normal(mean, std)
-        z_sample_new = z_current.sample(seed=key2) #(z_dim,)
+        z_sample_new = z_current.sample(seed=key2) #(z_list_size, z_dim)
 
-        return z_sample_new, z_sample_old, z_prior
+        return z_sample_new, z_sample_old
         
     def compute_policy_stats(self, apply_fn, params, old_dist_diag=None, key=None):
         """Compute policy distribution stats after update."""
@@ -116,8 +116,8 @@ class AdversarialZ:
 
         return entropy, kl_div
 
-    def train_step(self, z_gen_state, key, current_reward, trained_reward, 
-                         z_new, z_old, z_prior):
+    def train_step(self, z_gen_state, key, current_reward, trained_reward,
+                         z_old, z_new, z_prior):
 
         # No grad (baseline)
         key, k_diag = jax.random.split(key)

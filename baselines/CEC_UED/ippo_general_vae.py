@@ -41,7 +41,7 @@ def initialize_environment(config):
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
-    if config["ENV_NAME"] == "overcooked" or config["ENV_NAME"] == "overcooked_vae" or config["ENV_NAME"] == "overcooked_vae_crop":
+    if "overcooked" in config["ENV_NAME"]:
         def reset_env(key):
             def reset_sub_dict(key, fn):
                 key, subkey = jax.random.split(key)
@@ -143,7 +143,7 @@ class ActorCriticRNN(nn.Module):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
         if self.config["CONV_NET"]:
-            if self.config["ENV_NAME"] == "overcooked" or self.config["ENV_NAME"] == "overcooked_vae":
+            if "overcooked" in self.config["ENV_NAME"]:
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
@@ -204,7 +204,7 @@ class ActorCriticRNN(nn.Module):
             self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = nn.relu(actor_mean)
-        if self.config["ENV_NAME"] == "overcooked" or self.config["ENV_NAME"] == "overcooked_vae":
+        if "overcooked" in self.config["ENV_NAME"]:
             actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 actor_mean
             )
@@ -227,7 +227,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
         critic = nn.relu(critic)
-        if self.config["ENV_NAME"] == "overcooked" or self.config["ENV_NAME"] == "overcooked_vae":
+        if "overcooked" in self.config["ENV_NAME"]:
             critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
@@ -363,18 +363,18 @@ def make_train(config, update_step=0):
             def _sample_z(k):
                 return z_gen.get_z(adversary_state, k)
 
-            z_new, z_old, z_prior = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z) # z_new, z_old (batch_size, z_dim)       
+            z_new, z_old = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z) # z_new, z_old (batch_size, z_dim)       
             keys_env = jax.random.split(key_env, config["NUM_ENVS"])
 
             def _reset_env(k, z):
-                obsv, env_state = env.reset(k, params={"z": z[None, :]})
+                obsv, env_state = env.reset(k, params={"z": z})
                 return obsv, env_state
 
             obsv, env_state = jax.vmap(_reset_env, in_axes=(0, 0), out_axes=0)(keys_env, z_new)
 
-            return obsv, env_state, adversary_state, z_new, z_old, z_prior
+            return obsv, env_state, adversary_state, z_new, z_old
 
-        obsv, env_state, adversary_state, z_new, z_old, z_prior = \
+        obsv, env_state, adversary_state, z_new, z_old = \
             _reset_all_envs(_rng, adversary_state)
         
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
@@ -387,7 +387,7 @@ def make_train(config, update_step=0):
 
             def _env_step(runner_state, unused):
                 (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                z_new, z_old, z_prior, update_step) = runner_state
+                z_new, z_old, update_step) = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -430,25 +430,25 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_reset = jax.random.split(_rng, config["NUM_ENVS"])
                 #TODO : check the layout of reset, is it reset with after done?
-                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, z_new_i, z_old_i, z_prior_i, adversary_state):
+                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, z_new_i, z_old_i, adversary_state):
                     """Reset a single env if its episode is done, otherwise keep as is."""
                     def do_reset(_):
                         key_z, key_env = jax.random.split(rng_i)
-                        z_new_i_new, z_old_i_new, z_prior_i_new = z_gen.get_z(adversary_state, key_z)
+                        z_new_i_new, z_old_i_new = z_gen.get_z(adversary_state, key_z)
 
                         obsv_new_i, env_state_new_i = env.reset(
-                            key_env, params={"z": z_new_i_new[None, :]}
+                            key_env, params={"z": z_new_i_new}
                         )
-                        return (obsv_new_i, env_state_new_i, z_new_i_new, z_old_i_new, z_prior_i_new)
+                        return (obsv_new_i, env_state_new_i, z_new_i_new, z_old_i_new)
 
                     def keep(_):
-                        return (obsv_i, env_state_i, z_new_i, z_old_i, z_prior_i)
+                        return (obsv_i, env_state_i, z_new_i, z_old_i)
 
                     return jax.lax.cond(done_i, do_reset, keep, operand=None)
 
-                obsv, env_state, z_new, z_old, z_prior = jax.vmap(
-                    _reset_if_done, in_axes=(0, 0, 0, 0, 0, 0, 0, None), out_axes=(0, 0, 0, 0, 0)
-                )(done_all, rng_reset, obsv, env_state, z_new, z_old, z_prior, adversary_state)
+                obsv, env_state, z_new, z_old = jax.vmap(
+                    _reset_if_done, in_axes=(0, 0, 0, 0, 0, 0, None), out_axes=(0, 0, 0, 0)
+                )(done_all, rng_reset, obsv, env_state, z_new, z_old, adversary_state)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -464,32 +464,27 @@ def make_train(config, update_step=0):
                     agent_positions
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state,
-                                z_new, z_old, z_prior, update_step)
+                                z_new, z_old, update_step)
 
                 return runner_state, (transition, FilteredState(**filtered_state))
 
             (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state, 
-            z_new, z_old, z_prior) = runner_state
+            z_new, z_old) = runner_state
             initial_hstate = hstate
             eval_start_state = (env_state, obsv, done_batch, hstate, rng, update_steps)
 
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, 
-            adversary_state, z_new, z_old, z_prior, update_steps)
+            adversary_state, z_new, z_old, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
             (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-             z_new, z_old, z_prior, update_steps) = runner_state
-
-            z_sample_info = {
-                'z_sample/mean': z_new.mean(),
-                'z_sample/std': z_new.std(),
-                'log_prob': z_prior.log_prob(z_new).mean()}
+             z_new, z_old, update_steps) = runner_state
 
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                            z_new, z_old, z_prior)
+                            z_new, z_old)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
@@ -740,8 +735,29 @@ def make_train(config, update_step=0):
             metric["trained_reward_per_env"] = trained_reward
 
             rng, _rng = jax.random.split(rng)
-            adversary_state, train_info = z_gen.train_step(adversary_state, _rng, current_reward, trained_reward, 
-                                                           z_new, z_old, z_prior)
+            selected_z_idx = env_state.env_state.selected_z_idx
+            safe_idx = jnp.where(selected_z_idx >= 0, selected_z_idx, 0).astype(jnp.int32)
+            batch_idx = jnp.arange(safe_idx.shape[0])
+            z_old_selected   = z_old[batch_idx, safe_idx]    # (512, 16)
+            z_new_selected   = z_new[batch_idx, safe_idx]    # (512, 16)
+            
+            z_dim = config["ENV_KWARGS"]['vae_config']['latent_dim']
+            z_prior = distrax.Normal(loc=jnp.zeros((z_dim,)), scale=jnp.ones((z_dim,)))
+
+            adversary_state, train_info = z_gen.train_step(
+                adversary_state,
+                _rng,
+                current_reward,
+                trained_reward,
+                z_old_selected,
+                z_new_selected,
+                z_prior,
+            )
+
+            z_sample_info = {
+                'z_sample/mean': z_new_selected.mean(),
+                'z_sample/std': z_new_selected.std(),
+                'log_prob': z_prior.log_prob(z_new_selected).mean()}
 
             def callback(metric):
                 wandb.log(
@@ -786,7 +802,7 @@ def make_train(config, update_step=0):
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                            z_new, z_old, z_prior)
+                            z_new, z_old)
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -798,7 +814,7 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
             adversary_state,
-            z_new, z_old, z_prior
+            z_new, z_old
         )
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
@@ -897,7 +913,10 @@ def main(config):
     
     # load vae decoder params
     params, ckpt_config = load_checkpoint(config["VAE_CKPT_PATH"])
-    decoder_params = {"params": params["params"]["Decoder_0"]}
+    if config["ENV_NAME"] == "overcooked_vae_crop":
+        decoder_params = {"params": params["params"]["Decoder_crop_0"]}
+    else:
+        decoder_params = {"params": params["params"]["Decoder_0"]}
 
     config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
     config["ENV_KWARGS"]["vae_config"] = ckpt_config

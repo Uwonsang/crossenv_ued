@@ -239,8 +239,7 @@ class Overcooked_VAE(MultiAgentEnv):
             some_goal_match = jax.vmap(goal_match)(self.held_out_goal)
             some_pot_match = jax.vmap(pot_match)(self.held_out_pot)
             some_wall_match = jax.vmap(wall_match)(self.held_out_wall)
-            temp = jnp.stack([some_goal_match, some_pot_match, some_wall_match], axis=0) # 3 x 100
-            some_match = jnp.all(temp, axis=0).any()
+            some_match = (some_goal_match & some_pot_match & some_wall_match).any()
             return some_match
 
         key, key_cond = jax.random.split(key)
@@ -567,16 +566,21 @@ class Overcooked_VAE(MultiAgentEnv):
                 new_lab = jnp.where(free_2d, new_lab, N)
                 return new_lab.flatten(), None
 
-            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
-
+            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=max(h, w)+1)
             # --- filter isolated cells (size <= 1) ---
-            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            counts_per_label = jax.ops.segment_sum(
+                                jnp.ones(N, dtype=jnp.int32),
+                                propagated_labels,
+                                num_segments=N + 1)
             cell_counts = counts_per_label[propagated_labels]
             filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
 
             # --- unique component---
             is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
-            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            counts_per_filtered_label = jax.ops.segment_sum(
+                                        jnp.ones(N, dtype=jnp.int32),
+                                        filtered_labels,
+                                        num_segments=N + 1)
             rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
 
             # 1st component
@@ -590,7 +594,6 @@ class Overcooked_VAE(MultiAgentEnv):
 
             has_first = rep_counts0 > 0
             has_second = rep_counts1_best > 0
-            valid = has_first & has_second
 
             # --- region probs ---
             region0_mask = (filtered_labels == best_label0)
@@ -609,20 +612,18 @@ class Overcooked_VAE(MultiAgentEnv):
                             region1_mask.astype(jnp.float32) / jnp.where(sum1 > 0, sum1, 1.0),
                             region0_mask.astype(jnp.float32) / jnp.where(sum0 > 0, sum0, 1.0))
 
-            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
+            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs
 
-        def _single_attempt(key, z):
-            key, subkey = jax.random.split(key)
+        def _single_attempt(z):
             pred = self.vae_decoder.apply(self.vae_decoder_params, z[None, :])
-            pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 9, 9, 5)
+            pred = (pred > 0.0).astype(jnp.uint8)  # (1, 9, 9, 5)
             pred_2d = pred[0]  # (9, 9, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
 
-            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d)
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs = jax_layout_fn(pred_2d)
 
-            return key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
+            return pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs 
 
-        key, subkey = jax.random.split(key)
-        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
+        pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs = _single_attempt(z) 
 
         # index to (x, y) pos (-1 is out of map range by uint32 casting)
         def idx_to_pos(idx):

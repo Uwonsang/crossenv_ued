@@ -239,8 +239,7 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
             some_goal_match = jax.vmap(goal_match)(self.held_out_goal)
             some_pot_match = jax.vmap(pot_match)(self.held_out_pot)
             some_wall_match = jax.vmap(wall_match)(self.held_out_wall)
-            temp = jnp.stack([some_goal_match, some_pot_match, some_wall_match], axis=0) # 3 x 100
-            some_match = jnp.all(temp, axis=0).any()
+            some_match = (some_goal_match & some_pot_match & some_wall_match).any()
             return some_match
 
         key, key_cond = jax.random.split(key)
@@ -568,16 +567,22 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
                 new_lab = jnp.where(free_2d, new_lab, N)
                 return new_lab.flatten(), None
 
-            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=h + w)
+            propagated_labels, _ = jax.lax.scan(propagate, labels, None, length=max(h, w)+1)
 
             # --- filter isolated cells (size <= 1) ---
-            counts_per_label = jax.vmap(lambda l: jnp.sum(propagated_labels == l))(jnp.arange(N + 1))
+            counts_per_label = jax.ops.segment_sum(
+                    jnp.ones(N, dtype=jnp.int32),
+                    propagated_labels,
+                    num_segments=N + 1)
             cell_counts = counts_per_label[propagated_labels]
             filtered_labels = jnp.where((cell_counts > 1) & free, propagated_labels, N)
 
             # --- unique component---
             is_representative = (jnp.arange(N) == filtered_labels) & (filtered_labels < N)
-            counts_per_filtered_label = jax.vmap(lambda l: jnp.sum(filtered_labels == l))(jnp.arange(N + 1))
+            counts_per_filtered_label = jax.ops.segment_sum(
+                                        jnp.ones(N, dtype=jnp.int32),
+                                        filtered_labels,
+                                        num_segments=N + 1)
             rep_counts = jnp.where(is_representative, counts_per_filtered_label[jnp.arange(N)], 0)
 
             # 1st component
@@ -591,7 +596,6 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
 
             has_first = rep_counts0 > 0
             has_second = rep_counts1_best > 0
-            valid = has_first & has_second
 
             # --- region probs ---
             region0_mask = (filtered_labels == best_label0)
@@ -610,32 +614,28 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
                             region1_mask.astype(jnp.float32) / jnp.where(sum1 > 0, sum1, 1.0),
                             region0_mask.astype(jnp.float32) / jnp.where(sum0 > 0, sum0, 1.0))
 
-            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid
+            return pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs
 
-        def _single_attempt(key, z):
-            key, subkey = jax.random.split(key)
+        def _single_attempt(z):
             pred = self.vae_decoder.apply(self.vae_decoder_params, z[None, :])
-            pred = (jax.nn.sigmoid(pred) > 0.5).astype(jnp.uint8)  # (1, 5, 5, 5)
+            pred = (pred > 0.0).astype(jnp.uint8)  # (1, 5, 5, 5)
             pred_2d = pred[0]  # (5, 5, 5): ch0=pot, ch1=wall, ch2=onion_pile, ch3=plate_pile, ch4=goal
-
-            # padding to 9x9 (For the area excluded from the top-left vae_h x vae_w)
             vae_h, vae_w = pred_2d.shape[:2]
-            pred_2d_padded = jnp.zeros((h, w, 5), dtype=pred_2d.dtype)
-            pred_2d_padded = pred_2d_padded.at[:vae_h, :vae_w, :].set(pred_2d)
-            
-            # force the excluded area to be "wall" so it is not treated as free space.
-            out_mask = jnp.ones((h, w), dtype=jnp.bool_)
-            out_mask = out_mask.at[:vae_h, :vae_w].set(False)
-            pred_2d_padded = pred_2d_padded.at[:, :, 1].set(
-                jnp.where(out_mask, jnp.array(1, dtype=pred_2d_padded.dtype), pred_2d_padded[:, :, 1])
-            )
 
-            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid = jax_layout_fn(pred_2d_padded)
+            wall_ch = jnp.pad(pred_2d[:, :, 1],
+                            [(0, self.height - vae_h), (0, self.width - vae_w)], constant_values=1)
+            others  = jnp.pad(pred_2d[:, :, [0,2,3,4]], 
+                            [(0, self.height-vae_h),(0, self.width-vae_w),(0,0)], constant_values=0)
+            pred_2d_padded = jnp.concatenate([
+                            others[:,:,:1],
+                            wall_ch[:,:,None], 
+                            others[:,:,1:]], axis=-1)
 
-            return key, pred_2d_padded, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, valid 
+            pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs = jax_layout_fn(pred_2d_padded)
 
-        key, subkey = jax.random.split(key)
-        key, pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs, _ = _single_attempt(subkey, z) 
+            return pred_2d_padded, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs 
+
+        pred_2d, pot_idx, onion_pile_idx, plate_pile_idx, goal_idx, region0_probs, region1_probs = _single_attempt(z) 
 
         # index to (x, y) pos (-1 is out of map range by uint32 casting)
         def idx_to_pos(idx):

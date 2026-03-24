@@ -1,0 +1,16 @@
+name: fcp_general_cramped_9
+pod:
+  template_id: 46tnyiwpcm
+  gpu: NVIDIA GeForce RTX 5090
+  gpu_count: 1
+  spot: false
+  network_volume_id: c4fddrd4z9
+options:
+  timeout: false
+  time_limit: 21600
+  terminate: true
+runtime:
+  cmds:
+  - cd /workerspace/crossenv_ued
+  - pip install -e .
+  - bash baselines/CEC/shell/bash_fcp_args.sh cramped_room_9

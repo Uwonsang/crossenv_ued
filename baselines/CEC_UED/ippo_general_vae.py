@@ -311,6 +311,7 @@ def make_train(config, update_step=0):
         return config["LR"] * frac
 
     def train(rng, model_params=None, update_step=0):
+        save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # Initialize z generator
         rng, _rng = jax.random.split(rng)
         z_gen = AdversarialZ(config, linear_schedule, _rng)
@@ -778,15 +779,14 @@ def make_train(config, update_step=0):
                     frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
                         for step in range(config["NUM_STEPS"])]
                     
-                    file_path = os.path.join(file_path, str(step))
                     os.makedirs(file_path, exist_ok=True)
-                    for i, frame in enumerate(frames):
-                        imageio.imwrite(os.path.join(file_path, f"layout_{i:03d}.png"), frame)
+                    filename = f"step_{step:03}_animation.gif"
+                    save_path = os.path.join(file_path, filename)
+                    imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
             
                 if config["save_frames"]:
-                    jax.debug.print("Saving frames")
-                    save_frames(metric["train_filtered_state"], step, "/app/ckpts/ippo/overcooked_vae/train_images")
-                    save_frames(metric["test_filtered_state"], step, "/app/ckpts/ippo/overcooked_vae/test_images")
+                    save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
+                    save_frames(metric["test_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/test_images")
 
             metric["adversary"] = {**train_info, **z_sample_info}
             metric["returns"] = returns

@@ -29,6 +29,10 @@ import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
+from flax import struct
+import chex
+import imageio
 
 
 def initialize_environment(config):
@@ -251,6 +255,12 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
 
+@struct.dataclass
+class FilteredState:
+    agent_dir_idx: chex.Array
+    agent_inv: chex.Array
+    maze_map: chex.Array
+
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -265,6 +275,8 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
+    agent_view_size = env.agent_view_size
+    viz = OvercookedVisualizer()
     
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -299,6 +311,7 @@ def make_train(config, update_step=0):
         return config["LR"] * frac
 
     def train(rng, model_params=None, update_step=0):
+        save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -379,6 +392,11 @@ def make_train(config, update_step=0):
                 # remove shaped rewards
                 del info['shaped_reward']
 
+                filtered_state = {
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
+                    "agent_inv": env_state.env_state.agent_inv[0],
+                    "maze_map": env_state.env_state.maze_map[0]}
+
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
@@ -393,12 +411,19 @@ def make_train(config, update_step=0):
                     agent_positions
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
-                return runner_state, transition
+                return runner_state, (
+                    transition,
+                    FilteredState(
+                        filtered_state["agent_dir_idx"],
+                        filtered_state["agent_inv"],
+                        filtered_state["maze_map"],
+                    ),
+                )
 
             initial_hstate = runner_state[-2]
             (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
-            runner_state, traj_batch = jax.lax.scan(
+            runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
@@ -601,9 +626,29 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
+                step = int(metric["update_steps"])
+
+                def save_frames(filtered_state, step, file_path):
+                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
+                        for step in range(config["NUM_STEPS"])]
+                    
+                    os.makedirs(file_path, exist_ok=True)
+                    filename = f"step_{step:03}_animation.gif"
+                    save_path = os.path.join(file_path, filename)
+                    imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
+            
+                if config["save_frames"]:
+                    save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
+                
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            jax.experimental.io_callback(callback, None, metric)
+            
+            callback_metric = {
+                **metric,
+                "train_filtered_state": train_filtered_state,
+            }
+            
+            jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
@@ -712,6 +757,9 @@ def main(config):
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
+    runner_state = out['runner_state']
+    train_state = runner_state[0]
+    model_state = train_state[0]
 
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 

@@ -82,10 +82,23 @@ class LogWrapper(JaxMARLWrapper):
         state: LogEnvState,
         action: Union[int, float],
     ) -> Tuple[chex.Array, LogEnvState, float, bool, dict]:
-        obs, env_state, reward, done, info = self._env.step(
+        key, key_reset = jax.random.split(key)
+        obs_st, env_state_st, reward, done, info = self._env.step_env(
             key, state.env_state, action
         )
         ep_done = done["__all__"]
+        
+        obs_re, reset_state = self.reset(key_reset)
+        env_state = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            reset_state.env_state,
+            env_state_st,
+        )
+        obs = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            obs_re,
+            obs_st,
+        )
         new_episode_return = state.episode_returns + self._batchify_floats(reward)
         new_episode_length = state.episode_lengths + 1
         state = LogEnvState(

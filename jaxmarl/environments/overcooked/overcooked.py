@@ -270,7 +270,7 @@ class Overcooked(MultiAgentEnv):
 
         obs, state = jax.lax.cond(self.random_reset, random_reset_fn, jitted_reset, key)
         key = jax.random.split(key)[0]
-        (obs, state) = jax.lax.cond(jnp.logical_and(check_match(state), self.check_held_out), random_og_5, lambda k: (obs, state), key)
+        (obs, state) = jax.lax.cond(jnp.logical_and(check_match(state), self.check_held_out), random_reset_fn, lambda k: (obs, state),key)
         
         return lax.stop_gradient(obs), lax.stop_gradient(state)
     

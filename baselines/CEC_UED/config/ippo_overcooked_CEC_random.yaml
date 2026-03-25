@@ -30,8 +30,8 @@
   "incentivize_strat": 2 # choose [0, 1, 2, 3] for top, bottom, none, or multiple
   # overcooked specific kwargs
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
-  "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
-  "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
+  "layout": "coord_ring_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
+  "random_reset_fn": "reset_coord_ring"  # reset_all or reset_counter_circuit, reset_coord_ring, reset_forced_coord, reset_cramped_room, reset_asymm_advantages
 "TRAINING": True
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
@@ -54,7 +54,7 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
+"PROJECT": "crossenv_ued_vae_ippo"
 "WANDB_MODE" : "disabled"
-"model_name": "IPPO_CEC_VAE"
-"save_frames": True
+"model_name": "IPPO_random_counter_circuit"
+"save_frames": False

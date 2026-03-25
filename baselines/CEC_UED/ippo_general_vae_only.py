@@ -29,7 +29,7 @@ from jax_tqdm import scan_tqdm
 import time
 import yaml
 from baselines.CEC_UED.VAE.utils import load_checkpoint
-from baselines.CEC_UED.regret_z_generator import AdversarialZ
+from baselines.CEC_UED.regret_z_generator import NormalGaussianZ
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
@@ -313,8 +313,7 @@ def make_train(config, update_step=0):
     def train(rng, model_params=None, update_step=0):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # Initialize z generator
-        rng, _rng = jax.random.split(rng)
-        z_gen = AdversarialZ(config, linear_schedule, _rng)
+        z_gen = NormalGaussianZ(config)
 
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -349,34 +348,30 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )    
-        
-        # adversarial z generator state
-        adversary_state = z_gen.init_state
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
 
-        def _reset_all_envs(rng_key, adversary_state):
+        def _reset_all_envs(rng_key):
             """Sample a separate z for each env and reset each env with its own z."""
             key_z, key_env = jax.random.split(rng_key)
             keys_z = jax.random.split(key_z, config["NUM_ENVS"])
 
             def _sample_z(k):
-                return z_gen.get_z(adversary_state, k)
+                return z_gen.get_z(k)
 
-            z_new, z_old = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z) # z_new, z_old (batch_size, z_dim)       
+            noraml_z = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z) # z_new, z_old (batch_size, z_dim)       
             keys_env = jax.random.split(key_env, config["NUM_ENVS"])
 
             def _reset_env(k, z):
                 obsv, env_state = env.reset(k, params={"z": z})
                 return obsv, env_state
 
-            obsv, env_state = jax.vmap(_reset_env, in_axes=(0, 0), out_axes=0)(keys_env, z_new)
+            obsv, env_state = jax.vmap(_reset_env, in_axes=(0, 0), out_axes=0)(keys_env, noraml_z)
 
-            return obsv, env_state, adversary_state, z_new, z_old
+            return obsv, env_state
 
-        obsv, env_state, adversary_state, z_new, z_old = \
-            _reset_all_envs(_rng, adversary_state)
+        obsv, env_state = _reset_all_envs(_rng)
         
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
@@ -387,8 +382,7 @@ def make_train(config, update_step=0):
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                z_new, z_old, update_step) = runner_state
+                (train_state, env_state, last_obs, last_done, hstate, rng, update_step) = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -431,25 +425,25 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_reset = jax.random.split(_rng, config["NUM_ENVS"])
                 #TODO : check the layout of reset, is it reset with after done?
-                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, z_new_i, z_old_i, adversary_state):
+                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i):
                     """Reset a single env if its episode is done, otherwise keep as is."""
                     def do_reset(_):
                         key_z, key_env = jax.random.split(rng_i)
-                        z_new_i_new, z_old_i_new = z_gen.get_z(adversary_state, key_z)
+                        z_normal_i = z_gen.get_z(key_z)
 
                         obsv_new_i, env_state_new_i = env.reset(
-                            key_env, params={"z": z_new_i_new}
+                            key_env, params={"z": z_normal_i}
                         )
-                        return (obsv_new_i, env_state_new_i, z_new_i_new, z_old_i_new)
+                        return (obsv_new_i, env_state_new_i)
 
                     def keep(_):
-                        return (obsv_i, env_state_i, z_new_i, z_old_i)
+                        return (obsv_i, env_state_i)
 
                     return jax.lax.cond(done_i, do_reset, keep, operand=None)
 
-                obsv, env_state, z_new, z_old = jax.vmap(
-                    _reset_if_done, in_axes=(0, 0, 0, 0, 0, 0, None), out_axes=(0, 0, 0, 0)
-                )(done_all, rng_reset, obsv, env_state, z_new, z_old, adversary_state)
+                obsv, env_state = jax.vmap(
+                    _reset_if_done, in_axes=(0, 0, 0, 0), out_axes=(0, 0)
+                )(done_all, rng_reset, obsv, env_state)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -464,28 +458,24 @@ def make_train(config, update_step=0):
                     info,
                     agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state,
-                                z_new, z_old, update_step)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
 
                 return runner_state, (transition, FilteredState(**filtered_state))
 
-            (train_state, env_state, obsv, done_batch, hstate, rng, adversary_state, 
-            z_new, z_old) = runner_state
+            (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
             initial_hstate = hstate
             eval_start_state = (env_state, obsv, done_batch, hstate, rng, update_steps)
 
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, 
-            adversary_state, z_new, z_old, update_steps)
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-             z_new, z_old, update_steps) = runner_state
+            (train_state, env_state, last_obs, last_done, hstate, rng, 
+             update_steps) = runner_state
 
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                            z_new, z_old)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
@@ -672,98 +662,6 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            # TODO check the layout of evaluation, make layout with same Z-sampling
-            def _env_step_eval(runner_state_eval, unused):
-                train_state, env_state_eval, obsv_eval, done_eval, hstate_eval, rng_eval, update_step = runner_state_eval
-
-                rng_eval, _rng = jax.random.split(rng_eval)
-                obs_batch = batchify(obsv_eval, env.agents, config["NUM_ACTORS"])
-                agent_positions = {"agent_0": env_state_eval.env_state.agent_pos, "agent_1": env_state_eval.env_state.agent_pos}
-                agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
-                ac_in = (
-                    obs_batch[np.newaxis, :],
-                    done_eval[np.newaxis, :],
-                    agent_positions[np.newaxis, :],
-                )
-                hstate_eval, pi_eval, _ = network.apply(train_state.params, hstate_eval, ac_in)
-                action_eval = pi_eval.sample(seed=_rng)
-
-                env_act_eval = unbatchify(
-                    action_eval, env.agents, config["NUM_ENVS"], env.num_agents
-                )
-                env_act_eval = {k: v.squeeze() for k, v in env_act_eval.items()}
-
-                rng_eval, _rng = jax.random.split(rng_eval)
-                rng_step = jax.random.split(_rng, config["NUM_ENVS"])
-                obsv_next, env_state_next, reward_eval, done_next, info_eval = jax.vmap(
-                    env.step_env, in_axes=(0, 0, 0)
-                )(rng_step, env_state_eval, env_act_eval)
-                shaped_reward_eval = info_eval['shaped_reward']
-                reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward_eval = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward_eval, shaped_reward_eval)
-
-                done_batch_next = batchify(done_next, env.agents, config["NUM_ACTORS"]).squeeze()
-
-                runner_state_eval_next = (
-                    train_state,
-                    env_state_next,
-                    obsv_next,
-                    done_batch_next,
-                    hstate_eval,
-                    rng_eval,
-                    update_step,
-                )
-
-                filtered_state = {
-                    "agent_dir_idx": env_state_next.env_state.agent_dir_idx[0],
-                    "agent_inv": env_state_next.env_state.agent_inv[0],
-                    "maze_map": env_state_next.env_state.maze_map[0]}
-
-                reward_eval = batchify(reward_eval, env.agents, config["NUM_ACTORS"]).squeeze()
-                return runner_state_eval_next, (reward_eval, FilteredState(**filtered_state))
-
-            env_state0, obsv0, done_batch0, hstate0, rng0, update_step = eval_start_state
-            runner_state_eval0 = (train_state, env_state0, obsv0, done_batch0, hstate0, rng0, update_step)    
-            runner_state_eval, (reward_eval_seq, test_filtered_state) = jax.lax.scan(
-                _env_step_eval, runner_state_eval0, None, config["NUM_STEPS"])
-            
-            current_reward = jnp.transpose(traj_batch.reward, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
-            trained_reward = jnp.transpose(reward_eval_seq, (1, 0)).reshape((config["NUM_ENVS"], env.num_agents, config["NUM_STEPS"]))
-
-            # REGRET uses "return" = sum_t gamma^t * r_t (horizon-T return).
-            gamma_pows = jnp.asarray(config["GAMMA"]) ** jnp.arange(config["NUM_STEPS"])
-            current_return = (current_reward[:, 0, :] * gamma_pows).sum(axis=1)  # choose agent 0
-            trained_return = (trained_reward[:, 0, :] * gamma_pows).sum(axis=1)  # choose agent 0
-
-            metric["current_return_per_env"] = current_return
-            metric["trained_return_per_env"] = trained_return
-
-
-            rng, _rng = jax.random.split(rng)
-            selected_z_idx = env_state.env_state.selected_z_idx
-            safe_idx = jnp.where(selected_z_idx >= 0, selected_z_idx, 0).astype(jnp.int32)
-            batch_idx = jnp.arange(safe_idx.shape[0])
-            z_old_selected   = z_old[batch_idx, safe_idx]    # (512, 16)
-            z_new_selected   = z_new[batch_idx, safe_idx]    # (512, 16)
-            
-            z_dim = config["ENV_KWARGS"]['vae_config']['latent_dim']
-            z_prior = distrax.Normal(loc=jnp.zeros((z_dim,)), scale=jnp.ones((z_dim,)))
-
-            adversary_state, train_info = z_gen.train_step(
-                adversary_state,
-                _rng,
-                current_return,
-                trained_return,
-                z_old_selected,
-                z_new_selected,
-                z_prior,
-            )
-
-            z_sample_info = {
-                'z_sample/mean': z_new_selected.mean(),
-                'z_sample/std': z_new_selected.std(),
-                'log_prob': z_prior.log_prob(z_new_selected).mean()}
-
             def callback(metric):
                 wandb.log(
                     {
@@ -772,12 +670,8 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
-                z_gen.log_train_info(metric["adversary"])
                 
                 step = int(metric["update_steps"])
-                save_interval = max(1, config["NUM_UPDATES"] // 19)
-                if (step % save_interval == 0 or step == config["NUM_UPDATES"] - 1):
-                    z_gen.save(metric["adversary_params"], step)
 
                 def save_frames(filtered_state, step, file_path):
                     frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
@@ -792,21 +686,17 @@ def make_train(config, update_step=0):
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
                     save_frames(metric["test_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/test_images")
 
-            metric["adversary"] = {**train_info, **z_sample_info}
             metric["returns"] = returns
             metric["update_steps"] = update_steps
 
             callback_metric = {
                 **metric,
-                "adversary_params": adversary_state.params,
                 "train_filtered_state": train_filtered_state,
-                "test_filtered_state": test_filtered_state,
             }
 
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, adversary_state,
-                            z_new, z_old)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -817,8 +707,6 @@ def make_train(config, update_step=0):
             jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
             init_hstate,
             _rng,
-            adversary_state,
-            z_new, z_old
         )
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
@@ -933,14 +821,13 @@ def main(config):
     train_state = runner_state[0]
     model_state = train_state[0]
     rng = train_state[5]
-    adversary_state = train_state[6]
 
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 
     # save model
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates, 'adversary_params': adversary_state.params}
+        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")

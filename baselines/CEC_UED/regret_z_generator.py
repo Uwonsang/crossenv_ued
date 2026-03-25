@@ -11,9 +11,10 @@ import pickle
 class NormalGaussianZ:
     def __init__(self, config):
         self.z_dim = config["z_dim"]
+        self.z_list_size = config["z_list_size"]
 
-    def get_z(self, z_gen_state, key):
-        return jax.random.normal(key, (1, self.z_dim))
+    def get_z(self, key):
+        return jax.random.normal(key, (self.z_list_size, self.z_dim))
 
 class AdversaryNet(nn.Module):
     z_dim: int

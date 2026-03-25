@@ -27,7 +27,7 @@ import functools
 import pdb
 from jax_tqdm import scan_tqdm
 import yaml
-
+from pathlib import Path
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -707,7 +707,8 @@ def main(config):
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
         seed_list = range(6)
-        custom_path = os.path.join(config['FCP_filepath'], config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
+        CKPT_ROOT = Path(__file__).resolve().parents[2] / "our_ckpts"
+        custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
         for ckpt_id, update_step in zip(ckpt_id_list, update_step_list):
             for ckpt_seed in seed_list:
                 print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl")

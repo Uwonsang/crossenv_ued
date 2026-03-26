@@ -254,19 +254,32 @@ class Overcooked_VAE_CROP(MultiAgentEnv):
 
         return lax.stop_gradient(obs), lax.stop_gradient(state)
 
-    def _reset_vae_candidates(self, rng_key, z):
-
-        sk1, sk2 = jax.random.split(rng_key)
-        keys = jax.random.split(sk1, z.shape[0])
+    def _reset_vae_candidates(self, rng, z):
+        rng, _rng = jax.random.split(rng)
+        keys = jax.random.split(_rng, z.shape[0])
         obsv, statev = jax.vmap(self.custom_reset_vae, in_axes=(0, 0))(keys, z)
 
         padding = (statev.maze_map.shape[1] - self.height) // 2
         maze_maps = statev.maze_map[:, padding:-padding, padding:-padding, 0]
 
-        valid_mask = jax.vmap(lambda m: validate_layout(maze_map=m, object_to_index=OBJECT_TO_INDEX).valid)(maze_maps)
+        results = jax.vmap(lambda m: validate_layout(maze_map=m, object_to_index=OBJECT_TO_INDEX))(maze_maps)
 
-        scores = jnp.where(valid_mask, jax.random.uniform(sk2, valid_mask.shape), -1.0)
-        idx = jnp.argmax(scores)
+        tier4 = results.valid_all
+        tier3 = results.valid_123 | results.valid_124 | results.valid_134 | results.valid_234
+        tier2 = (results.valid_12 | results.valid_13 | results.valid_14 |
+                results.valid_23 | results.valid_24 | results.valid_34)
+        tier1 = results.valid_1 | results.valid_2 | results.valid_3 | results.valid_4
+
+        # Priority: tier4 > tier3 > tier2 > tier1 > fallback
+        bucket_mask = jnp.ones_like(tier4, dtype=bool)
+        bucket_mask = jnp.where(jnp.any(tier1), tier1, bucket_mask)
+        bucket_mask = jnp.where(jnp.any(tier2), tier2, bucket_mask)
+        bucket_mask = jnp.where(jnp.any(tier3), tier3, bucket_mask)
+        bucket_mask = jnp.where(jnp.any(tier4), tier4, bucket_mask)
+
+        rng, _rng = jax.random.split(rng)
+        tie = jax.random.uniform(_rng, (z.shape[0],))
+        idx = jnp.argmax(jnp.where(bucket_mask, tie, -jnp.inf))
 
         obs = jax.tree_map(lambda x: x[idx], obsv)
         state = jax.tree_map(lambda x: x[idx], statev)

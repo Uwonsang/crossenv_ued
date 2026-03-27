@@ -684,7 +684,6 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                    save_frames(metric["test_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/test_images")
 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -757,7 +756,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_VAE_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_VAE_only_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

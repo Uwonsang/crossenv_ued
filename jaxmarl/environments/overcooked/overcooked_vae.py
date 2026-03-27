@@ -262,7 +262,7 @@ class Overcooked_VAE(MultiAgentEnv):
         padding = (statev.maze_map.shape[1] - self.height) // 2
         maze_maps = statev.maze_map[:, padding:-padding, padding:-padding, 0]
 
-        results = jax.vmap(lambda m: validate_layout(maze_map=m, object_to_index=OBJECT_TO_INDEX))(maze_maps)
+        results = jax.vmap(lambda m: validate_layout(maze_map=m, object_to_index=OBJECT_TO_INDEX, max_count=2))(maze_maps)
 
         tier4 = results.valid_all
         tier3 = results.valid_123 | results.valid_124 | results.valid_134 | results.valid_234

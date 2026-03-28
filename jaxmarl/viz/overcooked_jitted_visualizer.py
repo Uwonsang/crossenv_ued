@@ -364,7 +364,7 @@ def render_grid(grid, highlight_mask, agent_dir_idx, agent_inv, tile_size=TILE_P
 
 @jax.jit
 def render_state(state, highlight=False, tile_size=TILE_PIXELS, agent_view_size=5):
-    padding = agent_view_size - 1
+    padding = agent_view_size - 2
     grid = state.maze_map[padding:-padding, padding:-padding, :]
     
     highlight_mask = jnp.zeros(grid.shape[:2], dtype=bool)

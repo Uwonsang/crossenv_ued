@@ -151,6 +151,10 @@ def render_tile(obj, highlight, agent_dir_idx, agent_inv, tile_size=TILE_PIXELS)
             fn = point_in_rect(0, 1, 0, 1)
             img = fill_coords(img, fn, COLORS["black"])
             return img
+        def render_frame(img):
+            fn = point_in_rect(0, 1, 0, 1)
+            img = fill_coords(img, fn, COLORS["light_gray"])
+            return img
         def render_onion_pile(img):
             fn = point_in_rect(0, 1, 0, 1)
             img = fill_coords(img, fn, COLORS["grey"])
@@ -222,6 +226,12 @@ def render_tile(obj, highlight, agent_dir_idx, agent_inv, tile_size=TILE_PIXELS)
         img = lax.cond(
             obj_type == OBJECT_TO_INDEX['empty'],
             render_empty,
+            do_nothing,
+            img
+        )
+        img = lax.cond(
+            obj_type == OBJECT_TO_INDEX['frame'],
+            render_frame,
             do_nothing,
             img
         )
@@ -354,7 +364,7 @@ def render_grid(grid, highlight_mask, agent_dir_idx, agent_inv, tile_size=TILE_P
 
 @jax.jit
 def render_state(state, highlight=False, tile_size=TILE_PIXELS, agent_view_size=5):
-    padding = agent_view_size - 2
+    padding = agent_view_size - 1
     grid = state.maze_map[padding:-padding, padding:-padding, :]
     
     highlight_mask = jnp.zeros(grid.shape[:2], dtype=bool)

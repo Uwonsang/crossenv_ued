@@ -386,85 +386,41 @@ def main(config):
             traj = jax.tree_map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
             env_states = [jax.tree_map(lambda x: x[traj_num], init_env_states)]
             traj_rewards = [0]
-            action_probs_0, action_probs_1 = [], []
-            action_0, action_1 = [], []
             for timepoint in tqdm(range(config['NUM_STEPS']), desc="num_steps"):
                 timestep = jax.tree_map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
-
-                action_dict = timestep[3]
-                action_0.append(action_dict[env.agents[0]])
-                action_1.append(action_dict[env.agents[1]])
-
-                action_prob_dict = timestep[-1]
-                action_probs_0.append(action_prob_dict[env.agents[0]])
-                action_probs_1.append(action_prob_dict[env.agents[1]])
 
                 env_state = timestep[0]
                 traj_rewards.append(timestep[4]['agent_0'])
                 env_states.append(env_state)
 
-            # add arbitrary final actions and action probs
-            action_0.append(4)
-            action_1.append(4)
-            action_probs_0.append(jnp.ones(env.action_space("agent_0").n) / env.action_space("agent_0").n)
-            action_probs_1.append(jnp.ones(env.action_space("agent_1").n) / env.action_space("agent_1").n)
             env_images = [render_fn(s) for s in env_states]
             traj_rewards = jnp.cumsum(jnp.array(traj_rewards))
 
             frames = []
             for t in tqdm(range(len(env_images)), desc="render_images"):
-                fig = plt.figure(figsize=(16, 8))
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
 
-                # Environment image
-                ax1 = plt.subplot(221)
-                ax1.imshow(env_images[t])
-                ax1.axis('off')
-                ax1.set_title('Environment')
+                ax1.imshow(env_images[t], interpolation="nearest", aspect="equal")
+                ax1.axis("off")
+                ax1.set_title("Environment")
 
-                # Reward plot
-                ax2 = plt.subplot(222)
-                ax2.plot(range(len(traj_rewards)), traj_rewards, 'b-')
-                ax2.scatter(t, traj_rewards[t], color='red', s=100)
-                ax2.set_xlabel('Timestep')
-                ax2.set_ylabel('Cumulative Reward')
-                ax2.set_title('Reward Over Time')
+                ax2.plot(range(len(traj_rewards)), traj_rewards, "b-")
+                ax2.scatter(t, traj_rewards[t], color="red", s=100)
+                ax2.set_xlabel("Timestep")
+                ax2.set_ylabel("Cumulative Reward")
+                ax2.set_title("Reward Over Time")
 
-                # Agent 0 action probabilities
-                ax3 = plt.subplot(223)
-                probs = action_probs_0[t]
-                bars = ax3.bar(range(len(probs)), probs)
-                chosen_action = action_0[t]
-                bars[chosen_action].set_color('green')
-                ax3.set_xlabel('Action')
-                ax3.set_ylabel('Probability')
-                ax3.set_title('Agent 0 Action Probabilities')
-
-                # Agent 1 action probabilities  
-                ax4 = plt.subplot(224)
-                probs = action_probs_1[t]
-                bars = ax4.bar(range(len(probs)), probs)
-                chosen_action = action_1[t]
-                bars[chosen_action].set_color('green')
-                ax4.set_xlabel('Action')
-                ax4.set_ylabel('Probability')
-                ax4.set_title('Agent 1 Action Probabilities')
-
-                plt.tight_layout()
-
-                # Convert figure to image array
                 fig.canvas.draw()
                 image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
                 image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
                 frames.append(image)
-                plt.close()
+                plt.close(fig)
 
-                # Save as gif with explicit loop parameter and duration
-                imageio.mimsave(
-                f"{filepath}/{fcp_str}sp_eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_traj_{traj_num}.gif",
-                frames,
-                fps=10,
-                loop=0)
-            print(f"Saved gif to {filepath}/{fcp_str}sp_eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_traj_{traj_num}.gif")
+            gif_path = (
+                f"{filepath}/{fcp_str}sp_eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_traj_{traj_num}.gif"
+            )
+            imageio.mimsave(gif_path, frames, fps=10, loop=0)
+            print(f"Saved gif to {gif_path}")
 
 if __name__ == "__main__":
     main()

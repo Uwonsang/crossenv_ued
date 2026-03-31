@@ -812,6 +812,134 @@ def make_coord_ring_9x9(rng, ik=False, num_default_walls=65):
     return jax.lax.cond(ik, ik_coord_ring, default_coord_ring, rng, coord_ring_array)
 
 @jax.jit
+def make_coord_ring_custom_ljy_9x9(rng, ik=False, num_default_walls=65):
+    coord_ring_array = jnp.array([
+        [4,1,1,6,1],
+        [1,0,2,0,6],
+        [4,0,1,0,1],
+        [5,0,2,0,1],
+        [1,5,3,1,3],
+    ])
+
+    def default_coord_ring(rng, layout):
+        return make_9x9_layout(rng, layout, rotate=False, num_base_walls=num_default_walls)
+
+    def ik_coord_ring(rng, layout):
+        height, width = layout.shape
+
+        NUM_OBJECTS = 2
+
+        # -----------------------------
+        # 여기만 바꾸면 개수 바뀌도록
+        # -----------------------------
+        NUM_PLATE = NUM_OBJECTS
+        NUM_ONION = NUM_OBJECTS
+        NUM_POT   = NUM_OBJECTS
+        NUM_GOAL  = NUM_OBJECTS
+        NUM_AGENT = NUM_OBJECTS
+
+        total_item_count = NUM_PLATE + NUM_ONION + NUM_POT + NUM_GOAL
+
+        all_walls = jnp.array([0,1,2,3,4,5,9,10,12,14,15,19,20,21,22,23,24])
+        need_one  = jnp.array([1,2,3,5,9,10,14,15,19,21,22,23,12])
+
+        # 각 타입별 최소 1개씩은 need_one에서 뽑는다고 가정
+        base_need_count = 4  # plate/onion/pot/goal 각 1개
+        additional_needed = total_item_count - base_need_count
+
+        # need_one에서 4개 뽑기
+        need_one_permutation = jax.random.permutation(rng, need_one)[:base_need_count]
+        rng, rng_sub = jax.random.split(rng)
+
+        sorted_all_walls = jnp.sort(all_walls)
+
+        # need_one에서 뽑은 위치 제외 마스크
+        wall_mask = jnp.ones(len(sorted_all_walls))
+        exclude_idx = jnp.searchsorted(sorted_all_walls, need_one_permutation)
+        wall_mask = wall_mask.at[exclude_idx].set(0)
+
+        wall_probs = wall_mask.astype(jnp.float32) / jnp.sum(wall_mask)
+
+        # 나머지 아이템 위치 추가 샘플링
+        additional = jax.random.choice(
+            rng_sub,
+            sorted_all_walls,
+            shape=(additional_needed,),
+            replace=False,
+            p=wall_probs
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        # agent 위치 뽑기
+        valid_agent_positions = jnp.array([6,7,8,11,13,16,17,18])
+        agent_flat_idx = jax.random.choice(
+            rng_sub,
+            valid_agent_positions,
+            shape=(NUM_AGENT,),
+            replace=False
+        )
+
+        # 전체 아이템 위치
+        item_indices = jnp.concatenate([need_one_permutation, additional])
+
+        # 1차원 -> 2차원 좌표
+        x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
+        stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
+
+        agent_x, agent_y = jnp.unravel_index(agent_flat_idx, (height, width))
+        agent_coords = jnp.stack([agent_x, agent_y], axis=1)
+
+        # -----------------------------------
+        # 앞에서부터 순서대로 타입별로 잘라서 사용
+        # -----------------------------------
+        start = 0
+
+        plate_idx = stacked_coords[start:start + NUM_PLATE]
+        start += NUM_PLATE
+
+        onion_idx = stacked_coords[start:start + NUM_ONION]
+        start += NUM_ONION
+
+        pot_idx = stacked_coords[start:start + NUM_POT]
+        start += NUM_POT
+
+        goal_idx = stacked_coords[start:start + NUM_GOAL]
+        start += NUM_GOAL
+
+        def update_map(layout, item_coords, value):
+            def scan_body(carry, idx):
+                layout, item_coords, value = carry
+                layout = layout.at[item_coords[idx][0], item_coords[idx][1]].set(value)
+                return (layout, item_coords, value), idx
+
+            carry, _ = jax.lax.scan(
+                scan_body,
+                (layout, item_coords, value),
+                jnp.arange(item_coords.shape[0])
+            )
+            return carry[0]
+
+        modified_layout = jnp.zeros_like(layout)
+
+        # ring 기본 벽 만들기
+        wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
+        wall_coords = jnp.stack([wall_coords_x, wall_coords_y], axis=1)
+        modified_layout = update_map(modified_layout, wall_coords, 1)
+
+        # 아이템/에이전트 배치
+        modified_layout = update_map(modified_layout, plate_idx, 4)
+        modified_layout = update_map(modified_layout, onion_idx, 5)
+        modified_layout = update_map(modified_layout, pot_idx, 6)
+        modified_layout = update_map(modified_layout, goal_idx, 3)
+        modified_layout = update_map(modified_layout, agent_coords, 2)
+
+        rng, rng_sub = jax.random.split(rng)
+        return make_9x9_layout(rng, modified_layout, rotate=True, num_base_walls=num_default_walls)
+
+    return jax.lax.cond(ik, ik_coord_ring, default_coord_ring, rng, coord_ring_array)
+
+
+@jax.jit
 def make_forced_coord_9x9(rng, ik=False, num_default_walls=67):
     forced_coord_array = jnp.array([
         [1,1,1,6,1],
@@ -972,7 +1100,8 @@ overcooked_layouts = {
     'harder_counter_circuit': layout_grid_to_dict(harder_counter_circuit_padded),
     'cramped_room_9': make_cramped_room_9x9(jax.random.PRNGKey(0), ik=False),
     'asymm_advantages_9': make_asymm_advantages_9x9(jax.random.PRNGKey(0), ik=False),
-    'coord_ring_9': make_coord_ring_9x9(jax.random.PRNGKey(0), ik=False),
+    # object 개수 고정하고 실험 시, 아래 오른 쪽 주석 풀고 사용
+    'coord_ring_9': make_coord_ring_9x9(jax.random.PRNGKey(0), ik=False), #'coord_ring_9': make_coord_ring_custom_ljy_9x9(jax.random.PRNGKey(0), ik=False),  
     'counter_circuit_9': make_counter_circuit_9x9(jax.random.PRNGKey(0), ik=False),
     'forced_coord_9': make_forced_coord_9x9(jax.random.PRNGKey(0), ik=False),
 }

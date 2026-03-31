@@ -20,7 +20,7 @@ from jaxmarl.environments.overcooked.common import (
     DIR_TO_VEC,
     make_overcooked_map)
 from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
-from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
+from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9, make_coord_ring_custom_ljy_9x9
 from jaxmarl.environments.overcooked.layouts import single_cramped_room
 
 
@@ -237,7 +237,8 @@ class Overcooked(MultiAgentEnv):
             return reset_fn
 
         random_counter_circuit = _single_layout_reset(make_counter_circuit_9x9)
-        random_coord_ring = _single_layout_reset(make_coord_ring_9x9)
+        # object 개수 고정하고 실험 시, 아래 오른 쪽 주석 풀고 사용
+        random_coord_ring = _single_layout_reset(make_coord_ring_9x9) #_single_layout_reset(make_coord_ring_custom_ljy_9x9)
         random_forced_coord = _single_layout_reset(make_forced_coord_9x9)
         random_cramped_room = _single_layout_reset(make_cramped_room_9x9)
         random_asymm_advantages = _single_layout_reset(make_asymm_advantages_9x9)

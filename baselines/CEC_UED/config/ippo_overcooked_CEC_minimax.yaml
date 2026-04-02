@@ -57,3 +57,33 @@
 "PROJECT": "crossenv_ued_minimax_ippo"
 "WANDB_MODE" : "disabled"
 "model_name": "IPPO_CEC_minimax"
+# Ued params 
+"train_runner": "plr"  # dr, plr
+"n_devices": 1
+"is_multi_agent": True
+"n_students": 1
+"n_eval": 1
+"track_env_metrics": True
+"n_unroll_rollout": 10
+"render": False
+"ued_score": "max_mc"
+"n_unroll_update" : 5
+"plr_replay_prob": 0.5
+"plr_buffer_size": 4000
+"plr_staleness_coef": 0.3
+"plr_temp": 0.1
+"plr_use_score_ranks": True
+"plr_min_fill_ratio": 0.5
+"plr_use_robust_plr": True
+"plr_use_parallel_eval": False
+"plr_force_unique": True
+"verbose": False
+"log_dir": "~/logs/minimax"
+"log_interval" : 10
+"from_last_checkpoint": False
+"checkpoint_interval": 1000
+"archive_interval" : 0
+"archive_init_checkpoint" : False
+"test_interval" : 100
+"test_n_episodes" : 10
+"test_env_names" : "Overcooked-cramped_room_9, Overcooked-asymm_advantages_9, Overcooked-coord_ring_9, Overcooked-counter_circuit_9, Overcooked-forced_coord_9"

@@ -24,31 +24,26 @@ def main(config):
         config = OmegaConf.to_container(config)
 
         # === Setup the main runner ===
-        _args = copy.deepcopy(args)  # Mutable record of args
         from minimax.runners_ma import ExperimentRunner
 
 
         xp_runner = ExperimentRunner(
-            train_runner=_args.train_runner,
-            env_name=_args.env_name,
-            agent_rl_algo=_args.agent_rl_algo,
-            student_model_name=_args.student_model_name,
-            student_critic_model_name=_args.student_critic_model_name,
-            student_agent_kind=_args.student_agent_kind,
-            teacher_model_name=_args.teacher_model_name,
-            train_runner_kwargs=_args.train_runner_args,
-            env_kwargs=_args.env_args,
-            ued_env_kwargs=_args.ued_env_args,
-            student_rl_kwargs=_args.student_rl_args,
-            teacher_rl_kwargs=_args.teacher_rl_args,
-            student_model_kwargs=_args.student_model_args,
-            teacher_model_kwargs=_args.teacher_model_args,
-            eval_kwargs=_args.eval_args,
-            eval_env_kwargs=_args.eval_env_args,
-            n_devices=_args.n_devices,
-            shaped_reward_steps=_args.n_shaped_reward_steps,
-            shaped_reward_n_updates=_args.n_shaped_reward_updates,
-            xpid=args.xpid
+            config=config,
+            train_runner=config["train_runner"],
+            env_name=config["env_name"],
+            agent_rl_algo=config["agent_rl_algo"],
+            student_agent_kind=config["student_agent_kind"],
+            train_runner_kwargs=config["train_runner_args"],
+            env_kwargs=config["env_args"],
+            ued_env_kwargs=config["ued_env_args"],
+            student_rl_kwargs=config["student_rl_args"],
+            student_model_kwargs=config["student_model_args"],
+            eval_kwargs=config["eval_args"],
+            eval_env_kwargs=config["eval_env_args"],
+            n_devices=config["n_devices"],
+            shaped_reward_steps=config["n_shaped_reward_steps"],
+            shaped_reward_n_updates=config["n_shaped_reward_updates"],
+            xpid=config["xpid"]
         )
 
         # === Configure logging ===

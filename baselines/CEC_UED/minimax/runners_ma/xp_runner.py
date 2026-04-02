@@ -7,573 +7,389 @@ LICENSE file in the root directory of this source tree.
 """
 
 from functools import partial
-from enum import Enum
+import os
+import time
 
-import einops
+import imageio
 import numpy as np
 import jax
 import jax.numpy as jnp
-
-import minimax.envs as envs
-from minimax.runners_ma.dr_runner import DRRunner
-from minimax.util import pytree as _tree_util
-from minimax.util.rl import (
-    UEDScore,
-    compute_ued_scores,
-    PopPLRManager
-)
+from jax.experimental import mesh_utils
+from jax.experimental.shard_map import shard_map
 
 
-class MutationCriterion(Enum):
-    BATCH = 0
-    EASY = 1
-    HARD = 2
+from .eval_runner import EvalRunner
+from .dr_runner import DRRunner
+from .plr_runner import PLRRunner
+from minimax.model import ActorCriticRNN, ScannedRNN
+import minimax.agents as agents
+
+import jaxmarl
+from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.environments.overcooked import overcooked_layouts
+from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
+from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
+from jax_tqdm import scan_tqdm
 
 
-class PLRRunner(DRRunner):
+def initialize_environment(config):
+    layout_name = config["ENV_KWARGS"]["layout"]
+    config['layout_name'] = layout_name
+    config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
+    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+
+    if "overcooked" in config["ENV_NAME"]:
+        def reset_env(key):
+            def reset_sub_dict(key, fn):
+                key, subkey = jax.random.split(key)
+                sampled_layout_dict = fn(subkey, ik=True)
+                temp_o, temp_s = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
+                key, subkey = jax.random.split(key)
+                return (temp_o, temp_s), key
+                
+            asymm_reset, key = reset_sub_dict(key, make_asymm_advantages_9x9)
+            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
+            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
+            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
+            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
+            layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
+            # stack all layouts
+            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            # sample an index from 0 to 4
+            index = jax.random.randint(key, (), minval=0, maxval=5)
+            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            return sampled_reset
+        @scan_tqdm(100)
+        def gen_held_out(runner_state, unused):
+            (i,) = runner_state
+            _, ho_state = reset_env(jax.random.key(i))
+            res = (ho_state.goal_pos, ho_state.wall_map, ho_state.pot_pos)
+            carry = (i+1,)
+            return carry, res
+        carry, res = jax.lax.scan(gen_held_out, (0,), jnp.arange(100), 100)
+        ho_goal, ho_wall, ho_pot = [], [], []
+        for layout_name, layout_dict in overcooked_layouts.items():  # add hand crafted ones to heldout set
+            if "9" in layout_name:
+                _, ho_state = env.custom_reset(jax.random.PRNGKey(0), random_reset=False, shuffle_inv_and_pot=False, layout=layout_dict)
+                ho_goal.append(ho_state.goal_pos)
+                ho_wall.append(ho_state.wall_map)
+                ho_pot.append(ho_state.pot_pos)
+        ho_goal = jnp.stack(ho_goal, axis=0)
+        ho_wall = jnp.stack(ho_wall, axis=0)
+        ho_pot = jnp.stack(ho_pot, axis=0)
+        ho_goal = jnp.concatenate([res[0], ho_goal], axis=0)
+        ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
+        ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
+        env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
+    elif config["ENV_NAME"] == "ToyCoop":
+        # Generate 100 held-out states for ToyCoop
+        @scan_tqdm(100)
+        def gen_held_out_toycoop(runner_state, unused):
+            (i,) = runner_state
+            key = jax.random.key(i)
+            state = env.custom_reset_fn(key, random_reset=True)
+            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
+            carry = (i+1,)
+            return carry, res
+        
+        carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
+        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
+        
+        # Set the held-out states in the environment
+        env.held_out_agent_pos = ho_agent_pos
+        env.held_out_goal_pos = ho_goal_pos
+        env.held_out_other_goal_pos = ho_other_goal_pos
+    config["obs_dim"] = env.observation_space(env.agents[0]).shape
+    return env
+
+
+class RunnerInfo:
     def __init__(
             self,
-            *,
-            replay_prob=0.5,
-            buffer_size=100,
-            staleness_coef=0.3,
-            use_score_ranks=True,
-            temp=1.0,
-            min_fill_ratio=0.5,
-            use_robust_plr=False,
-            use_parallel_eval=False,
-            ued_score='l1_value_loss',
-            force_unique=False,  # Slower if True
-            mutation_fn=None,
-            n_mutations=0,
-            mutation_criterion='batch',
-            mutation_subsample_size=1,
-            **kwargs):
-        use_mutations = mutation_fn is not None
-        if use_parallel_eval:
-            replay_prob = 1.0  # Replay every rollout cycle
-            # Force batch mutations (no UED scores)
-            mutation_criterion = 'batch'
-            self._n_parallel_batches = 3 if use_mutations else 2
-            kwargs['n_parallel'] *= self._n_parallel_batches
+            runner_cls):
+        self.runner_cls = runner_cls
 
-        super().__init__(**kwargs)
 
-        self.replay_prob = replay_prob
-        self.buffer_size = buffer_size
-        self.staleness_coef = staleness_coef
-        self.temp = temp
-        self.use_score_ranks = use_score_ranks
-        self.min_fill_ratio = min_fill_ratio
-        self.use_robust_plr = use_robust_plr
-        self.use_parallel_eval = use_parallel_eval
-        self.ued_score = UEDScore[ued_score.upper()]
+RUNNER_INFO = {
+    'dr': RunnerInfo(
+        runner_cls=DRRunner,
+    ),
+    'plr': RunnerInfo(
+        runner_cls=PLRRunner,
+    )
+}
 
-        self.use_mutations = use_mutations
-        if self.use_mutations:
-            self.mutation_fn = envs.get_mutator(
-                self.benv.env_name, mutation_fn)
+
+class ExperimentRunner:
+    def __init__(
+            self,
+            config,
+            train_runner,
+            env_name,
+            agent_rl_algo,
+            student_agent_kind="mappo",
+            train_runner_kwargs={},
+            env_kwargs={},
+            ued_env_kwargs={},
+            student_rl_kwargs={},
+            student_model_kwargs={},
+            eval_kwargs={},
+            eval_env_kwargs={},
+            n_devices=1,
+            shaped_reward_steps=0,
+            shaped_reward_n_updates=0,
+            xpid=None
+    ):
+        self.env_name = env_name
+        self.agent_rl_algo = agent_rl_algo
+        self.xpid = xpid
+        self.shaped_reward_steps = shaped_reward_steps
+        self.shaped_reward_n_updates = shaped_reward_n_updates
+
+        env = initialize_environment(config)
+        obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+        env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+
+        # ---- Make agent ----
+        network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
+        rng, _rng = jax.random.split(rng)
+        # get flattened obs dim
+        flattened_obs_dim = 1
+        for dim in env.observation_space(env.agents[0]).shape:
+            flattened_obs_dim *= dim
+        init_x = (
+            jnp.zeros(
+                (1, config["NUM_ENVS"], flattened_obs_dim)
+            ),
+            jnp.zeros((1, config["NUM_ENVS"])),
+            jnp.zeros((1, config["NUM_ENVS"], 2, 2)).astype(jnp.int32)
+        )
+        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+        network_params = network.init(_rng, init_hstate, init_x)
+
+        student_agent = agents.MAPPOAgent(
+            actor=student_actor,
+            critic=student_critic,
+            n_devices=n_devices,
+            **student_rl_kwargs
+        )
+        
+        # ---- Set up train runner ----
+        runner_cls = RUNNER_INFO[train_runner].runner_cls
+
+        # Set up learning rate annealing parameters
+        lr_init = train_runner_kwargs.lr
+        lr_final = train_runner_kwargs.lr_final
+        lr_anneal_steps = train_runner_kwargs.lr_anneal_steps
+
+        if lr_final is None:
+            train_runner_kwargs.lr_final = lr_init
+        if train_runner_kwargs.lr_final == train_runner_kwargs.lr:
+            train_runner_kwargs.lr_anneal_steps = 0
+
+        use_shaped_reward = (shaped_reward_steps is not None and shaped_reward_steps > 0) or (
+            shaped_reward_n_updates is not None and shaped_reward_n_updates > 0)
+
+        self.runner = runner_cls(
+            env_name=env_name,
+            env_kwargs=env_kwargs,
+            student_agents=[student_agent],
+            student_agent_kind=student_agent_kind,
+            n_devices=n_devices,
+            shaped_reward=use_shaped_reward,
+            **train_runner_kwargs)
+
+        # ---- Make eval runner ----
+        if eval_kwargs.get('env_names') is None:
+            self.eval_runner = None
         else:
-            self.mutation_fn = None
-        self.n_mutations = n_mutations
-        self.mutation_criterion = MutationCriterion[mutation_criterion.upper()]
-        self.mutation_subsample_size = mutation_subsample_size
+            self.eval_runner = EvalRunner(
+                pop=self.runner.student_pop,
+                env_kwargs=eval_env_kwargs,
+                **eval_kwargs)
 
-        self.force_unique = force_unique
-        if force_unique:
-            self.comparator_fn = envs.get_comparator(self.benv.env_name)
+        self._start_tick = 0
+
+        # ---- Set up device parallelism ----
+        self.n_devices = n_devices
+        if n_devices > 1:
+            dummy_runner_state = self.reset_train_runner(jax.random.PRNGKey(0))
+            self._shmap_run = self._make_shmap_run(dummy_runner_state)
         else:
-            self.comparator_fn = None
+            self._shmap_run = None
 
-        if mutation_fn is not None and mutation_criterion != 'batch':
-            assert self.n_parallel % self.mutation_subsample_size == 0, \
-                'Number of parallel envs must be divisible by mutation subsample size.'
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, runner_state, evaluate=False):
+        if self.n_devices > 1:
+            run_fn = self._shmap_run
+        else:
+            run_fn = self.runner.run
 
-    def reset(self, rng):
-        runner_state = list(super().reset(rng))
+        stats, *runner_state = run_fn(*runner_state)
+
         rng = runner_state[0]
-        runner_state[0], subrng = jax.random.split(rng)
-        example_state = self.benv.env.reset(rng)[1]
+        rng, subrng = jax.random.split(rng)
 
-        self.plr_mgr = PopPLRManager(
-            n_agents=self.n_students,
-            example_level=example_state,
-            ued_score=self.ued_score,
-            replay_prob=self.replay_prob,
-            buffer_size=self.buffer_size,
-            staleness_coef=self.staleness_coef,
-            temp=self.temp,
-            use_score_ranks=self.use_score_ranks,
-            min_fill_ratio=self.min_fill_ratio,
-            use_robust_plr=self.use_robust_plr,
-            use_parallel_eval=self.use_parallel_eval,
-            comparator_fn=self.comparator_fn,
-            n_devices=self.n_devices
-        )
-        plr_buffer = self.plr_mgr.reset(self.n_students)
+        if self.eval_runner is not None:
+            params = runner_state[1].actor_params
+            eval_stats = jax.lax.cond(
+                evaluate,
+                self.eval_runner.run,
+                self.eval_runner.fake_run,
+                *(subrng, params)
+            )
+        else:
+            eval_stats = {}
 
+        return stats, eval_stats, rng, *runner_state[1:]
+
+    def _make_shmap_run(self, runner_state):
+        devices = mesh_utils.create_device_mesh((self.n_devices,))
+        mesh = Mesh(devices, axis_names=('device'))
+
+        in_specs, out_specs = self.runner.get_shmap_spec()
+
+        return partial(shard_map,
+                       mesh=mesh,
+                       in_specs=in_specs,
+                       out_specs=out_specs,
+                       check_rep=False
+                       )(self.runner.run)
+
+    def train(
+            self,
+            rng,
+            agent_algo='ppo',
+            algo_runner='dr',
+            n_total_updates=1000,
+            logger=None,
+            log_interval=1,
+            test_interval=1,
+            checkpoint_interval=0,
+            archive_interval=0,
+            archive_init_checkpoint=False,
+            from_last_checkpoint=False
+    ):
+        """
+        Entry-point for training
+        """
+        # Load checkpoint if any
+        runner_state = self.runner.reset(rng)
+
+        if from_last_checkpoint:
+            last_checkpoint_state = logger.load_last_checkpoint_state()
+            if last_checkpoint_state is not None:
+                runner_state = self.runner.load_checkpoint_state(
+                    runner_state,
+                    last_checkpoint_state
+                )
+                self._start_tick = runner_state[1].n_iters[0]
+
+        # Archive initialization weights if necessary
+        if archive_init_checkpoint:
+            logger.checkpoint(
+                self.runner.get_checkpoint_state(runner_state),
+                index=0,
+                archive_interval=1)
+
+        # Train loop
+        log_on = logger is not None and log_interval > 0
+        checkpoint_on = checkpoint_interval > 0 or archive_interval > 0
         train_state = runner_state[1]
-        train_state = train_state.replace(plr_buffer=plr_buffer)
-        if self.n_devices == 1:
-            runner_state[1] = train_state
-        else:
-            plr_buffer = jax.tree_map(lambda x: x.repeat(
-                self.n_devices, 1), plr_buffer)  # replicate plr buffer
-            # Return PLR buffer directly to make shmap easier
-            runner_state += (plr_buffer,)
-
-        self.dummy_eval_output = self._create_dummy_eval_output(train_state)
-
-        return tuple(runner_state)
-
-    def _create_dummy_eval_output(self, train_state):
-        rng, * \
-            vrngs = jax.random.split(jax.random.PRNGKey(0), self.n_students+1)
-        obs, state, extra = self.benv.reset(jnp.array(vrngs))
-
-        ep_stats = self.rolling_stats.reset_stats(
-            batch_shape=(self.n_students, self.n_parallel*self.n_eval))
-
-        ued_scores = jnp.zeros((self.n_students, self.n_parallel))
-
-        if self.student_pop.agent.is_recurrent:
-            actor_carry, critic_carry = self.zero_carry, self.zero_carry
-        else:
-            actor_carry, critic_carry = None, None
-        rollout = self.student_rollout.reset()
-
-        shared_obs = self._get_shared_obs(obs) #TODO : check this
-        # Map over the n_env_agents dimension in this multi agent rl setting.
-        # Dimensions are (n_students, n_parallel, n_env_agents, ...)
-        value, _ = jax.vmap(self.student_pop.get_value, in_axes=(None, 2, 2))(
-            jax.lax.stop_gradient(train_state.critic_params),
-            shared_obs, #TODO : check this
-            critic_carry,
-        )
-
-        value = einops.rearrange(
-            value,
-            "n_env_agents n_students n_parallel -> n_students n_parallel n_env_agents")
-
-        jax.debug.print(
-            "train_state.shaped_reward_coeff {s}", s=train_state.shaped_reward_coeff)
-
-        train_batch = self.student_rollout.get_batch(
-            rollout, value, train_state.shaped_reward_coeff
-        )
-
-        return (
-            rng,
-            train_state,
-            state,
-            state,
-            obs,
-            actor_carry,
-            critic_carry,
-            extra,
-            ep_stats,
-            state,
-            train_batch,
-            ued_scores
-        )
-
-    @partial(jax.jit, static_argnums=(0, 8))
-    def _eval_and_update_plr(
-            self,
-            rng,
-            levels,
-            level_idxs,
-            train_state,
-            update_plr,
-            parent_idxs=None,
-            dupe_mask=None,
-            fake=False):
-        # Collect rollout and optionally update plr buffer
-        # Returns train_batch and ued_scores
-        if fake:
-            dummy_eval_output = list(self.dummy_eval_output)
-            dummy_eval_output[1] = train_state
-            return tuple(dummy_eval_output)
-
-        rollout_batch_shape = (self.n_students, self.n_parallel*self.n_eval)
-        obs, state, extra = self.benv.set_state(levels)
-        ep_stats = self.rolling_stats.reset_stats(
-            batch_shape=rollout_batch_shape)
-
-        rollout_start_state = state
-
-        done = jnp.zeros(rollout_batch_shape, dtype=jnp.bool_)
-        if self.student_pop.agent.is_recurrent:
-            actor_carry = self.zero_carry
-            critic_carry = self.zero_carry
-        else:
-            actor_carry, critic_carry = None, None
-
-        rng, subrng = jax.random.split(rng)
-        start_state = state
-        rollout, state, start_state, obs, actor_carry, critic_carry, extra, ep_stats, train_state = \
-            self._rollout_students(
-                subrng,
-                train_state,
-                state,
-                start_state,
-                obs,
-                actor_carry,
-                critic_carry,
-                done,
-                extra,
-                ep_stats
-            )
-
-        reward = rollout["rewards"].sum(axis=1).mean(-1)[:, :, jnp.newaxis]
-        shaped_reward = rollout["shaped_rewards"].sum(
-            axis=1).mean(-1)[:, :, jnp.newaxis]
-
-        ep_stats["reward"] = reward
-        ep_stats["shaped_reward"] = shaped_reward
-        ep_stats["shaped_reward_scaled_by_shaped_reward_coeff"] = shaped_reward * \
-            train_state.shaped_reward_coeff
-        ep_stats["reward_p_shaped_reward_scaled"] = reward + shaped_reward * \
-            train_state.shaped_reward_coeff
-
-        shared_obs = self._get_shared_obs(obs) #TODO : check this
-        value, _ = jax.vmap(self.student_pop.get_value, in_axes=(None, 2, 2))(
-            jax.lax.stop_gradient(train_state.critic_params),
-            shared_obs,
-            critic_carry
-        )
-
-        value = einops.rearrange(
-            value, "n_env_agents n_students n_parallel -> n_students n_parallel n_env_agents")
-        train_batch = self.student_rollout.get_batch(
-            rollout,
-            value,
-            train_state.shaped_reward_coeff
-        )
-
-        # Update PLR buffer
-        if self.ued_score == UEDScore.MAX_MC:
-            max_returns = jax.vmap(lambda x, y: x.at[y].get())(
-                train_state.plr_buffer.max_returns, level_idxs)
-            max_returns = jnp.where(
-                jnp.greater_equal(level_idxs, 0),
-                max_returns,
-                jnp.full_like(max_returns, -jnp.inf)
-            )
-            ued_info = {'max_returns': max_returns}
-        else:
-            ued_info = None
-        ued_scores, ued_score_info = compute_ued_scores(
-            self.ued_score, train_batch, self.n_eval, info=ued_info, ignore_val=-jnp.inf, per_agent=True)
-        next_plr_buffer = self.plr_mgr.update(
-            train_state.plr_buffer,
-            levels=levels,
-            level_idxs=level_idxs,
-            ued_scores=ued_scores,
-            dupe_mask=dupe_mask,
-            info=ued_score_info,
-            ignore_val=-jnp.inf,
-            parent_idxs=parent_idxs)
-
-        next_plr_buffer = jax.vmap(
-            lambda update, new, prev: jax.tree_map(
-                lambda x, y: jax.lax.select(update, x, y), new, prev)
-        )(update_plr, next_plr_buffer, train_state.plr_buffer)
-
-        train_state = train_state.replace(plr_buffer=next_plr_buffer)
-
-        return (
-            rng,
-            train_state,
-            state,
-            start_state,
-            obs,
-            actor_carry,
-            critic_carry,
-            extra,
-            ep_stats,
-            rollout_start_state,
-            train_batch,
-            ued_scores,
-        )
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _mutate_levels(self, rng, levels, level_idxs, ued_scores=None):
-        if not self.use_mutations:
-            return levels, level_idxs, jnp.full_like(level_idxs, -1)
-
-        def upsample_levels(levels, level_idxs, subsample_idxs):
-            subsample_idxs = subsample_idxs.repeat(
-                self.n_parallel//self.mutation_subsample_size, -1)
-            parent_idxs = level_idxs.take(subsample_idxs)
-            levels = jax.vmap(
-                lambda x, y: jax.tree_map(
-                    lambda _x: jnp.array(_x).take(y, 0), x)
-            )(levels, parent_idxs)
-
-            return levels, parent_idxs
-
-        if self.mutation_criterion == MutationCriterion.BATCH:
-            parent_idxs = level_idxs
-
-        if self.mutation_criterion == MutationCriterion.EASY:
-            _, top_level_idxs = jax.lax.approx_min_k(
-                ued_scores, self.mutation_subsample_size)
-            levels, parent_idxs = upsample_levels(
-                levels, level_idxs, top_level_idxs)
-
-        elif self.mutation_criterion == MutationCriterion.HARD:
-            _, top_level_idxs = jax.lax.approx_max_k(
-                ued_scores, self.mutation_subsample_size)
-            levels, parent_idxs = upsample_levels(
-                levels, level_idxs, top_level_idxs)
-
-        n_parallel = level_idxs.shape[-1]
-        vrngs = jax.vmap(lambda subrng: jax.random.split(subrng, n_parallel))(
-            jax.random.split(rng, self.n_students)
-        )
-
-        mutated_levels = jax.vmap(
-            lambda *args: jax.vmap(self.mutation_fn,
-                                   in_axes=(0, None, 0, None))(*args),
-            in_axes=(0, None, 0, None)
-        )(vrngs, self.benv.env_params, levels, self.n_mutations)
-
-        # Mutated levels do not have existing idxs in the PLR buffer.
-        mutated_level_idxs = jnp.full((self.n_students, n_parallel), -1)
-
-        return mutated_levels, mutated_level_idxs, parent_idxs
-
-    def _efficient_grad_update(self, rng, train_state, train_batch, is_replay):
-        # PPOAgent vmaps over the train state and batch. Batch must be N x EM
-        skip_grad_update = jnp.logical_and(self.use_robust_plr, ~is_replay)
-
-        if self.n_students == 1:
-            train_state, stats = jax.lax.cond(
-                skip_grad_update[0],
-                partial(self.student_pop.update, fake=True),
-                self.student_pop.update,
-                *(rng, train_state, train_batch)
-            )
-        elif self.n_students > 1:  # Have to vmap all students + take only students that need updates
-            _, dummy_stats = jax.vmap(
-                lambda *_: self.student_pop.agent.get_empty_update_stats())(np.arange(self.n_students))
-            _train_state, stats = self.student.update(
-                rng, train_state, train_batch)
-            train_state, stats = jax.vmap(lambda cond, x, y:
-                                          jax.tree_map(lambda _cond, _x, _y: jax.lax.select(_cond, _x, _y), cond, x, y))(
-                is_replay, (train_state,
-                            stats), (_train_state, dummy_stats)
-            )
-
-        return train_state, stats
-
-    @partial(jax.jit, static_argnums=(0,))
-    def _compile_stats(self, update_stats, ep_stats, env_metrics=None, plr_stats=None, shaped_reward_coeff=None):
-        stats = super()._compile_stats(update_stats, ep_stats, env_metrics)
-
-        if plr_stats is not None:
-            plr_stats = jax.vmap(lambda info: jax.tree_map(
-                lambda x: x.mean(), info))(plr_stats)
-
-        if shaped_reward_coeff is not None:
-            stats['shaped_reward_coeff'] = shaped_reward_coeff
-
-        if self.n_students > 1:
-            _plr_stats = {}
-            for i in range(self.n_students):
-                _student_plr_stats = jax.tree_util.tree_map(
-                    lambda x: x[i], plr_stats)  # for agent0
-                _plr_stats.update(
-                    {f'{k}_a{i}': v for k, v in _student_plr_stats.items()})
-            plr_stats = _plr_stats
-        else:
-            plr_stats = jax.tree_map(lambda x: x[0], plr_stats)
-
-        stats.update({f'plr_{k}': v for k, v in plr_stats.items()})
-
-        if self.n_devices > 1:
-            stats = jax.tree_map(lambda x: jax.lax.pmean(x, 'device'), stats)
-
-        return stats
-
-    @partial(jax.jit, static_argnums=(0,))
-    def run(
-            self,
-            rng,
-            train_state,
-            state,
-            start_state,
-            obs,
-            carry=None,
-            extra=None,
-            ep_stats=None,
-            plr_buffer=None):
-        # If device sharded, load sharded PLR buffer into train state
-        if self.n_devices > 1:
-            rng = jax.random.fold_in(rng, jax.lax.axis_index('device'))
-            train_state = train_state.replace(plr_buffer=plr_buffer)
-
-        # Sample next training levels via PLR
-        rng, *vrngs = jax.random.split(rng, self.n_students+1)
-        obs, state, extra = self.benv.reset(
-            jnp.array(vrngs), self.n_parallel, 1)
-
-        if self.use_parallel_eval:
-            n_level_samples = self.n_parallel//self._n_parallel_batches
-            new_levels = jax.tree_map(
-                lambda x: x.at[:, n_level_samples:2*n_level_samples].get(), state)
-        else:
-            n_level_samples = self.n_parallel
-            new_levels = state
-
-        rng, subrng = jax.random.split(rng)
-        levels, level_idxs, is_replay, next_plr_buffer = \
-            self.plr_mgr.sample(subrng, train_state.plr_buffer,
-                                new_levels, n_level_samples)
-        train_state = train_state.replace(plr_buffer=next_plr_buffer)
-
-        # If use_parallel_eval=True, need to combine replay and non-replay levels together
-        # Need to mutate levels as well
-        parent_idxs = jnp.full((self.n_students, self.n_parallel), -1)
-        if self.use_parallel_eval:  # Parallel ACCEL
-            new_level_idxs = jnp.full_like(parent_idxs, -1)
-
-            _all_levels = jax.vmap(
-                lambda x, y: _tree_util.pytree_merge(
-                    x, y, start_idx=n_level_samples, src_len=n_level_samples),
-            )(state, levels)
-            _all_level_idxs = jax.vmap(
-                lambda x, y: _tree_util.pytree_merge(
-                    x, y, start_idx=n_level_samples, src_len=n_level_samples),
-            )(new_level_idxs, level_idxs)
-
-            if self.use_mutations:
-                rng, subrng = jax.random.split(rng)
-                mutated_levels, mutated_level_idxs, _parent_idxs = self._mutate_levels(
-                    subrng, levels, level_idxs)
-
-                fallback_levels = jax.tree_map(
-                    lambda x: x.at[:, -n_level_samples:].get(), state)
-                fallback_level_idxs = jnp.full_like(mutated_level_idxs, -1)
-
-                mutated_levels = jax.vmap(
-                    lambda cond, x, y: jax.tree_map(
-                        lambda _x, _y: jax.lax.select(cond, _x, _y), x, y
-                    ))(is_replay, mutated_levels, fallback_levels)
-
-                mutated_level_idxs = jax.vmap(
-                    lambda cond, x, y: jax.tree_map(
-                        lambda _x, _y: jax.lax.select(cond, _x, _y), x, y
-                    ))(is_replay, mutated_level_idxs, fallback_level_idxs)
-
-                _parent_idxs = jax.vmap(
-                    lambda cond, x, y: jax.tree_map(
-                        lambda _x, _y: jax.lax.select(cond, _x, _y), x, y
-                    ))(is_replay, _parent_idxs, fallback_level_idxs)
-
-                mutated_levels_start_idx = 2*n_level_samples
-                _all_levels = jax.vmap(
-                    lambda x, y: _tree_util.pytree_merge(
-                        x, y, start_idx=mutated_levels_start_idx, src_len=n_level_samples),
-                )(_all_levels, mutated_levels)
-                _all_level_idxs = jax.vmap(
-                    lambda x, y: _tree_util.pytree_merge(
-                        x, y, start_idx=mutated_levels_start_idx, src_len=n_level_samples),
-                )(_all_level_idxs, mutated_level_idxs)
-                parent_idxs = jax.vmap(
-                    lambda x, y: _tree_util.pytree_merge(
-                        x, y, start_idx=mutated_levels_start_idx, src_len=n_level_samples),
-                )(parent_idxs, _parent_idxs)
-
-            levels = _all_levels
-            level_idxs = _all_level_idxs
-
-        # dedupe levels, move into PLR buffer logic
-        if self.force_unique:
-            level_idxs, dupe_mask = self.plr_mgr.dedupe_levels(
-                next_plr_buffer, levels, level_idxs)
-        else:
-            dupe_mask = None
-
-        # Evaluate levels + update PLR
-        result = self._eval_and_update_plr(
-            rng, levels, level_idxs, train_state, update_plr=jnp.array([True]*self.n_students), parent_idxs=parent_idxs, dupe_mask=dupe_mask)
-        rng, train_state, state, start_state, obs, actor_carry, critic_carry, extra, ep_stats, \
-            rollout_start_state, train_batch, ued_scores = result
-
-        if self.use_parallel_eval:
-            replay_start_idx = self.n_eval*n_level_samples
-            replay_end_idx = 2*replay_start_idx
-            train_batch = jax.vmap(
-                lambda x: jax.tree_map(
-                    lambda _x: _x.at[:, replay_start_idx:replay_end_idx].get(), x)
-            )(train_batch)
-
-        # Gradient update
-        rng, subrng = jax.random.split(rng)
-        train_state, update_stats = self._efficient_grad_update(
-            subrng, train_state, train_batch, is_replay)
-
-        # Mutation step
-        use_mutations = jnp.logical_and(self.use_mutations, is_replay)
-        # Already mutated above in parallel
-        use_mutations = jnp.logical_and(
-            use_mutations, not self.use_parallel_eval)
-        rng, arng, brng = jax.random.split(rng, 3)
-
-        mutated_levels, mutated_level_idxs, parent_idxs = jax.lax.cond(
-            use_mutations.any(),
-            self._mutate_levels,
-            lambda *_: (levels, level_idxs, jnp.full_like(level_idxs, -1)),
-            *(arng, levels, level_idxs, ued_scores)
-        )
-
-        mutated_dupe_mask = jnp.zeros_like(mutated_level_idxs, dtype=jnp.bool_)
-        if self.force_unique:  # Should move into update plr logic
-            mutated_level_idxs, mutated_dupe_mask = jax.lax.cond(
-                use_mutations.any(),
-                self.plr_mgr.dedupe_levels,
-                lambda *_: (mutated_level_idxs, mutated_dupe_mask),
-                *(next_plr_buffer, mutated_levels, mutated_level_idxs)
-            )
-
-        mutation_eval_result = jax.lax.cond(
-            use_mutations.any(),
-            self._eval_and_update_plr,
-            partial(self._eval_and_update_plr, fake=True),
-            *(brng, mutated_levels, mutated_level_idxs, train_state, use_mutations, parent_idxs, mutated_dupe_mask)
-        )
-        train_state = mutation_eval_result[1]
-
-        # Collect training env metrics
-        if self.track_env_metrics:
-            env_metrics = self.benv.get_env_metrics(levels)
-        else:
-            env_metrics = None
-
-        plr_stats = self.plr_mgr.get_metrics(train_state.plr_buffer)
-
-        stats = self._compile_stats(
-            update_stats, ep_stats, env_metrics, plr_stats, shaped_reward_coeff=train_state.shaped_reward_coeff)
-
-        if self.n_devices > 1:
-            plr_buffer = train_state.plr_buffer
-            train_state = train_state.replace(plr_buffer=None)
-
-        train_state = train_state.increment()
-        stats.update(dict(n_updates=train_state.n_updates[0]))
-
-        return (
-            stats,
-            rng,
-            train_state,
-            state,
-            start_state,
-            obs,
-            carry,
-            extra,
-            ep_stats,
-            plr_buffer,
-            rollout_start_state,
-        )
+
+        tick = self._start_tick
+        train_steps = tick*self.runner.step_batch_size * \
+            self.runner.n_rollout_steps*self.n_devices
+        real_train_steps = train_steps//self.runner.n_students
+
+        while (train_state.n_updates < n_total_updates).any():
+            evaluate = test_interval > 0 and (tick+1) % test_interval == 0
+
+            start = time.time()
+            stats, eval_stats, *runner_state = \
+                self.step(runner_state, evaluate)
+            end = time.time()
+
+            start_state = runner_state[-1]
+            runner_state = runner_state[:-1]
+
+            if evaluate:
+                stats.update(eval_stats)
+            else:
+                stats.update({k: None for k in eval_stats.keys()})
+
+            train_state = runner_state[1]
+
+            dsteps = self.runner.step_batch_size*self.runner.n_rollout_steps*self.n_devices
+            real_dsteps = dsteps//self.runner.n_students
+            train_steps += dsteps
+            real_train_steps += real_dsteps
+
+            if (self.shaped_reward_steps is not None and self.shaped_reward_steps > 0) or (self.shaped_reward_n_updates is not None and self.shaped_reward_n_updates > 0):
+                if self.shaped_reward_n_updates:  # Meassure based on n_updates
+                    new_shaped_reward_coeff_value = max(
+                        0.0, 1.0 - (train_state.n_updates[0]/self.shaped_reward_n_updates))
+                else:  # Meassure based on steps in the env
+                    new_shaped_reward_coeff_value = max(
+                        0.0, 1.0 - (real_train_steps/self.shaped_reward_steps))
+
+                new_shaped_reward_coeff = jnp.full(
+                    runner_state[1].shaped_reward_coeff.shape, fill_value=new_shaped_reward_coeff_value)
+                jax.debug.print("Shaped reward coeff: {a}, real_dsteps: {b}, shaped_reward_steps: {c}",
+                                a=new_shaped_reward_coeff, b=real_dsteps, c=self.shaped_reward_steps)
+                # runner_state[1] is the training state object where the shaped reward coefficient is stored
+                runner_state[1] = runner_state[1].set_new_shaped_reward_coeff(
+                    new_shaped_reward_coeff)
+
+            sps = int(dsteps/(end-start))
+            real_sps = int(real_dsteps/(end-start))
+            time_per_iter = float(end-start)
+            stats.update(dict(
+                steps=train_steps,
+                sps=sps,
+                real_steps=real_train_steps,
+                real_sps=real_sps,
+                time_per_iter=time_per_iter,
+            ))
+
+            tick += 1
+
+            jax.debug.print("-----\n{stats}", stats=stats)
+            if log_on and tick % log_interval == 0:
+                logger.log(stats, tick, ignore_val=-np.inf)
+
+            if checkpoint_on and tick > 0:
+                if tick % checkpoint_interval == 0 \
+                        or (archive_interval > 0 and tick % archive_interval == 0):
+
+                    maze_map = start_state.maze_map
+                    agent_dir_idx = start_state.agent_dir_idx
+                    agent_inv = start_state.agent_inv
+                    for i in range(1):  # self.runner.n_parallel
+
+                        padding = 4 #TODO : check this
+                        grid = np.asarray(
+                            maze_map[0, i, padding:-padding, padding:-padding, :])
+                        # Render the state
+                        frame = OvercookedVisualizer._render_grid(
+                            grid,
+                            tile_size=32,
+                            highlight_mask=None,
+                            agent_dir_idx=agent_dir_idx[0][i],
+                            agent_inv=agent_inv[0][i]
+                        )
+
+                        # Save the numpy frame as image
+                        dir = f"{os.getcwd()}/overcooked_teacher_layout_imgs/{self.xpid}/"
+
+                        os.makedirs(os.path.dirname(dir), exist_ok=True)
+                        imageio.imwrite(
+                            dir + f"{tick}_{i}.png", frame)
+
+                    # Also produce an image of the teachers env output currently
+                    checkpoint_state = \
+                        self.runner.get_checkpoint_state(runner_state)
+                    logger.checkpoint(
+                        checkpoint_state,
+                        index=tick,
+                        archive_interval=archive_interval)

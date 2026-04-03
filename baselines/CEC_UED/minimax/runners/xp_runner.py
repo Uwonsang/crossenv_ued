@@ -21,7 +21,7 @@ from jax.experimental.shard_map import shard_map
 from .eval_runner import EvalRunner
 from .dr_runner import DRRunner
 from .plr_runner import PLRRunner
-from minimax.model import ActorCriticRNN, ScannedRNN
+from minimax.model import ActorCriticRNN
 import minimax.agents as agents
 
 import jaxmarl
@@ -126,52 +126,38 @@ class ExperimentRunner:
             config,
             train_runner,
             env_name,
-            agent_rl_algo,
-            student_agent_kind="mappo",
-            train_runner_kwargs={},
-            env_kwargs={},
-            ued_env_kwargs={},
-            student_rl_kwargs={},
-            student_model_kwargs={},
-            eval_kwargs={},
-            eval_env_kwargs={},
             n_devices=1,
-            shaped_reward_steps=0,
-            shaped_reward_n_updates=0,
             xpid=None
     ):
         self.env_name = env_name
-        self.agent_rl_algo = agent_rl_algo
         self.xpid = xpid
-        self.shaped_reward_steps = shaped_reward_steps
-        self.shaped_reward_n_updates = shaped_reward_n_updates
 
         env = initialize_environment(config)
         obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
         env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+        config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+        config["MAX_TRAIN_UPDATES"] = (
+            config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+        )
+        config["NUM_REWARD_SHAPING_STEPS"] = config["MAX_TRAIN_UPDATES"] // 2  # used for annealing reward shaping
+        config["MINIBATCH_SIZE"] = (
+            config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
+        )
+        config["CLIP_EPS"] = (
+            config["CLIP_EPS"] / env.num_agents
+            if config["SCALE_CLIP_EPS"]
+            else config["CLIP_EPS"]
+        )
+
         # ---- Make agent ----
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
-        rng, _rng = jax.random.split(rng)
-        # get flattened obs dim
-        flattened_obs_dim = 1
-        for dim in env.observation_space(env.agents[0]).shape:
-            flattened_obs_dim *= dim
-        init_x = (
-            jnp.zeros(
-                (1, config["NUM_ENVS"], flattened_obs_dim)
-            ),
-            jnp.zeros((1, config["NUM_ENVS"])),
-            jnp.zeros((1, config["NUM_ENVS"], 2, 2)).astype(jnp.int32)
-        )
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        network_params = network.init(_rng, init_hstate, init_x)
 
-        student_agent = agents.MAPPOAgent(
-            actor=student_actor,
-            critic=student_critic,
-            n_devices=n_devices,
-            **student_rl_kwargs
+        student_agent = agents.IPPOAgent(
+            model=network,
+            config=config,
+            obs_dim = env.observation_space(env.agents[0]).shape,
+            n_devices=n_devices
         )
         
         # ---- Set up train runner ----
@@ -194,19 +180,18 @@ class ExperimentRunner:
             env_name=env_name,
             env_kwargs=env_kwargs,
             student_agents=[student_agent],
-            student_agent_kind=student_agent_kind,
             n_devices=n_devices,
             shaped_reward=use_shaped_reward,
             **train_runner_kwargs)
 
-        # ---- Make eval runner ----
-        if eval_kwargs.get('env_names') is None:
-            self.eval_runner = None
-        else:
-            self.eval_runner = EvalRunner(
-                pop=self.runner.student_pop,
-                env_kwargs=eval_env_kwargs,
-                **eval_kwargs)
+        # # ---- Make eval runner ----
+        # if eval_kwargs.get('env_names') is None:
+        #     self.eval_runner = None
+        # else:
+        #     self.eval_runner = EvalRunner(
+        #         pop=self.runner.student_pop,
+        #         env_kwargs=eval_env_kwargs,
+        #         **eval_kwargs)
 
         self._start_tick = 0
 

@@ -7,11 +7,9 @@ LICENSE file in the root directory of this source tree.
 """
 
 from functools import partial
-from typing import Dict, Tuple, Optional
+from typing import Tuple, Optional
 import inspect
 
-import chex
-import einops
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -20,14 +18,13 @@ import optax
 import flax
 import flax.linen as nn
 from flax.core.frozen_dict import FrozenDict
-from torch import NoneType
 
 import minimax.envs as envs
 from minimax.util import pytree as _tree_util
 from minimax.util.rl import (
     AgentPop,
-    VmapMAPPOTrainState,
-    RolloutStorageSeperate,
+    VmapTrainState,
+    RolloutStorage,
     RollingStats
 )
 
@@ -45,29 +42,26 @@ class DRRunner:
     """
 
     def __init__(
-        self,
-        env_name,
-        env_kwargs,
-        student_agents,
-        student_agent_kind,
-        n_students=1,
-        n_parallel=1,
-        n_eval=1,
-        n_rollout_steps=256,
-        lr=1e-4,
-        lr_final=None,
-        lr_anneal_steps=0,
-        max_grad_norm=0.5,
-        discount=0.99,
-        gae_lambda=0.95,
-        adam_eps=1e-5,
-        normalize_return=False,
-        track_env_metrics=False,
-        n_unroll_rollout=1,
-        n_devices=1,
-        render=False,
-        shaped_reward=False,
-    ):
+            self,
+            env_name,
+            env_kwargs,
+            student_agents,
+            n_students=1,
+            n_parallel=1,
+            n_eval=1,
+            n_rollout_steps=256,
+            lr=1e-4,
+            lr_final=None,
+            lr_anneal_steps=0,
+            max_grad_norm=0.5,
+            discount=0.99,
+            gae_lambda=0.95,
+            adam_eps=1e-5,
+            normalize_return=False,
+            track_env_metrics=False,
+            n_unroll_rollout=1,
+            n_devices=1,
+            render=False):
 
         assert len(student_agents) == 1, 'Only one type of student supported.'
         assert n_parallel % n_devices == 0, 'Num envs must be divisible by num devices.'
@@ -89,8 +83,6 @@ class DRRunner:
         self.n_unroll_rollout = n_unroll_rollout
         self.render = render
 
-        self.shaped_reward = shaped_reward
-
         self.student_pop = AgentPop(student_agents[0], n_agents=n_students)
 
         self.env, self.env_params = envs.make(
@@ -99,18 +91,16 @@ class DRRunner:
         )
         self._action_shape = self.env.action_space().shape
 
-        wrappers_lst = ['monitor_return', 'monitor_ep_metrics']
-
         self.benv = envs.BatchEnv(
             env_name=env_name,
             n_parallel=self.n_parallel,
             n_eval=self.n_eval,
             env_kwargs=env_kwargs,
-            wrappers=wrappers_lst,
+            wrappers=['monitor_return', 'monitor_ep_metrics']
         )
         self.action_dtype = self.benv.env.action_space().dtype
 
-        self.student_rollout = RolloutStorageSeperate(
+        self.student_rollout = RolloutStorage(
             discount=discount,
             gae_lambda=gae_lambda,
             n_steps=n_rollout_steps,
@@ -119,7 +109,6 @@ class DRRunner:
             n_eval=self.n_eval,
             action_space=self.env.action_space(),
             obs_space=self.env.observation_space(),
-            obs_space_shared_shape=self._get_shared_obs_space_shape(),
             agent=self.student_pop.agent,
         )
 
@@ -132,18 +121,9 @@ class DRRunner:
             jax.vmap(self.rolling_stats.update_stats))
 
         if self.render:
-            from minimax.envs.viz.grid_viz import GridVisualizer
+            from envs.viz.grid_viz import GridVisualizer
             self.viz = GridVisualizer()
             self.viz.show()
-
-    def _get_shared_obs_space_shape(self): #TODO : check this
-
-        return self.env.observation_space().shape
-
-    def _get_shared_obs(self, obs):  #TODO : check this
-
-        return self._concat_multi_agent_obs(obs)
-
 
     def reset(self, rng):
         self.n_updates = 0
@@ -153,51 +133,44 @@ class DRRunner:
         rngs, *vrngs = jax.random.split(rng, self.n_students+1)
         obs, state, extra = self.benv.reset(
             jnp.array(vrngs), n_parallel=n_parallel)
-
-        # dummy_obs = jax.tree_util.tree_map(lambda x: x[0], obs) # for one agent only
-        dummy_obs = self._concat_multi_agent_obs(obs)
-        dummy_shared_obs = self._get_shared_obs(obs)
+        dummy_obs = jax.tree_util.tree_map(
+            lambda x: x[0], obs)  # for one agent only
 
         rng, subrng = jax.random.split(rng)
         if self.student_pop.agent.is_recurrent:
-            actor_carry, critic_carry = self.student_pop.init_carry(
-                subrng, dummy_obs)
+            carry = self.student_pop.init_carry(subrng, obs)
             self.zero_carry = jax.tree_map(
-                lambda x: x.at[:, :self.n_parallel].get(), actor_carry)
+                lambda x: x.at[:, :self.n_parallel].get(), carry)
         else:
-            actor_carry, critic_carry = None, None
+            carry = None
 
         rng, subrng = jax.random.split(rng)
-        actor_params, critic_params = self.student_pop.init_params(
-            subrng, (dummy_obs[0], dummy_shared_obs[0]))
+        params = self.student_pop.init_params(subrng, dummy_obs)
 
-        schedule_fn = optax.linear_schedule(
-            init_value=-float(self.lr),
-            end_value=-float(self.lr_final),
-            transition_steps=self.lr_anneal_steps,
-        )
+        def linear_schedule(count):
+            frac = (
+                1.0
+                - ((count + resume_update_step) // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
+                / config["MAX_TRAIN_UPDATES"]
+            )
+            frac = jnp.maximum(1e-9, frac)
+            return config["LR"] * frac
 
-        tx_actor = optax.chain(
-            optax.clip_by_global_norm(self.max_grad_norm),
-            optax.adam(learning_rate=float(self.lr), eps=self.adam_eps)
-        )
+        if config["ANNEAL_LR"]:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
+            )
+        else:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
 
-        tx_critic = optax.chain(
-            optax.clip_by_global_norm(self.max_grad_norm),
-            optax.adam(learning_rate=float(self.lr), eps=self.adam_eps)
-        )
-
-        shaped_reward_coeff_value = 1.0 if self.shaped_reward else 0.0
-        shaped_reward_coeff = jnp.full(
-            (self.n_students, 1), fill_value=shaped_reward_coeff_value)
-        train_state = VmapMAPPOTrainState.create(
-            actor_apply_fn=self.student_pop.agent.evaluate_action,
-            actor_params=actor_params,
-            actor_tx=tx_actor,
-            critic_apply_fn=self.student_pop.agent.get_value,
-            critic_params=critic_params,
-            critic_tx=tx_critic,
-            shaped_reward_coeff=shaped_reward_coeff,
+        train_state = VmapTrainState.create(
+            apply_fn=self.student_pop.agent.evaluate,
+            params=params,
+            tx=tx
         )
 
         ep_stats = self.rolling_stats.reset_stats(
@@ -211,8 +184,7 @@ class DRRunner:
             state,
             start_state,  # Used to track metrics from starting state
             obs,
-            actor_carry,
-            critic_carry,
+            carry,
             extra,
             ep_stats
         )
@@ -234,41 +206,21 @@ class DRRunner:
             self,
             rng,
             pop,
-            actor_params,
-            critic_params,
+            params,
             rollout,
             state,
             start_state,
             obs,
-            actor_carry,
-            critic_carry,
+            carry,
             done,
             extra=None):
         # Sample action
-
-        ma_obs = self._concat_multi_agent_obs(obs)
-
-        # PRINT THE CURRENT STATE
-
-        _, pi_params, next_actor_carry = jax.vmap(pop.act, in_axes=(None, 2, 2, None))(
-            actor_params, ma_obs, actor_carry, done)
-        next_actor_carry = jax.tree_map(lambda x: einops.rearrange(
-            x, 't n a d -> a t n d'), next_actor_carry)
-        shared_obs = self._get_shared_obs(obs) # TODO : check this
-        value, next_critic_carry = jax.vmap(pop.get_value, in_axes=(None, 2, 2, None))(
-            critic_params, shared_obs, critic_carry, done)
-        next_critic_carry = jax.tree_map(lambda x: einops.rearrange(
-            x, 't n a d -> a t n d'), next_critic_carry)
+        value, pi_params, next_carry = pop.act(params, obs, carry, done)
 
         pi = pop.get_action_dist(pi_params, dtype=self.action_dtype)
         rng, subrng = jax.random.split(rng)
         action = pi.sample(seed=subrng)
         log_pi = pi.log_prob(action)
-
-        env_action = {
-            'agent_0': action[0],
-            'agent_1': action[1]
-        }
 
         rng, *vrngs = jax.random.split(rng, self.n_students+1)
         (next_obs,
@@ -276,30 +228,16 @@ class DRRunner:
          reward,
          done,
          info,
-         extra) = self.benv.step(jnp.array(vrngs), state, env_action, extra)
-
-        # jax.debug.print("Current state (r: {r}, sparse: {spa}, shaped: {sha}) =\n{a}", spa=info["sparse_reward"][0, 0].mean(), sha=info["shaped_reward"][0, 0].mean(), r=reward[0, 0], a=ma_obs[0, 0, 0, :, :, 0]
-        #                 * 1 + ma_obs[0, 0, 0, :, :, 1]*2+ma_obs[0, 0, 0, :, :, 11]*3)
+         extra) = self.benv.step(jnp.array(vrngs), state, action, extra)
 
         next_start_state = jax.vmap(_tree_util.pytree_select)(
             done, next_state, start_state
         )
 
         # Add transition to storage
-        log_pi = einops.rearrange(log_pi, 'a s n -> s n a')
-        value = einops.rearrange(value, 'a s n -> s n a')
-
-        action = einops.rearrange(action, 'a s n -> s n a')
-
-        done_ = jnp.concatenate(
-            [done[:, :, jnp.newaxis], done[:, :, jnp.newaxis]], axis=2)
-
-        # jax.debug.print("sparse reward = {b}, reward = {c}",  # a=info["shaped_reward"].mean(),
-        #                 b=info["sparse_reward"].mean(), c=reward.mean())
-        step = (ma_obs, shared_obs, action, info["sparse_reward"],
-                info["shaped_reward"], done_, log_pi, value)
-        if actor_carry is not None and critic_carry is not None:
-            step += (actor_carry, critic_carry)
+        step = (obs, action, reward, done, log_pi, value)
+        if carry is not None:
+            step += (carry,)
 
         rollout = self.student_rollout.append(rollout, *step)
 
@@ -313,10 +251,7 @@ class DRRunner:
             next_state,
             next_start_state,
             next_obs,
-            jax.tree_map(lambda x: einops.rearrange(
-                x, 'n a s d -> s n a d'), next_actor_carry),
-            jax.tree_map(lambda x: einops.rearrange(
-                x, 'n a s d -> s n a d'), next_critic_carry),
+            next_carry,
             done,
             info,
             extra
@@ -330,8 +265,7 @@ class DRRunner:
             state,
             start_state,
             obs,
-            actor_carry,
-            critic_carry,
+            carry,
             done,
             extra=None,
             ep_stats=None):
@@ -340,28 +274,25 @@ class DRRunner:
         rngs = jax.random.split(rng, self.n_rollout_steps)
 
         def _scan_rollout(scan_carry, rng):
-            rollout, state, start_state, obs, actor_carry, critic_carry, done, extra, ep_stats, train_state = scan_carry
+            rollout, state, start_state, obs, carry, done, extra, ep_stats, train_state = scan_carry
 
             next_scan_carry = \
                 self._get_transition(
                     rng,
                     self.student_pop,
-                    jax.lax.stop_gradient(train_state.actor_params),
-                    jax.lax.stop_gradient(train_state.critic_params),
+                    jax.lax.stop_gradient(train_state.params),
                     rollout,
                     state,
                     start_state,
                     obs,
-                    actor_carry,
-                    critic_carry,
+                    carry,
                     done,
                     extra)
             (rollout,
              next_state,
              next_start_state,
              next_obs,
-             next_actor_carry,
-             next_critic_carry,
+             next_carry,
              done,
              info,
              extra) = next_scan_carry
@@ -373,8 +304,7 @@ class DRRunner:
                 next_state,
                 next_start_state,
                 next_obs,
-                next_actor_carry,
-                next_critic_carry,
+                next_carry,
                 done,
                 extra,
                 ep_stats,
@@ -384,8 +314,7 @@ class DRRunner:
          state,
          start_state,
          obs,
-         actor_carry,
-         critic_carry,
+         carry,
          done,
          extra,
          ep_stats,
@@ -395,8 +324,7 @@ class DRRunner:
              state,
              start_state,
              obs,
-             actor_carry,
-             critic_carry,
+             carry,
              done,
              extra,
              ep_stats,
@@ -405,21 +333,13 @@ class DRRunner:
             length=self.n_rollout_steps,
         )
 
-        return rollout, state, start_state, obs, actor_carry, critic_carry, extra, ep_stats, train_state
+        return rollout, state, start_state, obs, carry, extra, ep_stats, train_state
 
     @partial(jax.jit, static_argnums=(0,))
-    def _compile_stats(self, update_stats, ep_stats, env_metrics=None, shaped_reward_coeff=None):
-
-        info = {k: ep_stats[k] for k in self.rolling_stats.names}
-
+    def _compile_stats(self, update_stats, ep_stats, env_metrics=None):
         stats = jax.vmap(lambda info: jax.tree_map(lambda x: x.mean(), info))(
-            info
+            {k: ep_stats[k] for k in self.rolling_stats.names}
         )
-
-        if shaped_reward_coeff is not None:
-            update_stats.update(
-                {"shaped_reward_coeff": shaped_reward_coeff})
-
         stats.update(update_stats)
 
         if self.n_students > 1:
@@ -475,8 +395,7 @@ class DRRunner:
             state,
             start_state,
             obs,
-            actor_carry=None,
-            critic_carry=None,
+            carry=None,
             extra=None,
             ep_stats=None):
         """
@@ -496,44 +415,26 @@ class DRRunner:
 
         done = jnp.zeros(rollout_batch_shape, dtype=jnp.bool_)
         rng, subrng = jax.random.split(rng)
-        rollout, state, start_state, obs, actor_carry, critic_carry, extra, ep_stats, train_state = \
+        rollout, state, start_state, obs, carry, extra, ep_stats, train_state = \
             self._rollout_students(
                 subrng,
                 train_state,
                 state,
                 start_state,
                 obs,
-                actor_carry,
-                critic_carry,
+                carry,
                 done,
                 extra,
                 ep_stats
             )
 
-        reward = rollout["rewards"].sum(axis=1).mean(-1)[:, :, jnp.newaxis]
-        shaped_reward = rollout["shaped_rewards"].sum(
-            axis=1).mean(-1)[:, :, jnp.newaxis]
-
-        ep_stats["reward"] = reward
-        ep_stats["shaped_reward"] = shaped_reward
-        ep_stats["shaped_reward_scaled_by_shaped_reward_coeff"] = shaped_reward * \
-            train_state.shaped_reward_coeff
-        ep_stats["reward_p_shaped_reward_scaled"] = reward + shaped_reward * \
-            train_state.shaped_reward_coeff
-
-        shared_obs = self._get_shared_obs(obs) #TODO : check this
-        value, _ = jax.vmap(self.student_pop.get_value, in_axes=(None, 2, 2))(
-            jax.lax.stop_gradient(train_state.critic_params),
-            shared_obs,
-            critic_carry
-        )
-
-        value = einops.rearrange(
-            value, "n_env_agents n_students n_parallel -> n_students n_parallel n_env_agents")
         train_batch = self.student_rollout.get_batch(
             rollout,
-            value,
-            train_state.shaped_reward_coeff
+            self.student_pop.get_value(
+                jax.lax.stop_gradient(train_state.params),
+                obs,
+                carry,
+            )
         )
 
         # PPOAgent vmaps over the train state and batch. Batch must be N x EM
@@ -547,8 +448,7 @@ class DRRunner:
         else:
             env_metrics = None
 
-        stats = self._compile_stats(
-            update_stats, ep_stats, env_metrics, shaped_reward_coeff=train_state.shaped_reward_coeff)
+        stats = self._compile_stats(update_stats, ep_stats, env_metrics)
         stats.update(dict(n_updates=train_state.n_updates[0]))
 
         train_state = train_state.increment()
@@ -561,15 +461,7 @@ class DRRunner:
             state,
             start_state,
             obs,
-            actor_carry,
-            critic_carry,
+            carry,
             extra,
-            ep_stats,
-            rollout_start_state
+            ep_stats
         )
-
-    def _concat_multi_agent_obs(self, obs: Dict[str, chex.Array]) -> chex.Array:
-        """Concatenates a obs dictionary that was built for two env agents.
-        Doubles the number of parallel_envs, i.e. (num_students, n_parallel, ...) -> (num_students, 2*n_parallel, ...)
-        """
-        return jnp.concatenate([obs['agent_0'][:, :, jnp.newaxis, :], obs['agent_1'][:, :, jnp.newaxis, :]], axis=2)

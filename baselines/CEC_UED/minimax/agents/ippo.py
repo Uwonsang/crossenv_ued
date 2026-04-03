@@ -22,32 +22,22 @@ class IPPOAgent(Agent):
     def __init__(
             self,
             model,
-            n_epochs=5,
-            n_minibatches=1,
-            value_loss_coef=0.5,
-            entropy_coef=0.0,
-            clip_eps=0.2,
-            clip_value_loss=True,
-            track_grad_norm=False,
-            n_unroll_update=1,
+            config,
+            obs_dim,
             n_devices=1):
 
         self.model = model
-        self.n_epochs = n_epochs
-        self.n_minibatches = n_minibatches
-        self.value_loss_coef = value_loss_coef
-        self.entropy_coef = entropy_coef
-        self.clip_eps = clip_eps
-        self.clip_value_loss = clip_value_loss
-        self.track_grad_norm = track_grad_norm
-        self.n_unroll_update = n_unroll_update
+        self.n_epochs = config["UPDATE_EPOCHS"]
+        self.n_minibatches = config["NUM_MINIBATCHES"]
+        self.value_loss_coef = config["VF_COEF"]
+        self.entropy_coef = config["ENT_COEF"]
+        self.clip_eps = config["CLIP_EPS"]
+        self.n_unroll_update = config["n_unroll_update"]
+        self.num_envs = config["NUM_ENVS"]
+        self.gpu_hidden_dim = config["GRU_HIDDEN_DIM"]
         self.n_devices = n_devices
 
         self.grad_fn = jax.value_and_grad(self._loss, has_aux=True)
-
-    @property
-    def is_recurrent(self):
-        return self.model.is_recurrent
 
     def init_params(self, rng, obs):
         """
@@ -55,15 +45,23 @@ class IPPOAgent(Agent):
         observation shape.
         """
         rng, subrng = jax.random.split(rng)
-        if self.model.is_recurrent:
-            batch_size = jax.tree_util.tree_leaves(obs)[0].shape[1]
-            carry = self.model.initialize_carry(
-                rng=subrng, batch_dims=(batch_size,))
-            reset = jnp.zeros((1, batch_size), dtype=jnp.bool_)
-            rng, subrng = jax.random.split(rng)
-            params = self.model.init(subrng, obs, carry, reset)
-        else:
-            params = self.model.init(subrng, obs)
+        batch_size = jax.tree_util.tree_leaves(obs)[0].shape[1]
+
+        # get flattened obs dim #TODO: fix from obs
+        # flattened_obs_dim = 1
+        # for dim in env.observation_space(env.agents[0]).shape:
+        #     flattened_obs_dim *= dim
+       
+        flattened_obs_dim = 2106
+        init_x = (
+            jnp.zeros(
+                (1, self.num_envs, flattened_obs_dim)
+            ),
+            jnp.zeros((1, self.num_envs)),
+            jnp.zeros((1, self.num_envs, 2, 2)).astype(jnp.int32)
+        )
+        init_hstate = self.model.initialize_carry(self.num_envs, self.gpu_hidden_dim)
+        params = self.model.init(subrng, init_hstate, init_x)
 
         return params
 
@@ -196,51 +194,37 @@ class IPPOAgent(Agent):
         return train_state, loss_stats
 
     @partial(jax.jit, static_argnums=(0, 2, 4))
-    def _loss(
-            self,
-            params,
-            apply_fn,
-            batch,
-            rng=None):
-        carry = None
+    def _loss(self, params, apply_fn, batch, rng=None):
 
-        if self.is_recurrent:
-            """
-            Elements have batch shape of n_rollout_steps x n_envs//n_minibatches
-            """
-            carry = jax.tree_util.tree_map(lambda x: x[0, :], batch.carry)
-            obs, action, rewards, dones, log_pi_old, value_old, target, gae, carry_old = batch
+        """
+        Elements have batch shape of n_rollout_steps x n_envs//n_minibatches
+        """
+        carry = jax.tree_util.tree_map(lambda x: x[0, :], batch.carry)
+        obs, action, rewards, dones, log_pi_old, value_old, target, gae, carry_old = batch
 
-            if self.is_recurrent:
-                dones = dones.at[1:, :].set(dones[:-1, :])
-                dones = dones.at[0, :].set(False)
-                _batch = batch._replace(dones=dones)
+        dones = dones.at[1:, :].set(dones[:-1, :])
+        dones = dones.at[0, :].set(False)
+        _batch = batch._replace(dones=dones)
 
-                # Returns LxB and LxBxH tensors
-                obs, action, _, done, _, _, _, _, _ = _batch
-                value, log_pi, entropy, carry = apply_fn(
-                    params, action, obs, carry, done)
-            else:
-                value, log_pi, entropy, carry = apply_fn(
-                    params, action, obs, carry_old)
-        else:
-            obs, action, rewards, dones, log_pi_old, value_old, target, gae, _ = batch
-            value, log_pi, entropy, _ = apply_fn(params, action, obs, carry)
+        # Returns LxB and LxBxH tensors
+        obs, action, _, done, _, _, _, _, _ = _batch
+        value, log_pi, entropy, carry = apply_fn(
+            params, action, obs, carry, done)
 
-        if self.clip_value_loss:
-            value_pred_clipped = value_old + (value - value_old).clip(
-                -self.clip_eps, self.clip_eps
-            )
-            value_losses = jnp.square(value - target)
-            value_losses_clipped = jnp.square(value_pred_clipped - target)
-            value_loss = 0.5 * \
-                jnp.maximum(value_losses, value_losses_clipped).mean()
-        else:
-            value_loss = optax.huber_loss(value, target).mean()
+        # CALCULATE VALUE LOSS
+        value_pred_clipped = value_old + (value - value_old).clip(
+            -self.clip_eps, self.clip_eps
+        )
+        value_losses = jnp.square(value - target)
+        value_losses_clipped = jnp.square(value_pred_clipped - target)
+        value_loss = 0.5 * \
+            jnp.maximum(value_losses, value_losses_clipped).mean()
+
 
         if self.model.value_ensemble_size > 1:
             gae = gae.at[..., 0].get()
 
+        # CALCULATE ACTOR LOSS
         ratio = jnp.exp(log_pi - log_pi_old)
         norm_gae = (gae - gae.mean()) / (gae.std() + 1e-5)
         loss_actor1 = ratio * norm_gae
@@ -267,37 +251,25 @@ class IPPOAgent(Agent):
     def _get_minibatches(self, rng, batch):
         # get dims based on dones
         n_rollout_steps, n_envs = batch.dones.shape[0:2]
-        if self.is_recurrent:
-            """
-            Reshape elements into a batch shape of 
-            n_minibatches x n_envs//n_minibatches x n_rollout_steps.
-            """
-            assert n_envs % self.n_minibatches == 0, \
-                'Number of environments must be divisible into number of minibatches.'
+        """
+        Reshape elements into a batch shape of 
+        n_minibatches x n_envs//n_minibatches x n_rollout_steps.
+        """
+        assert n_envs % self.n_minibatches == 0, \
+            'Number of environments must be divisible into number of minibatches.'
 
-            n_env_per_minibatch = n_envs//self.n_minibatches
-            shuffled_idx = jax.random.permutation(rng, jnp.arange(n_envs))
+        n_env_per_minibatch = n_envs//self.n_minibatches
+        shuffled_idx = jax.random.permutation(rng, jnp.arange(n_envs))
 
-            shuffled_batch = jax.tree_util.tree_map(
-                lambda x: jnp.take(x, shuffled_idx, axis=1), batch)
+        shuffled_batch = jax.tree_util.tree_map(
+            lambda x: jnp.take(x, shuffled_idx, axis=1), batch)
 
-            minibatches = jax.tree_util.tree_map(
-                lambda x: x.swapaxes(0, 1).reshape(
-                    self.n_minibatches,
-                    n_env_per_minibatch,
-                    n_rollout_steps,
-                    *x.shape[2:]
-                ).swapaxes(1, 2), shuffled_batch)
-        else:
-            n_txns = n_envs*n_rollout_steps
-            assert n_envs*n_rollout_steps % self.n_minibatches == 0
-
-            shuffled_idx = jax.random.permutation(rng, jnp.arange(n_txns))
-            shuffled_batch = jax.tree_util.tree_map(
-                lambda x: jnp.take(
-                    x.reshape(n_txns, *x.shape[2:]),
-                    shuffled_idx, axis=0), batch)
-            minibatches = jax.tree_util.tree_map(
-                lambda x: x.reshape(self.n_minibatches, -1, *x.shape[1:]), shuffled_batch)
+        minibatches = jax.tree_util.tree_map(
+            lambda x: x.swapaxes(0, 1).reshape(
+                self.n_minibatches,
+                n_env_per_minibatch,
+                n_rollout_steps,
+                *x.shape[2:]
+            ).swapaxes(1, 2), shuffled_batch)
 
         return minibatches

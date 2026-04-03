@@ -8,39 +8,34 @@ import distrax
 import functools
 
 
-class ScannedRNN(nn.Module):
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
-    @nn.compact
-    def __call__(self, carry, x):
-        """Applies the module."""
-        lstm_state = carry
-        ins, resets = x
-        
-        # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
-            lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
-            lstm_state
+class ActorCriticRNN(nn.Module):
+    action_dim: Sequence[int]
+    config: Dict
+
+    class ScannedRNN(nn.Module):
+        @functools.partial(
+            nn.scan,
+            variable_broadcast="params",
+            in_axes=0,
+            out_axes=0,
+            split_rngs={"params": False},
         )
-        
-        new_lstm_state, y = nn.OptimizedLSTMCell(features=ins.shape[-1])(lstm_state, ins)
-        return new_lstm_state, y
+        @nn.compact
+        def __call__(self, carry, x):
+            lstm_state = carry
+            ins, resets = x
+            lstm_state = jax.tree_map(
+                lambda h: jnp.where(resets[:, np.newaxis], jnp.zeros_like(h), h),
+                lstm_state,
+            )
+            new_lstm_state, y = nn.OptimizedLSTMCell(features=ins.shape[-1])(lstm_state, ins)
+            return new_lstm_state, y
 
     @staticmethod
     def initialize_carry(batch_size, hidden_size):
         return nn.OptimizedLSTMCell(features=hidden_size).initialize_carry(
             jax.random.PRNGKey(0), (batch_size, hidden_size)
         )
-
-
-class ActorCriticRNN(nn.Module):
-    action_dim: Sequence[int]
-    config: Dict
 
     @nn.compact
     def __call__(self, hidden, x):
@@ -87,7 +82,7 @@ class ActorCriticRNN(nn.Module):
 
         if self.config["LSTM"]:
             rnn_in = (embedding, dones)
-            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            hidden, embedding = self.ScannedRNN()(hidden, rnn_in)
         else:
             embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
             embedding = nn.relu(embedding)

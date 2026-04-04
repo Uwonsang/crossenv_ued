@@ -22,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 256
+  "max_steps": 400
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -31,7 +31,7 @@
   # overcooked specific kwargs
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
-  "random_reset_fn": "reset_vae"  # reset_all or reset_counter_circuit
+  "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
@@ -58,32 +58,12 @@
 "WANDB_MODE" : "disabled"
 "model_name": "IPPO_CEC_minimax"
 # Ued params 
-"train_runner": "plr"  # dr, plr
-"n_devices": 1
-"is_multi_agent": True
-"n_students": 1
-"n_eval": 1
-"track_env_metrics": True
-"n_unroll_rollout": 10
-"render": False
-"ued_score": "max_mc"
-"n_unroll_update" : 5
-"plr_replay_prob": 0.5
-"plr_buffer_size": 4000
-"plr_staleness_coef": 0.3
-"plr_temp": 0.1
-"plr_use_score_ranks": True
-"plr_min_fill_ratio": 0.5
-"plr_use_robust_plr": True
-"plr_use_parallel_eval": False
-"plr_force_unique": True
-"verbose": False
-"log_dir": "~/logs/minimax"
-"log_interval" : 10
-"from_last_checkpoint": False
-"checkpoint_interval": 1000
-"archive_interval" : 0
-"archive_init_checkpoint" : False
-"test_interval" : 100
-"test_n_episodes" : 10
-"test_env_names" : "Overcooked-cramped_room_9, Overcooked-asymm_advantages_9, Overcooked-coord_ring_9, Overcooked-counter_circuit_9, Overcooked-forced_coord_9"
+# PLR (Prioritized Level Replay) — overcooked + random_reset_fn=reset_all 일 때만 동작
+"USE_PLR": False
+"PLR_REPLAY_PROB": 0.5
+"PLR_BUFFER_SIZE": 4000
+"PLR_STALENESS_COEF": 0.3
+"PLR_TEMP": 0.1
+"PLR_USE_SCORE_RANKS": True
+"PLR_MIN_FILL_RATIO": 0.5
+"PLR_USE_ROBUST_PLR": False

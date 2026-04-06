@@ -80,3 +80,15 @@ def plr_ued_scores_and_info(plr_ued_score, batch, plr_buffer, level_idxs, num_en
         return ued_scores, {"max_returns": merged_max_returns}
 
     return ued_scores, None
+
+def layout_comparator(a, b):
+    keys = (
+        "agent_idx",
+        "goal_idx",
+        "onion_pile_idx",
+        "plate_pile_idx",
+        "pot_idx",
+        "wall_idx",
+    )
+    checks = [jnp.all(a[k] == b[k]) for k in keys]
+    return jnp.all(jnp.stack(checks))

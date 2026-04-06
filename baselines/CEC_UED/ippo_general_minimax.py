@@ -39,7 +39,8 @@ from minimax import (
     UEDScore,
     plr_batch_from_traj,
     plr_ued_scores_and_info,
-    sample_layout_reset_all
+    sample_layout_reset_all,
+    layout_comparator
 )
 
 def initialize_environment(config):
@@ -319,7 +320,7 @@ def make_train(config, update_step=0):
         min_fill_ratio=config["PLR_MIN_FILL_RATIO"],
         use_score_ranks=config["PLR_USE_SCORE_RANKS"],
         use_robust_plr=config["PLR_USE_ROBUST_PLR"],
-        comparator_fn=None,
+        comparator_fn=layout_comparator if config["PLR_FORCE_UNIQUE"] else None,
         n_devices=1,
     )
 
@@ -414,6 +415,12 @@ def make_train(config, update_step=0):
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
                 rng_plr, plr_buffer, new_levels, config["NUM_ENVS"]
             )
+            if config["PLR_FORCE_UNIQUE"]:
+                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
+                    plr_buffer, levels, level_idxs)
+            else:
+                dupe_mask = None
+
             reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
             obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
             last_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
@@ -424,7 +431,7 @@ def make_train(config, update_step=0):
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}  
+                agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}  
                 agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
                 ac_in = (
                     obs_batch[np.newaxis, :],
@@ -489,7 +496,7 @@ def make_train(config, update_step=0):
             train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-            agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
+            agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
             ac_in = (
                 last_obs_batch[np.newaxis, :],
@@ -748,7 +755,7 @@ def make_train(config, update_step=0):
                 plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
 
             plr_buffer = plr_mgr.update(
-                plr_buffer, levels, level_idxs, ued_scores, info=update_info)
+                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer)
 
             return (runner_state, update_steps), metric

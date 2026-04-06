@@ -24,7 +24,6 @@ class PLRBuffer(struct.PyTreeNode):
     max_returns: chex.Array  # for MaxMC
     filled: chex.Array
     filled_count: chex.Array
-    n_mutations: chex.Array
 
     ued_score: int = struct.field(
         pytree_node=False, default=UEDScore.L1_VALUE_LOSS.value)
@@ -35,7 +34,6 @@ class PLRBuffer(struct.PyTreeNode):
     use_score_ranks: bool = struct.field(pytree_node=False, default=True)
     min_fill_ratio: float = struct.field(pytree_node=False, default=0.5)
     use_robust_plr: bool = struct.field(pytree_node=False, default=False)
-    use_parallel_eval: bool = struct.field(pytree_node=False, default=False)
 
 
 class PLRManager:
@@ -50,7 +48,6 @@ class PLRManager:
             min_fill_ratio=0.5,
             use_score_ranks=True,
             use_robust_plr=False,
-            use_parallel_eval=False,
             comparator_fn=None,
             n_devices=1):
 
@@ -65,7 +62,6 @@ class PLRManager:
         self.min_fill_ratio = min_fill_ratio
         self.use_score_ranks = use_score_ranks
         self.use_robust_plr = use_robust_plr
-        self.use_parallel_eval = use_parallel_eval
         self.comparator_fn = comparator_fn
 
         self.n_devices = n_devices
@@ -81,7 +77,6 @@ class PLRManager:
         self.ages = jnp.zeros(buffer_size, dtype=jnp.uint32)
         self.filled = jnp.zeros(buffer_size, dtype=jnp.bool_)
         self.filled_count = jnp.zeros((1,), dtype=jnp.int32)
-        self.n_mutations = jnp.zeros(buffer_size, dtype=jnp.uint32)
 
     @partial(jax.jit, static_argnums=(0,))
     def reset(self):
@@ -93,14 +88,12 @@ class PLRManager:
             temp=self.temp,
             min_fill_ratio=self.min_fill_ratio,
             use_robust_plr=self.use_robust_plr,
-            use_parallel_eval=self.use_parallel_eval,
             levels=self.levels,
             scores=self.scores,
             max_returns=self.max_returns,
             ages=self.ages,
             filled=self.filled,
-            filled_count=self.filled_count,
-            n_mutations=self.n_mutations)
+            filled_count=self.filled_count)
 
     def _get_replay_dist(self, scores, ages, filled):
         # Score dist
@@ -281,7 +274,6 @@ class PLRManager:
             # Ignore duplicate levels in batch by treating them as not done
             done_masks = jnp.logical_and(done_masks, ~dupe_mask)
 
-        cur_n_mutations = plr_buffer.n_mutations
         insert_mask = jnp.zeros((self.buffer_size,), dtype=jnp.bool_)
 
         def update_level_info(carry, step):
@@ -350,31 +342,6 @@ class PLRManager:
                 max_returns=next_max_returns
             )
 
-            # Update mutation count
-            n_mutations = plr_buffer.n_mutations
-            should_incr_n_mutations = jnp.logical_and(
-                jnp.not_equal(parent_idx, -1), should_insert)
-            should_reset_n_mutations = jnp.logical_and(
-                jnp.equal(parent_idx, -1), should_insert_or_update)
-            reset_n_mutations = jnp.where(
-                is_existing_level,
-                cur_n_mutations.at[insert_idx].get(),
-                0
-            )
-            next_n_mutations = jnp.where(
-                should_incr_n_mutations,
-                n_mutations.at[insert_idx].set(
-                    cur_n_mutations.at[parent_idx].get() + 1),
-                n_mutations
-            )
-            next_n_mutations = jnp.where(
-                should_reset_n_mutations,
-                next_n_mutations.at[insert_idx].set(reset_n_mutations),
-                next_n_mutations
-            )
-
-            plr_replace_kwargs['n_mutations'] = next_n_mutations
-
             next_plr_buffer = plr_buffer.replace(**plr_replace_kwargs)
 
             return (next_plr_buffer, next_insert_mask), None
@@ -403,14 +370,12 @@ class PLRManager:
             plr_buffer.scores,
             plr_buffer.ages,
             plr_buffer.filled)
-        weighted_n_mutations = (plr_buffer.n_mutations*replay_dist).sum()
         scores = jnp.where(plr_buffer.filled, plr_buffer.scores, 0)
         weighted_ued_score = (scores*replay_dist).sum()
 
         weighted_age = (plr_buffer.ages*replay_dist).sum()
 
         return dict(
-            weighted_n_mutations=weighted_n_mutations,
             weighted_ued_score=weighted_ued_score,
             weighted_age=weighted_age
         )

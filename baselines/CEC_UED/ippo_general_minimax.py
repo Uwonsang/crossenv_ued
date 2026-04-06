@@ -312,14 +312,13 @@ def make_train(config, update_step=0):
     plr_mgr = PLRManager(
         example_level=sample_layout_reset_all(jax.random.PRNGKey(0)),
         ued_score=plr_ued_score,
-        replay_prob=float(config["PLR_REPLAY_PROB"]),
-        buffer_size=int(config["PLR_BUFFER_SIZE"]),
-        staleness_coef=float(config["PLR_STALENESS_COEF"]),
-        temp=float(config["PLR_TEMP"]),
-        min_fill_ratio=float(config["PLR_MIN_FILL_RATIO"]),
-        use_score_ranks=bool(config["PLR_USE_SCORE_RANKS"]),
-        use_robust_plr=bool(config["PLR_USE_ROBUST_PLR"]),
-        use_parallel_eval=False,
+        replay_prob=config["PLR_REPLAY_PROB"],
+        buffer_size=config["PLR_BUFFER_SIZE"],
+        staleness_coef=config["PLR_STALENESS_COEF"],
+        temp=config["PLR_TEMP"],
+        min_fill_ratio=config["PLR_MIN_FILL_RATIO"],
+        use_score_ranks=config["PLR_USE_SCORE_RANKS"],
+        use_robust_plr=config["PLR_USE_ROBUST_PLR"],
         comparator_fn=None,
         n_devices=1,
     )
@@ -385,17 +384,17 @@ def make_train(config, update_step=0):
             )
             return obs, st
 
-        # INIT ENV
+        # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
         plr_buffer = plr_mgr.reset()
-        rng, r1, r2, r3 = jax.random.split(_rng, 4)
+        rng, rng_samp, rng_plr, rng_reset = jax.random.split(_rng, 4)
         new_levels = jax.vmap(sample_layout_reset_all)(
-            jax.random.split(r1, config["NUM_ENVS"])
+            jax.random.split(rng_samp, config["NUM_ENVS"])
         )
         levels, _, _, plr_buffer = plr_mgr.sample(
-            r2, plr_buffer, new_levels, config["NUM_ENVS"]
+            rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=False
         )
-        reset_rng = jax.random.split(r3, config["NUM_ENVS"])
+        reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, levels)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
@@ -404,7 +403,7 @@ def make_train(config, update_step=0):
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
-            (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer) = runner_state
+            (train_state, _env_state, _last_obs, _last_done, hstate, rng, plr_buffer) = runner_state
             initial_hstate = hstate
 
             # PLR SAMPLE #TODO: when sample new levels, but not until env max_step

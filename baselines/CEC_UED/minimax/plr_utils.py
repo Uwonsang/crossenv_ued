@@ -10,10 +10,7 @@ from jaxmarl.environments.overcooked.layouts import (
 from collections import namedtuple
 from .ued_scores import (
     UEDScore,
-    compute_episodic_stats,
-    compute_max_mc,
-    compute_ued_scores_no_vmap,
-    plr_flatten_scores_to_env,
+    _compute_ued_scores,
 )
 PLRUEDBatch = namedtuple("PLRUEDBatch", ["rewards", "dones", "values", "advantages"])
 MAX_WALL_IDX_LEN = 75
@@ -54,19 +51,18 @@ def plr_batch_from_traj(traj_batch, advantages, num_steps, num_agents, num_envs)
     v_all = traj_batch.value.reshape(num_steps, num_agents, num_envs)
     gd_all = traj_batch.global_done.reshape(num_steps, num_agents, num_envs)
     adv_all = advantages.reshape(num_steps, num_agents, num_envs)
+
     return PLRUEDBatch(
-        rewards=r_all.transpose(1, 0, 2),
-        dones=gd_all.transpose(1, 0, 2),
-        values=v_all.transpose(1, 0, 2),
-        advantages=adv_all.transpose(1, 0, 2),
+        rewards=r_all.transpose(0, 2, 1), # (time, num_envs, num_agents)
+        values=v_all.transpose(0, 2, 1), # (time, num_envs, num_agents)
+        dones=gd_all.transpose(0, 2, 1), # (time, num_envs, num_agents)
+        advantages=adv_all.transpose(0, 2, 1) # (time, num_envs, num_agents)
     )
 
 
 def plr_ued_scores_and_info(plr_ued_score, batch, plr_buffer, level_idxs, num_envs):
-    """
-    Returns (ued_scores (ne,), update_info: None | {'max_returns': ...}).
-    MAX_MC needs buffer prev max; other scores use _compute_ued_scores only.
-    """
+    info = None
+    prev_max = None
     if plr_ued_score == UEDScore.MAX_MC:
         safe_idx = jnp.maximum(level_idxs, 0)
         prev_max = jnp.where(
@@ -74,13 +70,13 @@ def plr_ued_scores_and_info(plr_ued_score, batch, plr_buffer, level_idxs, num_en
             plr_buffer.max_returns[safe_idx],
             jnp.full((num_envs,), -jnp.inf),
         )
-        mean_scores, _, _ = compute_max_mc(batch, {"max_returns": prev_max})
-        ued_scores = plr_flatten_scores_to_env(mean_scores, num_envs)
-        _, max_ep = compute_episodic_stats(batch.rewards, batch.dones, time_average=False)
-        merged = jnp.maximum(max_ep, prev_max)
-        return ued_scores, {"max_returns": merged}
-    
-    mean_s, _, _ = compute_ued_scores_no_vmap(plr_ued_score, batch, None)
-    ued_scores = plr_flatten_scores_to_env(mean_s, num_envs)
-    
+        info = {"max_returns": prev_max}
+
+    mean_s, _, score_info = _compute_ued_scores(plr_ued_score, batch, info)
+    ued_scores = jnp.ravel(jnp.asarray(mean_s))
+
+    if plr_ued_score == UEDScore.MAX_MC:
+        merged_max_returns = jnp.maximum(score_info["max_returns"], prev_max)
+        return ued_scores, {"max_returns": merged_max_returns}
+
     return ued_scores, None

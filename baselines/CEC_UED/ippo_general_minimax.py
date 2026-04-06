@@ -411,7 +411,7 @@ def make_train(config, update_step=0):
             new_levels = jax.vmap(sample_layout_reset_all)(
                 jax.random.split(rng_samp, config["NUM_ENVS"]) 
             )
-            levels, level_idxs, _, plr_buffer = plr_mgr.sample(
+            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
                 rng_plr, plr_buffer, new_levels, config["NUM_ENVS"]
             )
             reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
@@ -641,9 +641,42 @@ def make_train(config, update_step=0):
                 targets,
                 rng,
             )
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+
+            def _run_update(update_state):
+                return jax.lax.scan(
+                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
+
+            def _skip_update(update_state):
+                zeros = jnp.zeros(
+                    (config["UPDATE_EPOCHS"], config["NUM_MINIBATCHES"]),
+                    dtype=jnp.float32,
+                )
+                ratio_zeros = jnp.zeros(
+                    (
+                        config["UPDATE_EPOCHS"],
+                        config["NUM_MINIBATCHES"],
+                        config["NUM_STEPS"],
+                        config["NUM_ACTORS"] // config["NUM_MINIBATCHES"],
+                    ),
+                    dtype=jnp.float32,
+                )
+                loss_info = (
+                    zeros,
+                    (zeros, zeros, zeros, ratio_zeros, zeros, zeros),
+                )
+                return update_state, loss_info
+
+            do_update = jnp.logical_or(
+                jnp.logical_not(jnp.array(config["PLR_USE_ROBUST_PLR"])),
+                is_replay)
+
+            update_state, loss_info = jax.lax.cond(
+                do_update,
+                _run_update,
+                _skip_update,
+                update_state,
             )
+
             train_state = update_state[0]
             metric = traj_batch.info
             metric = jax.tree_map(

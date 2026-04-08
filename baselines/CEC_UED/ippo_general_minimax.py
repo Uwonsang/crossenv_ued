@@ -388,15 +388,12 @@ def make_train(config, update_step=0):
         # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
         plr_buffer = plr_mgr.reset()
-        rng, rng_samp, rng_plr, rng_reset = jax.random.split(_rng, 4)
+        rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
         new_levels = jax.vmap(sample_layout_reset_all)(
             jax.random.split(rng_samp, config["NUM_ENVS"])
         )
-        levels, _, _, plr_buffer = plr_mgr.sample(
-            rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=False
-        )
         reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, levels)
+        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, new_levels)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
@@ -714,6 +711,15 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
+            plr_batch = plr_batch_from_traj(
+                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
+            
+            ued_scores, update_info = plr_ued_scores_and_info(
+                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
+
+            plr_buffer = plr_mgr.update(
+                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
+
             def callback(metric):
                 wandb.log(
                     {
@@ -737,6 +743,19 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
+
+                if config["PLR_BUFFER_SAVE"]:
+                    plr_save_period = config["NUM_UPDATES"] // 19
+                    if plr_save_period > 0 and (step % plr_save_period == 0):
+                        plr_save_dir = os.path.join(config["filepath"], "plr_buffer")
+                        os.makedirs(plr_save_dir, exist_ok=True)
+                        plr_save_path = os.path.join(plr_save_dir, f"plr_buffer_step_{step:03d}.pkl")
+                        plr_buffer_data = {"levels": {k: np.array(v) for k, v in metric["plr_buffer"].levels.items()}}
+                        with open(plr_save_path, "wb") as f:
+                            pickle.dump({
+                                    "update_step": step,
+                                    "plr_buffer": plr_buffer_data,
+                                },  f)
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -744,18 +763,11 @@ def make_train(config, update_step=0):
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
+                "plr_buffer": plr_buffer,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            plr_batch = plr_batch_from_traj(
-                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
-            
-            ued_scores, update_info = plr_ued_scores_and_info(
-                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
-
-            plr_buffer = plr_mgr.update(
-                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer)
 
             return (runner_state, update_steps), metric
@@ -854,6 +866,7 @@ def main(config):
         model_params = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
+    config["filepath"] = filepath
 
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])

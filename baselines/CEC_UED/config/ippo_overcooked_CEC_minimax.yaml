@@ -2,9 +2,9 @@
 "LR": 3e-4 #checked
 "NUM_ENVS": 512
 "NUM_SEEDS": 1
-"NUM_STEPS": 256 #checked
+"NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
-"GRU_HIDDEN_DIM": 400
+"GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
 "MAX_TRAIN_STEPS": 3e9 #checked
 "UPDATE_EPOCHS": 4 #checked

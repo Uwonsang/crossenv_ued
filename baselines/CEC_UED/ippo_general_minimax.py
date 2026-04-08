@@ -369,21 +369,21 @@ def make_train(config, update_step=0):
             tx=tx,
         )
 
-        def reset_from_layout(key, layout):
-            obs, es = env._env.custom_reset(
+        def reset_from_layout(key, layout_dict):
+            obs, env_state = env._env.custom_reset(
                 key,
                 random_reset=False,
                 shuffle_inv_and_pot=False,
-                layout=layout,
+                layout=layout_dict,
             )
-            st = LogEnvState(
-                es,
+            state = LogEnvState(
+                env_state,
                 jnp.zeros((env.num_agents,)),
                 jnp.zeros((env.num_agents,)),
                 jnp.zeros((env.num_agents,)),
                 jnp.zeros((env.num_agents,)),
             )
-            return obs, st
+            return obs, state
 
         # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
@@ -420,7 +420,7 @@ def make_train(config, update_step=0):
 
             reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
             obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            last_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+            last_done = jnp.ones((config["NUM_ACTORS"]), dtype=bool) # New PLR level starts a fresh episode.
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state

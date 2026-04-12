@@ -37,7 +37,7 @@ class OvercookedVisualizer:
 		return self._render_state(agent_view_size, state, highlight, tile_size)
 
 	def custom_get_frame(self, state, agent_view_size): # add
-		padding = agent_view_size - 1  # agent_view_size is 5, (1 => 9x9) (2 => 11x11)
+		padding = agent_view_size - 2  # agent_view_size is 5, (1 => 9x9) (2 => 11x11)
 		grid = np.asarray(state.maze_map[padding:-padding, padding:-padding, :])
 		# Render the state
 		frame = OvercookedVisualizer._render_grid(
@@ -226,6 +226,8 @@ class OvercookedVisualizer:
 			rendering.fill_coords(img, tri_fn, COLORS[color])
 		elif obj_type == OBJECT_TO_INDEX['empty']:
 			rendering.fill_coords(img, rendering.point_in_rect(0, 1, 0, 1), COLORS[color])
+		elif obj_type == OBJECT_TO_INDEX['frame']:
+			rendering.fill_coords(img, rendering.point_in_rect(0, 1, 0, 1), COLORS["light_gray"])
 		elif obj_type == OBJECT_TO_INDEX['onion_pile']:
 			rendering.fill_coords(img, rendering.point_in_rect(0, 1, 0, 1), COLORS["grey"])
 			onion_fns = [rendering.point_in_circle(*coord, 0.15) for coord in [(0.5, 0.15), (0.3, 0.4), (0.8, 0.35),

@@ -20,16 +20,27 @@ class LayoutValidationResult:
     onion_count: chex.Array
     plate_count: chex.Array
     goal_count: chex.Array
-
     count_ok: chex.Array
-
+    valid_1: chex.Array   # pot_count <= max_count
+    valid_2: chex.Array   # onion_count <= max_count
+    valid_3: chex.Array   # plate_count <= max_count
+    valid_4: chex.Array   # goal_count <= max_count
+    valid_12: chex.Array
+    valid_13: chex.Array
+    valid_14: chex.Array
+    valid_23: chex.Array
+    valid_24: chex.Array
+    valid_34: chex.Array
+    valid_123: chex.Array
+    valid_124: chex.Array
+    valid_134: chex.Array
+    valid_234: chex.Array
+    valid_all: chex.Array  # pot+onion+plate+goal all <= max_count
     onion_reachable: chex.Array
     plate_reachable: chex.Array
     pot_reachable: chex.Array
     goal_reachable: chex.Array
-
     reachable_ok: chex.Array
-    valid: chex.Array
 
 
 def make_tile_mask(env_map: chex.Array, tile_idx: int) -> chex.Array:
@@ -212,30 +223,53 @@ def is_target_reachable(
     reachable = jnp.any(jnp.logical_and(final_state.flood_count > 0, target_mask))
     return reachable
 
-
-def count_required_objects(env_map: chex.Array, object_to_index: dict):
+def count_required_objects(env_map: chex.Array, object_to_index: dict, max_count: int = 2):
     pot_count = jnp.sum(env_map == object_to_index["pot"])
     onion_count = jnp.sum(env_map == object_to_index["onion_pile"])
     plate_count = jnp.sum(env_map == object_to_index["plate_pile"])
     goal_count = jnp.sum(env_map == object_to_index["goal"])
 
-    count_ok = (
-        (pot_count > 0) &
-        (onion_count > 0) &
-        (plate_count > 0) &
-        (goal_count > 0)
-    )
+    # Baseline presence check: all required objects exist at least once.
+    count_ok = (0 < pot_count) & (0 < onion_count) & (0 < plate_count) & (0 < goal_count)
 
-    return pot_count, onion_count, plate_count, goal_count, count_ok
+    # Max-count constraints (independent from reachability / presence).
+    pot_max_ok = pot_count <= max_count
+    onion_max_ok = onion_count <= max_count
+    plate_max_ok = plate_count <= max_count
+    goal_max_ok = goal_count <= max_count
+
+    return (
+        pot_count,
+        onion_count,
+        plate_count,
+        goal_count,
+        count_ok,
+        pot_max_ok,
+        onion_max_ok,
+        plate_max_ok,
+        goal_max_ok,
+    )
 
 
 def validate_layout(
     maze_map: chex.Array,
     object_to_index: dict,
+    max_count: int = 2,
 ) -> LayoutValidationResult:
-    pot_count, onion_count, plate_count, goal_count, count_ok = count_required_objects(
+    (
+        pot_count,
+        onion_count,
+        plate_count,
+        goal_count,
+        count_ok,
+        pot_max_ok,
+        onion_max_ok,
+        plate_max_ok,
+        goal_max_ok,
+    ) = count_required_objects(
         maze_map,
         object_to_index,
+        max_count,
     )
 
     player_tiles = infer_player_tiles(object_to_index)
@@ -287,14 +321,26 @@ def validate_layout(
         object_to_index,
     )
 
-    reachable_ok = (
-        onion_reachable &
-        plate_reachable &
-        pot_reachable &
-        goal_reachable
-    )
+    reachable_ok = onion_reachable & plate_reachable & pot_reachable & goal_reachable
 
-    valid = count_ok & reachable_ok
+    valid_1 = count_ok & reachable_ok & pot_max_ok
+    valid_2 = count_ok & reachable_ok & onion_max_ok
+    valid_3 = count_ok & reachable_ok & plate_max_ok
+    valid_4 = count_ok & reachable_ok & goal_max_ok
+
+    valid_12 = count_ok & reachable_ok & pot_max_ok & onion_max_ok
+    valid_13 = count_ok & reachable_ok & pot_max_ok & plate_max_ok
+    valid_14 = count_ok & reachable_ok & pot_max_ok & goal_max_ok
+    valid_23 = count_ok & reachable_ok & onion_max_ok & plate_max_ok
+    valid_24 = count_ok & reachable_ok & onion_max_ok & goal_max_ok
+    valid_34 = count_ok & reachable_ok & plate_max_ok & goal_max_ok
+
+    valid_123 = count_ok & reachable_ok & pot_max_ok & onion_max_ok & plate_max_ok
+    valid_124 = count_ok & reachable_ok & pot_max_ok & onion_max_ok & goal_max_ok
+    valid_134 = count_ok & reachable_ok & pot_max_ok & plate_max_ok & goal_max_ok
+    valid_234 = count_ok & reachable_ok & onion_max_ok & plate_max_ok & goal_max_ok
+
+    valid_all = count_ok & reachable_ok & pot_max_ok & onion_max_ok & plate_max_ok & goal_max_ok
 
     return LayoutValidationResult(
         pot_count=pot_count,
@@ -302,12 +348,26 @@ def validate_layout(
         plate_count=plate_count,
         goal_count=goal_count,
         count_ok=count_ok,
+        valid_1=valid_1,
+        valid_2=valid_2,
+        valid_3=valid_3,
+        valid_4=valid_4,
+        valid_12=valid_12,
+        valid_13=valid_13,
+        valid_14=valid_14,
+        valid_23=valid_23,
+        valid_24=valid_24,
+        valid_34=valid_34,
+        valid_123=valid_123,
+        valid_124=valid_124,
+        valid_134=valid_134,
+        valid_234=valid_234,
+        valid_all=valid_all,
         onion_reachable=onion_reachable,
         plate_reachable=plate_reachable,
         pot_reachable=pot_reachable,
         goal_reachable=goal_reachable,
-        reachable_ok=reachable_ok,
-        valid=valid,
+        reachable_ok=reachable_ok
     )
 
 

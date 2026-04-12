@@ -1,8 +1,8 @@
-"ENV_NAME": "overcooked_vae"  # ToyCoop or overcooked #checked
+"ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
 "NUM_ENVS": 512
 "NUM_SEEDS": 1
-"NUM_STEPS": 256 #checked
+"NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
@@ -22,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 256
+  "max_steps": 400 #TODO: check this
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -31,7 +31,7 @@
   # overcooked specific kwargs
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
-  "random_reset_fn": "reset_vae"  # reset_all or reset_counter_circuit
+  "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
@@ -54,27 +54,18 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_vae_ippo"
+"PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
-"model_name": "IPPO_CEC_VAE"
-# VAE params
-"VAE_CKPT_PATH": "/app/baselines/CEC_UED/VAE/checkpoints/layout_1e6_coord_ring/lr-20260320-114011/vae_seed0_kl70.pkl"
-"z_dim": 16 # replace with vae config
-"kl_coeff": 5.0
-"entropy_coeff": 0.01
-"use_mean_clipping": False
-"clip_mean_min": -0.5
-"clip_mean_max": 0.5
-"use_std_scaling": False
-"scale_log_std": 4.0
-"scale_std_offset": 1.0
-"gen_hidden_dim": 128
-"use_kl": True
-"use_entropy": False
-"adversary_learning_rate": 0.0005
-"adversary_weight_decay": 0.0001
-"use_grad_clip": False
-"grad_clip_norm": 0.5
-"use_lr_scheduler": False
+"model_name": "IPPO_CEC_minimax"
 "save_frames": False
-"z_list_size": 10
+# Ued params 
+"PLR_UED_SCORE": "MAX_MC"
+"PLR_REPLAY_PROB": 0.5
+"PLR_BUFFER_SIZE": 4000
+"PLR_STALENESS_COEF": 0.3
+"PLR_TEMP": 0.1
+"PLR_USE_SCORE_RANKS": True
+"PLR_MIN_FILL_RATIO": 0.5
+"PLR_USE_ROBUST_PLR": True
+"PLR_FORCE_UNIQUE": True
+"PLR_BUFFER_SAVE": False

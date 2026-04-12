@@ -66,6 +66,17 @@ def parse_args():
             "Names are looked up under runpod/config, paths are used as-is."
         ),
     )
+    parser.add_argument(
+        "--dashboard-mode",
+        type=str,
+        default="all",
+        choices=["all", "leaderboard", "activity", "none"],
+        help=(
+            "Control which UI panels are shown. "
+            "`all`: leaderboard + activity log, `leaderboard`: only table, "
+            "`activity`: only activity log, `none`: hide both."
+        ),
+    )
     args = parser.parse_args()
 
     return args
@@ -415,9 +426,35 @@ def run_single_pod(pod_config, status_dict, pod_id_key, API_KEY, log_queue):
             unregister_pod(pod_id)
 
 
-def generate_dashboard(status_dict, log_queue, max_logs=15):
-    """Generate rich dashboard with status table and log panel"""
-    # Create status table
+def generate_dashboard(
+    status_dict,
+    log_queue,
+    max_logs=15,
+    show_leaderboard=True,
+    show_activity_log=True,
+):
+    """Generate rich dashboard with optional status table + log panel"""
+    log_panel = None
+    if show_activity_log:
+        # Create log panel with recent logs
+        log_lines = list(log_queue)[-max_logs:]  # Get last N logs
+        log_text = "\n".join(log_lines) if log_lines else "[dim]No logs yet...[/dim]"
+        log_panel = Panel(
+            log_text,
+            title="📝 Activity Log",
+            border_style="blue",
+            padding=(1, 2),
+        )
+
+    if not show_leaderboard:
+        return log_panel or Panel(
+            "[dim]Dashboard disabled (leaderboard + activity log hidden).[/dim]",
+            title="RunPod",
+            border_style="dim",
+            padding=(1, 2),
+        )
+
+    # Create status table (leaderboard)
     table = Table(title="RunPod Multi-Process Dashboard", show_header=True, header_style="bold magenta")
     table.add_column("Index", style="cyan", width=6)
     table.add_column("Name", style="green", width=20)
@@ -430,43 +467,35 @@ def generate_dashboard(status_dict, log_queue, max_logs=15):
 
     for idx in sorted(status_dict.keys()):
         info = status_dict[idx]
-        status = info['status']
-        
+        status = info["status"]
+
         # Status is already emoji-decorated from run_single_pod
         status_colored = status
 
         table.add_row(
             str(idx),
-            info['name'][:19],
-            info['pod_id'][:14] if info['pod_id'] else '-',
+            info["name"][:19],
+            info["pod_id"][:14] if info["pod_id"] else "-",
             status_colored,
-            info.get('progress', '-')[:24],
-            info['runtime'],
-            info['start_time'],
-            info['error'][:19] if info['error'] else '-'
+            info.get("progress", "-")[:24],
+            info["runtime"],
+            info["start_time"],
+            info["error"][:19] if info["error"] else "-",
         )
-    
-    # Create log panel with recent logs
-    log_lines = list(log_queue)[-max_logs:]  # Get last N logs
-    log_text = "\n".join(log_lines) if log_lines else "[dim]No logs yet...[/dim]"
-    log_panel = Panel(
-        log_text,
-        title="📝 Activity Log",
-        border_style="blue",
-        padding=(1, 2)
-    )
 
     # Create layout
-    layout = Layout()
-    layout.split_column(
-        Layout(table, name="status", ratio=2),
-        Layout(log_panel, name="logs", ratio=1)
-    )
+    if show_activity_log and log_panel is not None:
+        layout = Layout()
+        layout.split_column(
+            Layout(table, name="status", ratio=2),
+            Layout(log_panel, name="logs", ratio=1),
+        )
+        return layout
 
-    return layout
+    return table
 
 
-def run_multiple_pods(pod_configs, API_KEY):
+def run_multiple_pods(pod_configs, API_KEY, show_leaderboard=True, show_activity_log=True):
     """Run multiple pods in parallel with dashboard monitoring"""
     manager = Manager()
     status_dict = manager.dict()
@@ -489,13 +518,49 @@ def run_multiple_pods(pod_configs, API_KEY):
     # Monitor with live dashboard - faster refresh for smooth spinner
     interrupted = False
     try:
-        with Live(generate_dashboard(status_dict, log_queue), refresh_per_second=4, console=console) as live:
+        # If both panels are hidden, don't use Rich Live at all.
+        # This makes debugging easier (plain stdout) and avoids UI redirection.
+        if not show_leaderboard and not show_activity_log:
+            console.print("[dim]Dashboard disabled. Streaming activity logs to stdout...[/dim]")
+            last_log_len = 0
             while any(p.is_alive() for p in processes):
-                live.update(generate_dashboard(status_dict, log_queue))
-                time.sleep(0.25)
+                current_logs = list(log_queue)
+                if len(current_logs) > last_log_len:
+                    for line in current_logs[last_log_len:]:
+                        console.print(line)
+                    last_log_len = len(current_logs)
+                time.sleep(0.5)
+        else:
+            with Live(
+                generate_dashboard(
+                    status_dict,
+                    log_queue,
+                    show_leaderboard=show_leaderboard,
+                    show_activity_log=show_activity_log,
+                ),
+                refresh_per_second=4,
+                console=console,
+            ) as live:
+                while any(p.is_alive() for p in processes):
+                    live.update(
+                        generate_dashboard(
+                            status_dict,
+                            log_queue,
+                            show_leaderboard=show_leaderboard,
+                            show_activity_log=show_activity_log,
+                        )
+                    )
+                    time.sleep(0.25)
 
-            # Final update
-            live.update(generate_dashboard(status_dict, log_queue))
+                # Final update
+                live.update(
+                    generate_dashboard(
+                        status_dict,
+                        log_queue,
+                        show_leaderboard=show_leaderboard,
+                        show_activity_log=show_activity_log,
+                    )
+                )
     except KeyboardInterrupt:
         interrupted = True
         console.print("\n[red]⚠️  Interrupted by user (Ctrl+C)[/red]")
@@ -514,8 +579,23 @@ def run_multiple_pods(pod_configs, API_KEY):
     console.print("\n[green]✅ All pods completed![/green]\n")
 
     # Print final summary
-    final_table = generate_dashboard(dict(status_dict), log_queue)
-    console.print(final_table)
+    if not show_leaderboard and not show_activity_log:
+        console.print("[bold cyan]Final status[/bold cyan]")
+        final_status = dict(status_dict)
+        for idx in sorted(final_status.keys()):
+            info = final_status[idx]
+            console.print(
+                f"- [{idx}] {info.get('name','-')}: {info.get('status','-')} "
+                f"(pod_id={info.get('pod_id','-')}, runtime={info.get('runtime','-')}, error={info.get('error','')})"
+            )
+    else:
+        final_table = generate_dashboard(
+            dict(status_dict),
+            log_queue,
+            show_leaderboard=show_leaderboard,
+            show_activity_log=show_activity_log,
+        )
+        console.print(final_table)
 
     # Generate summary statistics
     final_status = dict(status_dict)
@@ -567,8 +647,23 @@ def main(args):
             pod_configs.append(pod_config)
 
     if pod_configs:
-        print(f"Starting {len(pod_configs)} pod(s) with dashboard...")
-        run_multiple_pods(pod_configs, API_KEY)
+        mode = args.dashboard_mode
+        show_leaderboard = mode in ("all", "leaderboard")
+        show_activity_log = mode in ("all", "activity")
+        if show_leaderboard and show_activity_log:
+            print(f"Starting {len(pod_configs)} pod(s) with dashboard...")
+        elif show_leaderboard and not show_activity_log:
+            print(f"Starting {len(pod_configs)} pod(s) with leaderboard only (activity log hidden)...")
+        elif not show_leaderboard and show_activity_log:
+            print(f"Starting {len(pod_configs)} pod(s) with activity-log only (leaderboard hidden)...")
+        else:
+            print(f"Starting {len(pod_configs)} pod(s) with dashboard hidden (no leaderboard, no activity log)...")
+        run_multiple_pods(
+            pod_configs,
+            API_KEY,
+            show_leaderboard=show_leaderboard,
+            show_activity_log=show_activity_log,
+        )
     else:
         print("No valid pod configurations found.")
 
@@ -596,6 +691,10 @@ python runpod/deploy.py --config config.yaml
 
 Multiple pods execution (multi-process with dashboard):
 python runpod/deploy.py --configs config1.yaml config2.yaml config3.yaml
+
+Dashboard UI mode (single arg):
+python runpod/deploy.py --configs config1.yaml config2.yaml --dashboard-mode leaderboard
+  # options: all | leaderboard | activity | none
 
 Direct arguments:
 python runpod/deploy.py --name my-pod --gpu "NVIDIA RTX 2000 Ada Generation" --gpu-count 1

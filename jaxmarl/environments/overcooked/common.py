@@ -20,6 +20,7 @@ OBJECT_TO_INDEX = {
 	"pot": 8,
 	"dish": 9,
 	"agent": 10,
+	"frame": 11,	
 }
 
 
@@ -33,6 +34,7 @@ COLORS = {
     'white' : np.array([255, 255, 255]),
 	'black' : np.array([25, 25, 25]),
 	'orange': np.array([230, 180, 0]),
+	'light_gray' : np.array([150, 150, 150]),
 }
 
 
@@ -46,6 +48,7 @@ COLOR_TO_INDEX = {
     'white' : 6,
 	'black' : 7,
 	'orange': 8,
+	'light_gray' : 9,
 }
 
 
@@ -61,6 +64,7 @@ OBJECT_INDEX_TO_VEC = jnp.array([
 	jnp.array([OBJECT_TO_INDEX['pot'], COLOR_TO_INDEX['black'], 0], dtype=jnp.uint8),
 	jnp.array([OBJECT_TO_INDEX['dish'], COLOR_TO_INDEX["white"], 0], dtype=jnp.uint8),
 	jnp.array([OBJECT_TO_INDEX['agent'], COLOR_TO_INDEX['red'], 0], dtype=jnp.uint8),  					# Default color and direction
+	jnp.array([OBJECT_TO_INDEX['frame'], COLOR_TO_INDEX['light_gray'], 0], dtype=jnp.uint8),
 ])
 
 
@@ -185,16 +189,18 @@ def make_overcooked_map(
 	else:
 		padding = 1
 
-	maze_map_padded = jnp.tile(wall.reshape((1,1,*empty.shape)), (maze_map.shape[0]+2*padding, maze_map.shape[1]+2*padding, 1))
+	frame = jnp.array([OBJECT_TO_INDEX['frame'], COLOR_TO_INDEX["light_gray"], 0], dtype=jnp.uint8)
+	maze_map_padded = jnp.tile(frame.reshape((1,1,*empty.shape)), (maze_map.shape[0]+2*padding, maze_map.shape[1]+2*padding, 1))
+	# maze_map_padded = jnp.tile(wall.reshape((1,1,*empty.shape)), (maze_map.shape[0]+2*padding, maze_map.shape[1]+2*padding, 1))
 	maze_map_padded = maze_map_padded.at[padding:-padding,padding:-padding,:].set(maze_map)
 
 	# Add surrounding walls
 	wall_start = padding-1 # start index for walls
 	wall_end_y = maze_map_padded.shape[0] - wall_start - 1
 	wall_end_x = maze_map_padded.shape[1] - wall_start - 1
-	maze_map_padded = maze_map_padded.at[wall_start,wall_start:wall_end_x+1,:].set(wall) # top
-	maze_map_padded = maze_map_padded.at[wall_end_y,wall_start:wall_end_x+1,:].set(wall) # bottom
-	maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_start,:].set(wall) # left
-	maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_end_x,:].set(wall) # right
+	maze_map_padded = maze_map_padded.at[wall_start,wall_start:wall_end_x+1,:].set(frame) # top
+	maze_map_padded = maze_map_padded.at[wall_end_y,wall_start:wall_end_x+1,:].set(frame) # bottom
+	maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_start,:].set(frame) # left
+	maze_map_padded = maze_map_padded.at[wall_start:wall_end_y+1,wall_end_x,:].set(frame) # right
 
 	return maze_map_padded

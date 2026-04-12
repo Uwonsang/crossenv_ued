@@ -19,7 +19,7 @@ import hydra
 from omegaconf import OmegaConf
 
 import jaxmarl
-from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.wrappers.baselines import LogWrapper, LogEnvState
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
@@ -34,6 +34,14 @@ from flax import struct
 import chex
 import imageio
 
+from minimax import (
+    PLRManager,
+    UEDScore,
+    plr_batch_from_traj,
+    plr_ued_scores_and_info,
+    sample_layout_reset_all,
+    layout_comparator
+)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -301,6 +309,21 @@ def make_train(config, update_step=0):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    plr_ued_score = UEDScore[config["PLR_UED_SCORE"]]
+    plr_mgr = PLRManager(
+        example_level=sample_layout_reset_all(jax.random.PRNGKey(0)),
+        ued_score=plr_ued_score,
+        replay_prob=config["PLR_REPLAY_PROB"],
+        buffer_size=config["PLR_BUFFER_SIZE"],
+        staleness_coef=config["PLR_STALENESS_COEF"],
+        temp=config["PLR_TEMP"],
+        min_fill_ratio=config["PLR_MIN_FILL_RATIO"],
+        use_score_ranks=config["PLR_USE_SCORE_RANKS"],
+        use_robust_plr=config["PLR_USE_ROBUST_PLR"],
+        comparator_fn=layout_comparator if config["PLR_FORCE_UNIQUE"] else None,
+        n_devices=1,
+    )
+
     def linear_schedule(count):
         frac = (
             1.0
@@ -346,10 +369,31 @@ def make_train(config, update_step=0):
             tx=tx,
         )
 
-        # INIT ENV
+        def reset_from_layout(key, layout_dict):
+            obs, env_state = env._env.custom_reset(
+                key,
+                random_reset=False,
+                shuffle_inv_and_pot=False,
+                layout=layout_dict,
+            )
+            state = LogEnvState(
+                env_state,
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+            )
+            return obs, state
+
+        # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+        plr_buffer = plr_mgr.reset()
+        rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
+        new_levels = jax.vmap(sample_layout_reset_all)(
+            jax.random.split(rng_samp, config["NUM_ENVS"])
+        )
+        reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, new_levels)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
@@ -357,6 +401,26 @@ def make_train(config, update_step=0):
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            (train_state, _env_state, _last_obs, _last_done, hstate, rng, plr_buffer) = runner_state
+            initial_hstate = hstate
+
+            # PLR SAMPLE #TODO: when sample new levels, but not until env max_step
+            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
+            new_levels = jax.vmap(sample_layout_reset_all)(
+                jax.random.split(rng_samp, config["NUM_ENVS"]) 
+            )
+            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"]
+            )
+            if config["PLR_FORCE_UNIQUE"]:
+                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
+                    plr_buffer, levels, level_idxs)
+            else:
+                dupe_mask = None
+
+            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
+            last_done = jnp.ones((config["NUM_ACTORS"]), dtype=bool) # New PLR level starts a fresh episode.
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
@@ -364,7 +428,7 @@ def make_train(config, update_step=0):
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}  
+                agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}  
                 agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
                 ac_in = (
                     obs_batch[np.newaxis, :],
@@ -420,9 +484,7 @@ def make_train(config, update_step=0):
                     ),
                 )
 
-            initial_hstate = runner_state[-2]
-            (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
+            runner_state = (train_state, env_state, obsv, last_done, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
@@ -431,7 +493,7 @@ def make_train(config, update_step=0):
             train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-            agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
+            agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
             ac_in = (
                 last_obs_batch[np.newaxis, :],
@@ -583,9 +645,42 @@ def make_train(config, update_step=0):
                 targets,
                 rng,
             )
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+
+            def _run_update(update_state):
+                return jax.lax.scan(
+                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
+
+            def _skip_update(update_state):
+                zeros = jnp.zeros(
+                    (config["UPDATE_EPOCHS"], config["NUM_MINIBATCHES"]),
+                    dtype=jnp.float32,
+                )
+                ratio_zeros = jnp.zeros(
+                    (
+                        config["UPDATE_EPOCHS"],
+                        config["NUM_MINIBATCHES"],
+                        config["NUM_STEPS"],
+                        config["NUM_ACTORS"] // config["NUM_MINIBATCHES"],
+                    ),
+                    dtype=jnp.float32,
+                )
+                loss_info = (
+                    zeros,
+                    (zeros, zeros, zeros, ratio_zeros, zeros, zeros),
+                )
+                return update_state, loss_info
+
+            do_update = jnp.logical_or(
+                jnp.logical_not(jnp.array(config["PLR_USE_ROBUST_PLR"])),
+                is_replay)
+
+            update_state, loss_info = jax.lax.cond(
+                do_update,
+                _run_update,
+                _skip_update,
+                update_state,
             )
+
             train_state = update_state[0]
             metric = traj_batch.info
             metric = jax.tree_map(
@@ -616,6 +711,15 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
+            plr_batch = plr_batch_from_traj(
+                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
+            
+            ued_scores, update_info = plr_ued_scores_and_info(
+                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
+
+            plr_buffer = plr_mgr.update(
+                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
+
             def callback(metric):
                 wandb.log(
                     {
@@ -639,6 +743,19 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
+
+                if config["PLR_BUFFER_SAVE"]:
+                    plr_save_period = config["NUM_UPDATES"] // 19
+                    if plr_save_period > 0 and (step % plr_save_period == 0):
+                        plr_save_dir = os.path.join(config["filepath"], "plr_buffer")
+                        os.makedirs(plr_save_dir, exist_ok=True)
+                        plr_save_path = os.path.join(plr_save_dir, f"plr_buffer_step_{step:03d}.pkl")
+                        plr_buffer_data = {"levels": {k: np.array(v) for k, v in metric["plr_buffer"].levels.items()}}
+                        with open(plr_save_path, "wb") as f:
+                            pickle.dump({
+                                    "update_step": step,
+                                    "plr_buffer": plr_buffer_data,
+                                },  f)
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -646,22 +763,18 @@ def make_train(config, update_step=0):
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
+                "plr_buffer": plr_buffer,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer)
+
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
-        runner_state = (
-            train_state,
-            env_state,
-            obsv,
-            jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
-            init_hstate,
-            _rng,
-        )
+        runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ACTORS"]), dtype=bool), 
+                        init_hstate, _rng, plr_buffer)
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
@@ -670,7 +783,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_minimax")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
@@ -708,7 +821,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
@@ -753,6 +866,7 @@ def main(config):
         model_params = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
+    config["filepath"] = filepath
 
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])

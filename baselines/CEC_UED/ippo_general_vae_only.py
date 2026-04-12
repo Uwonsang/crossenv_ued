@@ -25,15 +25,15 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
+from baselines.CEC_UED.VAE.utils import load_checkpoint
+from baselines.CEC_UED.regret_z_generator import NormalGaussianZ
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -41,7 +41,7 @@ def initialize_environment(config):
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
-    if config["ENV_NAME"] == "overcooked":
+    if "overcooked" in config["ENV_NAME"]:
         def reset_env(key):
             def reset_sub_dict(key, fn):
                 key, subkey = jax.random.split(key)
@@ -134,7 +134,6 @@ class ScannedRNN(nn.Module):
             jax.random.PRNGKey(0), (batch_size, hidden_size)
         )
 
-
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
     config: Dict
@@ -144,7 +143,7 @@ class ActorCriticRNN(nn.Module):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
         if self.config["CONV_NET"]:
-            if self.config["ENV_NAME"] == "overcooked":
+            if "overcooked" in self.config["ENV_NAME"]:
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
@@ -205,7 +204,7 @@ class ActorCriticRNN(nn.Module):
             self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = nn.relu(actor_mean)
-        if self.config["ENV_NAME"] == "overcooked":
+        if "overcooked" in self.config["ENV_NAME"]:
             actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 actor_mean
             )
@@ -228,7 +227,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
         critic = nn.relu(critic)
-        if self.config["ENV_NAME"] == "overcooked":
+        if "overcooked" in self.config["ENV_NAME"]:
             critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
@@ -242,7 +241,6 @@ class ActorCriticRNN(nn.Module):
         )
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
-
 
 class Transition(NamedTuple):
     global_done: jnp.ndarray
@@ -297,9 +295,11 @@ def make_train(config, update_step=0):
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
 
-    obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    rng, _rng1, _rng2 = jax.random.split(jax.random.PRNGKey(0), 3)
+    init_z = jax.random.normal(_rng1, (1, config["ENV_KWARGS"]['vae_config']['latent_dim']))
+    obs, state = env.reset(_rng2, params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"], "z": init_z})
 
-    env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    env = LogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
     def linear_schedule(count):
         frac = (
@@ -312,6 +312,9 @@ def make_train(config, update_step=0):
 
     def train(rng, model_params=None, update_step=0):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+        # Initialize z generator
+        z_gen = NormalGaussianZ(config)
+
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -344,12 +347,32 @@ def make_train(config, update_step=0):
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
-        )
+        )    
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+
+        def _reset_all_envs(rng_key):
+            """Sample a separate z for each env and reset each env with its own z."""
+            key_z, key_env = jax.random.split(rng_key)
+            keys_z = jax.random.split(key_z, config["NUM_ENVS"])
+
+            def _sample_z(k):
+                return z_gen.get_z(k)
+
+            noraml_z = jax.vmap(_sample_z, in_axes=0, out_axes=0)(keys_z) # z_new, z_old (batch_size, z_dim)       
+            keys_env = jax.random.split(key_env, config["NUM_ENVS"])
+
+            def _reset_env(k, z):
+                obsv, env_state = env.reset(k, params={"z": z})
+                return obsv, env_state
+
+            obsv, env_state = jax.vmap(_reset_env, in_axes=(0, 0), out_axes=0)(keys_env, noraml_z)
+
+            return obsv, env_state
+
+        obsv, env_state = _reset_all_envs(_rng)
+        
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
@@ -359,7 +382,7 @@ def make_train(config, update_step=0):
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
+                (train_state, env_state, last_obs, last_done, hstate, rng, update_step) = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -383,7 +406,7 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
+                    env.step_env, in_axes=(0, 0, 0) # not use auto-reset
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
@@ -391,11 +414,36 @@ def make_train(config, update_step=0):
                 
                 # remove shaped rewards
                 del info['shaped_reward']
-
+                
                 filtered_state = {
                     "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
                     "agent_inv": env_state.env_state.agent_inv[0],
                     "maze_map": env_state.env_state.maze_map[0]}
+
+                done_all = done["__all__"]
+                # --- Manually reset only done envs (no auto-reset) ---
+                rng, _rng = jax.random.split(rng)
+                rng_reset = jax.random.split(_rng, config["NUM_ENVS"])
+                #TODO : check the layout of reset, is it reset with after done?
+                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i):
+                    """Reset a single env if its episode is done, otherwise keep as is."""
+                    def do_reset(_):
+                        key_z, key_env = jax.random.split(rng_i)
+                        z_normal_i = z_gen.get_z(key_z)
+
+                        obsv_new_i, env_state_new_i = env.reset(
+                            key_env, params={"z": z_normal_i}
+                        )
+                        return (obsv_new_i, env_state_new_i)
+
+                    def keep(_):
+                        return (obsv_i, env_state_i)
+
+                    return jax.lax.cond(done_i, do_reset, keep, operand=None)
+
+                obsv, env_state = jax.vmap(
+                    _reset_if_done, in_axes=(0, 0, 0, 0), out_axes=(0, 0)
+                )(done_all, rng_reset, obsv, env_state)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -411,24 +459,22 @@ def make_train(config, update_step=0):
                     agent_positions
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
-                return runner_state, (
-                    transition,
-                    FilteredState(
-                        filtered_state["agent_dir_idx"],
-                        filtered_state["agent_inv"],
-                        filtered_state["maze_map"],
-                    ),
-                )
 
-            initial_hstate = runner_state[-2]
+                return runner_state, (transition, FilteredState(**filtered_state))
+
             (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
+            initial_hstate = hstate
+            eval_start_state = (env_state, obsv, done_batch, hstate, rng, update_steps)
+
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
+            (train_state, env_state, last_obs, last_done, hstate, rng, 
+             update_steps) = runner_state
+
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
@@ -619,13 +665,12 @@ def make_train(config, update_step=0):
             def callback(metric):
                 wandb.log(
                     {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
                         "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                         **metric["loss"],
                     }
                 )
+                
                 step = int(metric["update_steps"])
 
                 def save_frames(filtered_state, step, file_path):
@@ -639,18 +684,18 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            
+
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
             }
-            
+
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
@@ -670,7 +715,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_VAE")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
@@ -685,6 +730,9 @@ def main(config):
     elif config['ENV_NAME'] == 'overcooked':
         fcp_prefix = ""
         finetune_appendage = "_improved"
+    elif config['ENV_NAME'] == 'overcooked_vae':
+        fcp_prefix = ""
+        finetune_appendage = "_improved_vae"
     else:
         fcp_prefix = ""
         finetune_appendage = "_improved"
@@ -708,7 +756,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_VAE_only_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
@@ -753,13 +801,25 @@ def main(config):
         model_params = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
+    
+    # load vae decoder params
+    params, ckpt_config = load_checkpoint(config["VAE_CKPT_PATH"])
+    if config["ENV_NAME"] == "overcooked_vae_crop":
+        decoder_params = {"params": params["params"]["Decoder_crop_0"]}
+    else:
+        decoder_params = {"params": params["params"]["Decoder_0"]}
 
+    config["ENV_KWARGS"]["vae_decoder_params"] = decoder_params
+    config["ENV_KWARGS"]["vae_config"] = ckpt_config
+    config["filepath"] = filepath
+    
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
+    rng = train_state[5]
 
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 
@@ -769,9 +829,8 @@ def main(config):
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
+    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
+    print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
 
 if __name__ == "__main__":
     main()

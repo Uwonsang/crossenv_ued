@@ -16,21 +16,33 @@ import time
 
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from map_viz import FilteredState
-from Models.vae import VAE, vae_loss
+from Models.vae import vae_loss, VAE_crop
 from utils import (
     restore_from_obs, 
     split_dataset, 
     DataLoader, 
     concat_images_with_labels, 
     load_h5, 
-    input_processing, 
+    input_processing,
+    input_processing_crop,
     restore_to_26ch
 )
 
+import jax
+import jax.numpy as jnp
+
+import flax.linen as nn
+from flax.linen.initializers import constant, orthogonal
+
+import numpy as np
+import optax
+
+
 def make_train(config, train_data, test_data):
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}/{xpid}"
+    checkpoint_path = f"/app/baselines/CEC_UED/VAE/checkpoints/layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}/crop/{xpid}"
     print(f"Checkpoint path: {checkpoint_path}")
+    
     # for viz
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     agent_view_size = env.agent_view_size
@@ -54,7 +66,7 @@ def make_train(config, train_data, test_data):
     best_recon_wrt_kl = {kl: 1e9 for kl in kl_spectrum}
 
     def train(rng):
-        model = VAE(config)
+        model = VAE_crop(config)
         rng, _rng, _rng_init = jax.random.split(rng, 3)
         params = model.init(_rng, jnp.zeros((1, *input_shape)), _rng_init)
 
@@ -126,7 +138,7 @@ def make_train(config, train_data, test_data):
                 
                 wandb.log({"test_recon_loss": mean_recon, "test_kl_loss": mean_kl}, step=epoch)
 
-                os.makedirs(checkpoint_path, exist_ok=True)
+                os.makedirs(os.path.join(checkpoint_path), exist_ok=True)
                 for kl in best_recon_wrt_kl:
                     if mean_kl < kl and mean_recon < best_recon_wrt_kl[kl]:
                         best_recon_wrt_kl[kl] = mean_recon
@@ -146,7 +158,7 @@ def single_run(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
-    name = f"VAE_layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}_seed{config['SEED']}"
+    name = f"VAE_crop_layout_{config['LAYOUT_DATA_FILE'].replace('.h5', '').split('layout_dataset_')[1]}_seed{config['SEED']}"
     
     wandb.init(
         entity=config["ENTITY"],
@@ -165,8 +177,8 @@ def single_run(config):
     images_train, images_test = split_dataset(
         data["agent_0"], config["VALIDATION_RATIO"])
 
-    processed_train = input_processing(images_train)
-    processed_test = input_processing(images_test)
+    processed_train = input_processing_crop(images_train)
+    processed_test = input_processing_crop(images_test)
 
     train_fn = make_train(config, processed_train, processed_test)
     out = train_fn(rng_train)
@@ -200,8 +212,9 @@ def tune(config):
         data = load_h5(data_path)
         images_train, images_test = split_dataset(data["agent_0"], run_config["VALIDATION_RATIO"])
 
-        processed_train = input_processing(images_train)
-        processed_test  = input_processing(images_test)
+
+        processed_train = input_processing_crop(images_train)
+        processed_test  = input_processing_crop(images_test)
 
         train_fn = make_train(run_config, processed_train, processed_test)
         train_fn(rng_train)

@@ -42,7 +42,17 @@ def sample_layout_reset_all(key):
         mk(make_cramped_room_9x9),
     )
     idx = jax.random.randint(key, (), 0, 5)
-    return jax.lax.switch(idx, branches, key)
+    layout_dict = jax.lax.switch(idx, branches, key)
+    return layout_dict
+
+
+@jax.jit
+def check_heldout_match_overcooked(state, held_out_goal, held_out_wall, held_out_pot):
+    """Return True when a state matches one of held-out layouts."""
+    goal_match = jax.vmap(lambda g_pos: jnp.all(g_pos == state.goal_pos))(held_out_goal)
+    wall_match = jax.vmap(lambda w_map: jnp.all(w_map == state.wall_map))(held_out_wall)
+    pot_match = jax.vmap(lambda p_pos: jnp.all(p_pos == state.pot_pos))(held_out_pot)
+    return jnp.all(jnp.stack([goal_match, wall_match, pot_match], axis=0), axis=0).any()
 
 
 def plr_batch_from_traj(traj_batch, advantages, num_steps, num_agents, num_envs):

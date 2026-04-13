@@ -19,7 +19,7 @@ import hydra
 from omegaconf import OmegaConf
 
 import jaxmarl
-from jaxmarl.wrappers.baselines import LogWrapper, LogEnvState
+from jaxmarl.wrappers.baselines import PLRLogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
@@ -33,10 +33,6 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-
-from minimax import (
-    sample_layout_reset_all
-)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -302,7 +298,7 @@ def make_train(config, update_step=0):
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
-    env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    env = PLRLogWrapper(env, env_params={"random_reset_fn": config["ENV_KWARGS"]["random_reset_fn"]})
 
     def linear_schedule(count):
         frac = (
@@ -349,30 +345,10 @@ def make_train(config, update_step=0):
             tx=tx,
         )
 
-        def reset_from_layout(key, layout_dict):
-            obs, env_state = env._env.custom_reset(
-                key,
-                random_reset=False,
-                shuffle_inv_and_pot=False,
-                layout=layout_dict,
-            )
-            state = LogEnvState(
-                env_state,
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-            )
-            return obs, state
-
         # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
-        rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
-        new_levels = jax.vmap(sample_layout_reset_all)(
-            jax.random.split(rng_samp, config["NUM_ENVS"])
-        )
-        reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, new_levels)
+        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(env.reset_from_layout, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
@@ -380,18 +356,7 @@ def make_train(config, update_step=0):
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
-            (train_state, _env_state, _last_obs, _last_done, hstate, rng) = runner_state
-            initial_hstate = hstate
-
-            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            new_levels = jax.vmap(sample_layout_reset_all)(
-                jax.random.split(rng_samp, config["NUM_ENVS"]) 
-            )
-
-            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            last_done = jnp.ones((config["NUM_ACTORS"]), dtype=bool) # New PLR level starts a fresh episode.
-
+            
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
 
@@ -454,7 +419,9 @@ def make_train(config, update_step=0):
                     ),
                 )
 
-            runner_state = (train_state, env_state, obsv, last_done, hstate, rng, update_steps)
+            (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
+            initial_hstate = hstate
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
@@ -616,8 +583,7 @@ def make_train(config, update_step=0):
                 rng,
             )
 
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
+            update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config["UPDATE_EPOCHS"])
 
             train_state = update_state[0]
             metric = traj_batch.info

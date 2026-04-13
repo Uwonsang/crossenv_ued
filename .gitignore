@@ -183,3 +183,4 @@ baselines/CEC_UED/VAE/checkpoints/*
 baselines/CEC_UED/VAE/img_check_decoder/*
 our_ckpts/*
 viz_results/*
+baselines/CEC_UED/minimax/analysis/buffer_viz/*

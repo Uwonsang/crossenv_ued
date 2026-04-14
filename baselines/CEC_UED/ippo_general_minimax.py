@@ -498,7 +498,7 @@ def make_train(config, update_step=0):
             new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
 
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"])
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=config["PLR_RANDOM"])
 
             reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
             obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
@@ -782,6 +782,24 @@ def make_train(config, update_step=0):
                                     "update_step": step,
                                     "plr_buffer": plr_buffer_data,
                                 },  f)
+
+                if config["PLR_LEVEL_SAVE"]:
+                    sampled_save_dir = os.path.join(config["filepath"], "plr_sampled_levels")
+                    os.makedirs(sampled_save_dir, exist_ok=True)
+                    sampled_save_path = os.path.join(sampled_save_dir, f"sampled_levels_step_{step:03d}.pkl")
+                    sampled_levels_data = {
+                        "levels": {k: np.array(v) for k, v in metric["sampled_levels"].items()},
+                        "level_idxs": np.array(metric["sampled_level_idxs"]),
+                        "is_replay": bool(np.array(metric["is_replay"])),
+                    }
+                    with open(sampled_save_path, "wb") as f:
+                        pickle.dump(
+                            {
+                                "update_step": step,
+                                "sampled": sampled_levels_data,
+                            },
+                            f,
+                        )
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -790,6 +808,9 @@ def make_train(config, update_step=0):
                 **metric,
                 "train_filtered_state": train_filtered_state,
                 "plr_buffer": plr_buffer,
+                "sampled_levels": levels,
+                "sampled_level_idxs": level_idxs,
+                "is_replay": is_replay,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)

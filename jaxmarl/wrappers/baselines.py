@@ -165,7 +165,11 @@ class PLRLogWrapper(JaxMARLWrapper):
             layout=layout,
         )
 
-        if self._env.held_out_goal and self._env.held_out_wall and self._env.held_out_pot:
+        if (
+            self._env.held_out_goal is not None
+            and self._env.held_out_wall is not None
+            and self._env.held_out_pot is not None
+        ):
             key, key_reset = jax.random.split(key)
             is_match = check_heldout_match_overcooked(
                 env_state,

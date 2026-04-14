@@ -40,7 +40,8 @@ from minimax import (
     plr_batch_from_traj,
     plr_ued_scores_and_info,
     sample_layout_reset_all,
-    layout_comparator
+    layout_comparator,
+    check_heldout_match_overcooked
 )
 
 def initialize_environment(config):
@@ -376,6 +377,31 @@ def make_train(config, update_step=0):
                 shuffle_inv_and_pot=False,
                 layout=layout_dict,
             )
+            
+            if (env._env.held_out_goal is not None 
+               and env._env.held_out_wall is not None 
+               and env._env.held_out_pot is not None
+               ):
+
+                key, key_reset = jax.random.split(key)
+                is_match = check_heldout_match_overcooked(
+                    env_state,
+                    env._env.held_out_goal,
+                    env._env.held_out_wall,
+                    env._env.held_out_pot,
+                )
+                
+                def _resample(k):
+                    new_layout = sample_layout_reset_all(k)
+                    return env._env.custom_reset(
+                        k,
+                        random_reset=False,
+                        shuffle_inv_and_pot=False,
+                        layout=new_layout,
+                    )
+                
+                obs, env_state = jax.lax.cond(is_match, _resample, lambda k: (obs, env_state), key_reset)
+            
             state = LogEnvState(
                 env_state,
                 jnp.zeros((env.num_agents,)),
@@ -401,26 +427,6 @@ def make_train(config, update_step=0):
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
-            (train_state, _env_state, _last_obs, _last_done, hstate, rng, plr_buffer) = runner_state
-            initial_hstate = hstate
-
-            # PLR SAMPLE #TODO: when sample new levels, but not until env max_step
-            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            new_levels = jax.vmap(sample_layout_reset_all)(
-                jax.random.split(rng_samp, config["NUM_ENVS"]) 
-            )
-            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"]
-            )
-            if config["PLR_FORCE_UNIQUE"]:
-                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
-                    plr_buffer, levels, level_idxs)
-            else:
-                dupe_mask = None
-
-            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            last_done = jnp.ones((config["NUM_ACTORS"]), dtype=bool) # New PLR level starts a fresh episode.
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
@@ -483,8 +489,28 @@ def make_train(config, update_step=0):
                         filtered_state["maze_map"],
                     ),
                 )
+            
+            (train_state, _env_state, _obsv, _done_batch, hstate, rng, plr_buffer) = runner_state
+            initial_hstate = hstate
 
-            runner_state = (train_state, env_state, obsv, last_done, hstate, rng, update_steps)
+            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
+            rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
+            new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
+
+            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"])
+
+            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
+            done_batch = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+
+            if config["PLR_FORCE_UNIQUE"]:
+                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
+                    plr_buffer, levels, level_idxs)
+            else:
+                dupe_mask = None
+
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
@@ -869,8 +895,8 @@ def main(config):
     config["filepath"] = filepath
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
+    train_fn = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
+    out = train_fn(rng, model_params, final_update_step)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]

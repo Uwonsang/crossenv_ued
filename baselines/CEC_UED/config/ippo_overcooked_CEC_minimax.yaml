@@ -1,12 +1,12 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 512
+"NUM_ENVS": 256
 "NUM_SEEDS": 1
 "NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
-"MAX_TRAIN_STEPS": 3e9 #checked
+"TOTAL_TIMESTEPS": 3e7 #checked #for overcooked : 3e9
+"MAX_TRAIN_STEPS": 3e7 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
@@ -66,6 +66,6 @@
 "PLR_TEMP": 0.1
 "PLR_USE_SCORE_RANKS": True
 "PLR_MIN_FILL_RATIO": 0.5
-"PLR_USE_ROBUST_PLR": True
-"PLR_FORCE_UNIQUE": True
+"PLR_USE_ROBUST_PLR": False
+"PLR_FORCE_UNIQUE": False
 "PLR_BUFFER_SAVE": False

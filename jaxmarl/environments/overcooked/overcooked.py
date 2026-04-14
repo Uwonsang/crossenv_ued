@@ -987,7 +987,7 @@ if __name__ == "__main__":
     import os
 
     env_kwargs = {
-        'layout': overcooked_layouts["reset_coord_ring"],
+        'layout': overcooked_layouts["coord_ring_9"],
         'random_reset': True,
         'max_steps': 256,
         'single_agent': False,

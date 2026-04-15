@@ -34,13 +34,7 @@ import chex
 import imageio
 
 from minimax import (
-    PLRManager,
-    UEDScore,
-    plr_batch_from_traj,
-    plr_ued_scores_and_info,
     sample_layout_reset_all,
-    layout_comparator,
-    check_heldout_match_overcooked
 )
 
 def initialize_environment(config):
@@ -309,21 +303,6 @@ def make_train(config, update_step=0):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
-    plr_ued_score = UEDScore[config["PLR_UED_SCORE"]]
-    plr_mgr = PLRManager(
-        example_level=sample_layout_reset_all(jax.random.PRNGKey(0)),
-        ued_score=plr_ued_score,
-        replay_prob=config["PLR_REPLAY_PROB"],
-        buffer_size=config["PLR_BUFFER_SIZE"],
-        staleness_coef=config["PLR_STALENESS_COEF"],
-        temp=config["PLR_TEMP"],
-        min_fill_ratio=config["PLR_MIN_FILL_RATIO"],
-        use_score_ranks=config["PLR_USE_SCORE_RANKS"],
-        use_robust_plr=config["PLR_USE_ROBUST_PLR"],
-        comparator_fn=layout_comparator if config["PLR_FORCE_UNIQUE"] else None,
-        n_devices=1,
-    )
-
     def linear_schedule(count):
         frac = (
             1.0
@@ -377,30 +356,6 @@ def make_train(config, update_step=0):
                 layout=layout_dict,
             )
             
-            if (env._env.held_out_goal is not None 
-               and env._env.held_out_wall is not None 
-               and env._env.held_out_pot is not None
-               ):
-
-                key, key_reset = jax.random.split(key)
-                is_match = check_heldout_match_overcooked(
-                    env_state,
-                    env._env.held_out_goal,
-                    env._env.held_out_wall,
-                    env._env.held_out_pot,
-                )
-                
-                def _resample(k):
-                    new_layout = sample_layout_reset_all(k)
-                    return env._env.custom_reset(
-                        k,
-                        random_reset=False,
-                        shuffle_inv_and_pot=False,
-                        layout=new_layout,
-                    )
-                
-                obs, env_state = jax.lax.cond(is_match, _resample, lambda k: (obs, env_state), key_reset)
-            
             state = LogEnvState(
                 env_state,
                 jnp.zeros((env.num_agents,)),
@@ -412,7 +367,6 @@ def make_train(config, update_step=0):
 
         # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
-        plr_buffer = plr_mgr.reset()
         rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
         new_levels = jax.vmap(sample_layout_reset_all)(
             jax.random.split(rng_samp, config["NUM_ENVS"])
@@ -452,7 +406,7 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
+                    env.step_env, in_axes=(0, 0, 0)  # no auto-reset
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
@@ -465,6 +419,26 @@ def make_train(config, update_step=0):
                     "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
                     "agent_inv": env_state.env_state.agent_inv[0],
                     "maze_map": env_state.env_state.maze_map[0]}
+
+                # --- Manually reset only done envs (no auto-reset) ---
+                done_all = done["__all__"]
+                rng, rng_samp, rng_reset = jax.random.split(rng, 3)
+                rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
+                new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
+                reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+
+                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, level_i):
+                    def do_reset(_):
+                        return reset_from_layout(rng_i, level_i)
+
+                    def keep(_):
+                        return (obsv_i, env_state_i)
+
+                    return jax.lax.cond(done_i, do_reset, keep, operand=None)
+                
+                obsv, env_state = jax.vmap(
+                    _reset_if_done, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0)
+                )(done_all, reset_rng, obsv, env_state, new_levels)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -489,26 +463,8 @@ def make_train(config, update_step=0):
                     ),
                 )
             
-            (train_state, _env_state, _obsv, _done_batch, hstate, rng, plr_buffer) = runner_state
+            (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
             initial_hstate = hstate
-
-            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
-            new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
-
-            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=config["PLR_RANDOM"])
-
-            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            done_batch = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
-
-            if config["PLR_FORCE_UNIQUE"]:
-                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
-                    plr_buffer, levels, level_idxs)
-            else:
-                dupe_mask = None
-
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
@@ -671,40 +627,7 @@ def make_train(config, update_step=0):
                 rng,
             )
 
-            def _run_update(update_state):
-                return jax.lax.scan(
-                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
-
-            def _skip_update(update_state):
-                zeros = jnp.zeros(
-                    (config["UPDATE_EPOCHS"], config["NUM_MINIBATCHES"]),
-                    dtype=jnp.float32,
-                )
-                ratio_zeros = jnp.zeros(
-                    (
-                        config["UPDATE_EPOCHS"],
-                        config["NUM_MINIBATCHES"],
-                        config["NUM_STEPS"],
-                        config["NUM_ACTORS"] // config["NUM_MINIBATCHES"],
-                    ),
-                    dtype=jnp.float32,
-                )
-                loss_info = (
-                    zeros,
-                    (zeros, zeros, zeros, ratio_zeros, zeros, zeros),
-                )
-                return update_state, loss_info
-
-            do_update = jnp.logical_or(
-                jnp.logical_not(jnp.array(config["PLR_USE_ROBUST_PLR"])),
-                is_replay)
-
-            update_state, loss_info = jax.lax.cond(
-                do_update,
-                _run_update,
-                _skip_update,
-                update_state,
-            )
+            update_state, loss_info = jax.lax.scan(_update_epoch, update_state, None, config["UPDATE_EPOCHS"])
 
             train_state = update_state[0]
             metric = traj_batch.info
@@ -736,15 +659,6 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            plr_batch = plr_batch_from_traj(
-                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
-            
-            ued_scores, update_info = plr_ued_scores_and_info(
-                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
-
-            plr_buffer = plr_mgr.update(
-                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
-
             def callback(metric):
                 wandb.log(
                     {
@@ -768,37 +682,6 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-
-                if config["PLR_BUFFER_SAVE"]:
-                    plr_save_period = config["NUM_UPDATES"] // 19
-                    if plr_save_period > 0 and (step % plr_save_period == 0):
-                        plr_save_dir = os.path.join(config["filepath"], "plr_buffer")
-                        os.makedirs(plr_save_dir, exist_ok=True)
-                        plr_save_path = os.path.join(plr_save_dir, f"plr_buffer_step_{step:03d}.pkl")
-                        plr_buffer_data = {"levels": {k: np.array(v) for k, v in metric["plr_buffer"].levels.items()}}
-                        with open(plr_save_path, "wb") as f:
-                            pickle.dump({
-                                    "update_step": step,
-                                    "plr_buffer": plr_buffer_data,
-                                },  f)
-
-                if config["PLR_LEVEL_SAVE"]:
-                    sampled_save_dir = os.path.join(config["filepath"], "plr_sampled_levels")
-                    os.makedirs(sampled_save_dir, exist_ok=True)
-                    sampled_save_path = os.path.join(sampled_save_dir, f"sampled_levels_step_{step:03d}.pkl")
-                    sampled_levels_data = {
-                        "levels": {k: np.array(v) for k, v in metric["sampled_levels"].items()},
-                        "level_idxs": np.array(metric["sampled_level_idxs"]),
-                        "is_replay": bool(np.array(metric["is_replay"])),
-                    }
-                    with open(sampled_save_path, "wb") as f:
-                        pickle.dump(
-                            {
-                                "update_step": step,
-                                "sampled": sampled_levels_data,
-                            },
-                            f,
-                        )
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -806,21 +689,17 @@ def make_train(config, update_step=0):
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
-                "plr_buffer": plr_buffer,
-                "sampled_levels": levels,
-                "sampled_level_idxs": level_idxs,
-                "is_replay": is_replay,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer)
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
 
             return (runner_state, update_steps), metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (train_state, env_state, obsv, jnp.zeros((config["NUM_ACTORS"]), dtype=bool), 
-                        init_hstate, _rng, plr_buffer)
+                        init_hstate, _rng)
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )

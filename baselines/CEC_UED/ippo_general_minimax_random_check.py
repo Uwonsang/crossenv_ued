@@ -420,25 +420,20 @@ def make_train(config, update_step=0):
                     "agent_inv": env_state.env_state.agent_inv[0],
                     "maze_map": env_state.env_state.maze_map[0]}
 
-                # --- Manually reset only done envs (no auto-reset) ---
-                done_all = done["__all__"]
+                # --- Manually reset done envs only (LogWrapper-like select pattern) ---
+                done_all = done["__all__"]  # (num_envs,)
                 rng, rng_samp, rng_reset = jax.random.split(rng, 3)
                 rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
                 new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
                 reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+                obsv_re, env_state_re = jax.vmap(reset_from_layout)(reset_rng, new_levels)
 
-                def _reset_if_done(done_i, rng_i, obsv_i, env_state_i, level_i):
-                    def do_reset(_):
-                        return reset_from_layout(rng_i, level_i)
+                def _select_reset(new_x, old_x):
+                    mask = done_all.reshape((done_all.shape[0],) + (1,) * (new_x.ndim - 1))
+                    return jnp.where(mask, new_x, old_x)
 
-                    def keep(_):
-                        return (obsv_i, env_state_i)
-
-                    return jax.lax.cond(done_i, do_reset, keep, operand=None)
-                
-                obsv, env_state = jax.vmap(
-                    _reset_if_done, in_axes=(0, 0, 0, 0, 0), out_axes=(0, 0)
-                )(done_all, reset_rng, obsv, env_state, new_levels)
+                obsv = jax.tree_map(_select_reset, obsv_re, obsv)
+                env_state = jax.tree_map(_select_reset, env_state_re, env_state)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()

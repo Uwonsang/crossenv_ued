@@ -433,7 +433,8 @@ def make_train(config, update_step=0):
                     return jnp.where(mask, new_x, old_x)
 
                 obsv = jax.tree_map(_select_reset, obsv_re, obsv)
-                env_state = jax.tree_map(_select_reset, env_state_re, env_state)
+                inner_env_state = jax.tree_map(_select_reset, env_state_re.env_state, env_state.env_state)
+                env_state = env_state.replace(env_state=inner_env_state)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()

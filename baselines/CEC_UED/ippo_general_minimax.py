@@ -25,7 +25,6 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
@@ -453,19 +452,33 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
+                    env.step_env, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
                 reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
-                
-                # remove shaped rewards
                 del info['shaped_reward']
 
                 filtered_state = {
                     "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
                     "agent_inv": env_state.env_state.agent_inv[0],
                     "maze_map": env_state.env_state.maze_map[0]}
+
+                # --- Manually reset done envs with random new levels ---
+                done_all = done["__all__"]
+                rng, rng_samp, rng_reset = jax.random.split(rng, 3)
+                rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
+                random_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
+                reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+                obsv_re, env_state_re = jax.vmap(reset_from_layout)(reset_rng, random_levels)
+
+                def _select_reset(new_x, old_x):
+                    mask = done_all.reshape((done_all.shape[0],) + (1,) * (new_x.ndim - 1))
+                    return jnp.where(mask, new_x, old_x)
+
+                obsv = jax.tree_map(_select_reset, obsv_re, obsv)
+                new_inner = jax.tree_map(_select_reset, env_state_re.env_state, env_state.env_state)
+                env_state = env_state.replace(env_state=new_inner)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -489,27 +502,28 @@ def make_train(config, update_step=0):
                         filtered_state["maze_map"],
                     ),
                 )
-            
-            (train_state, _env_state, _obsv, _done_batch, hstate, rng, plr_buffer) = runner_state
+
+            (train_state, env_state, obsv, done_batch, hstate, rng, plr_buffer) = runner_state
             initial_hstate = hstate
 
+            # --- PLR: sample levels and reset all envs at start of rollout ---
             rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
-            new_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
-
+            new_levels = jax.vmap(sample_layout_reset_all)(
+                jax.random.split(rng_samp, config["NUM_ENVS"])
+            )
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
                 rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=config["PLR_RANDOM"])
-
-            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            done_batch = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
-
+            
             if config["PLR_FORCE_UNIQUE"]:
                 level_idxs, dupe_mask = plr_mgr.dedupe_levels(
                     plr_buffer, levels, level_idxs)
             else:
                 dupe_mask = None
-
+            
+            reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, levels)
+            done_batch = jnp.ones((config["NUM_ACTORS"],), dtype=bool)
+            
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]

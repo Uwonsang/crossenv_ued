@@ -13,7 +13,7 @@ from .ued_scores import (
     _compute_ued_scores,
 )
 PLRUEDBatch = namedtuple("PLRUEDBatch", ["rewards", "dones", "values", "advantages"])
-MAX_WALL_IDX_LEN = 75
+MAX_WALL_IDX_LEN = 81
 
 
 def pad_wall_idx(layout, max_len: int = MAX_WALL_IDX_LEN):
@@ -23,8 +23,8 @@ def pad_wall_idx(layout, max_len: int = MAX_WALL_IDX_LEN):
     return layout.copy({"wall_idx": padded})
 
 
-@jax.jit
-def sample_layout_reset_all(key):
+def _sample_one_layout(key):
+    """Sample a single random layout (no held-out filtering)."""
 
     def mk(fn):
         def f(k):
@@ -42,8 +42,46 @@ def sample_layout_reset_all(key):
         mk(make_cramped_room_9x9),
     )
     idx = jax.random.randint(key, (), 0, 5)
-    layout_dict = jax.lax.switch(idx, branches, key)
-    return layout_dict
+    return jax.lax.switch(idx, branches, key)
+
+
+def sample_layout_reset_all(key, held_out_layouts):
+
+    layout = _sample_one_layout(key)
+
+    key, sk = jax.random.split(key)
+    is_match = check_layout_against_heldout(
+        layout, held_out_layouts["goal_idx"], held_out_layouts["wall_idx"], held_out_layouts["pot_idx"])
+
+    new_layout = _sample_one_layout(sk)
+    layout = jax.lax.cond(is_match, lambda: new_layout, lambda: layout)
+
+    return layout
+
+@jax.jit
+def check_layout_against_heldout(layout, held_out_goal, held_out_wall, held_out_pot):
+    """Check if a layout dict matches any held-out layout.
+
+    Converts layout dict idx fields to env state format and compares
+    against held_out_goal (N,2,2), held_out_wall (N,h,w), held_out_pot (N,P,2).
+    """
+    h, w = held_out_wall.shape[1], held_out_wall.shape[2]
+
+    goal_idx = layout["goal_idx"]
+    goal_pos = jnp.stack([goal_idx % w, goal_idx // w], axis=-1).astype(jnp.uint32)
+
+    pot_idx = layout["pot_idx"]
+    pot_pos = jnp.stack([pot_idx % w, pot_idx // w], axis=-1).astype(jnp.uint32)
+
+    occupied = jnp.zeros(h * w, dtype=jnp.bool_)
+    for k in ("wall_idx", "onion_pile_idx", "plate_pile_idx", "pot_idx", "goal_idx"):
+        occupied = occupied.at[layout[k]].set(True)
+    wall_map = occupied.reshape(h, w)
+
+    goal_match = jax.vmap(lambda g: jnp.all(g == goal_pos))(held_out_goal)
+    wall_match = jax.vmap(lambda wm: jnp.all(wm == wall_map))(held_out_wall)
+    pot_match = jax.vmap(lambda p: jnp.all(p == pot_pos))(held_out_pot)
+    return jnp.all(jnp.stack([goal_match, wall_match, pot_match], axis=0), axis=0).any()
 
 
 @jax.jit
@@ -93,7 +131,6 @@ def plr_ued_scores_and_info(plr_ued_score, batch, plr_buffer, level_idxs, num_en
 
 def layout_comparator(a, b):
     keys = (
-        "agent_idx",
         "goal_idx",
         "onion_pile_idx",
         "plate_pile_idx",

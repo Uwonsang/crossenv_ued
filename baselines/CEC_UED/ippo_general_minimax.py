@@ -40,7 +40,6 @@ from minimax import (
     plr_ued_scores_and_info,
     sample_layout_reset_all,
     layout_comparator,
-    check_heldout_match_overcooked
 )
 
 def initialize_environment(config):
@@ -309,9 +308,10 @@ def make_train(config, update_step=0):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    ho_layouts = {"goal_idx": env.held_out_goal, "wall_idx": env.held_out_wall, "pot_idx":  env.held_out_pot }
     plr_ued_score = UEDScore[config["PLR_UED_SCORE"]]
     plr_mgr = PLRManager(
-        example_level=sample_layout_reset_all(jax.random.PRNGKey(0)),
+        example_level = sample_layout_reset_all(jax.random.PRNGKey(0), ho_layouts),
         ued_score=plr_ued_score,
         replay_prob=config["PLR_REPLAY_PROB"],
         buffer_size=config["PLR_BUFFER_SIZE"],
@@ -376,31 +376,7 @@ def make_train(config, update_step=0):
                 shuffle_inv_and_pot=False,
                 layout=layout_dict,
             )
-            
-            if (env._env.held_out_goal is not None 
-               and env._env.held_out_wall is not None 
-               and env._env.held_out_pot is not None
-               ):
 
-                key, key_reset = jax.random.split(key)
-                is_match = check_heldout_match_overcooked(
-                    env_state,
-                    env._env.held_out_goal,
-                    env._env.held_out_wall,
-                    env._env.held_out_pot,
-                )
-                
-                def _resample(k):
-                    new_layout = sample_layout_reset_all(k)
-                    return env._env.custom_reset(
-                        k,
-                        random_reset=False,
-                        shuffle_inv_and_pot=False,
-                        layout=new_layout,
-                    )
-                
-                obs, env_state = jax.lax.cond(is_match, _resample, lambda k: (obs, env_state), key_reset)
-            
             state = LogEnvState(
                 env_state,
                 jnp.zeros((env.num_agents,)),
@@ -414,8 +390,8 @@ def make_train(config, update_step=0):
         rng, _rng = jax.random.split(rng)
         plr_buffer = plr_mgr.reset()
         rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
-        new_levels = jax.vmap(sample_layout_reset_all)(
-            jax.random.split(rng_samp, config["NUM_ENVS"])
+        new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
+            jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts
         )
         reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, new_levels)
@@ -506,9 +482,8 @@ def make_train(config, update_step=0):
 
             # --- PLR: sample levels and reset all envs at start of rollout ---
             rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            new_levels = jax.vmap(sample_layout_reset_all)(
-                jax.random.split(rng_samp, config["NUM_ENVS"])
-            )
+            new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
+            jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts)
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
                 rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=config["PLR_RANDOM"])
             

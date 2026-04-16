@@ -428,7 +428,7 @@ def make_train(config, update_step=0):
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, update_step, levels = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -466,11 +466,9 @@ def make_train(config, update_step=0):
 
                 # --- Manually reset done envs with random new levels ---
                 done_all = done["__all__"]
-                rng, rng_samp, rng_reset = jax.random.split(rng, 3)
-                rng_levels = jax.random.split(rng_samp, config["NUM_ENVS"])
-                random_levels = jax.vmap(sample_layout_reset_all)(rng_levels)
+                rng, rng_reset = jax.random.split(rng)
                 reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
-                obsv_re, env_state_re = jax.vmap(reset_from_layout)(reset_rng, random_levels)
+                obsv_re, env_state_re = jax.vmap(reset_from_layout)(reset_rng, levels)
 
                 def _select_reset(new_x, old_x):
                     mask = done_all.reshape((done_all.shape[0],) + (1,) * (new_x.ndim - 1))
@@ -493,7 +491,7 @@ def make_train(config, update_step=0):
                     info,
                     agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, levels)
                 return runner_state, (
                     transition,
                     FilteredState(
@@ -520,17 +518,13 @@ def make_train(config, update_step=0):
             else:
                 dupe_mask = None
             
-            reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, levels)
-            done_batch = jnp.ones((config["NUM_ACTORS"],), dtype=bool)
-            
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps, levels)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, update_steps, levels = runner_state
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}

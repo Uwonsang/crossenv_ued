@@ -53,7 +53,7 @@
 "FCP_KWARGS":
   "train_oracle": True
 "MODEL_PATH": "/app/baselines_model"
-"SAVE_PATH": "/app/baselines/CEC/results/test_general"
+"SAVE_PATH": "/app/baselines/CEC/results/cross_algo"
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"

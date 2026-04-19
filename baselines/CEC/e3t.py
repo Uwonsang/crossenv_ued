@@ -704,7 +704,7 @@ def main(config):
         finetune_filepath = f"{finetune_filepath}/ikFalse"
         fcp_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
         print("Loading fcp checkpoint for finetuning")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{fcp_ckpt_num}_e3t.pkl", "rb") as f:  # need to resume from last checkpoint
+        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_e3t_ckpt{fcp_ckpt_num}.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             # final_update_step = previous_ckpt['final_update_step']
@@ -727,11 +727,11 @@ def main(config):
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/e3t_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

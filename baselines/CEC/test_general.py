@@ -5,6 +5,7 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
+import glob as glob_module
 import pickle
 import jax
 import jax.numpy as jnp
@@ -17,7 +18,6 @@ from flax.training.train_state import TrainState
 import distrax
 import hydra
 from omegaconf import OmegaConf
-import gc
 # from sklearn.manifold import TSNE
 
 import jaxmarl
@@ -29,12 +29,11 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 import imageio
 import matplotlib.pyplot as plt
 
-import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import pandas as pd
 from tqdm import tqdm
+from jax_tqdm import scan_tqdm
 # import tsnex
 
 
@@ -314,14 +313,38 @@ def main(config):
     ##################
     # Load all models for current ckpt id
     ##################
+
+    if config['ENV_NAME'] == "overcooked":
+        from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
+    else:
+        from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
+
+    os.makedirs(config['SAVE_PATH'], exist_ok=True)
+
     param_list = []
     seed_list = []
     iter_range = range(6)
+    def find_model_path(seed):
+        if config["model_name"] == "CEC":
+            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved.pkl"]
+        elif config["model_name"] == "FCP":
+            patterns = [
+                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_improved_fcp_updates22888.pkl",
+            ]
+        elif config["model_name"] == "E3T":
+            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_e3t_updates22888.pkl"]
+        elif config["model_name"] == "IPPO":
+            patterns = [
+                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt19_update22887.pkl"]
+        for pat in patterns:
+            matches = sorted(glob_module.glob(pat))
+            if matches:
+                return matches[-1]
+        return None
+
     for seed in iter_range:
-        load_path = config['MODEL_PATH']
         try:
-            filepath = f"{load_path}/{config['ENV_KWARGS']['layout']}/seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_updates2228.pkl"
-            breakpoint()
+            filepath = find_model_path(seed)
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
@@ -332,7 +355,6 @@ def main(config):
             continue
     if len(param_list) == 0:
         print(f"No models found")
-        print(f"Loading from {load_path}/seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}.pkl")
         exit(0)
     seed_list = jnp.array(seed_list)
 
@@ -345,6 +367,7 @@ def main(config):
     ##################
     # Initialize environment and network
     ##################
+    layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
     network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
@@ -366,6 +389,7 @@ def main(config):
         return (true_seed_1, true_seed_2, rewards, trajectories, init_env_states)
     
     if not config['TEST_KWARGS']['plot']:
+        print("Evaluating pairs saved to csv")
         eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None)))
         eval_pair_res = eval_pair_fn(seed_pairs, seed_list, param_stack)
         true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
@@ -381,10 +405,12 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        # df.to_csv(f"{filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv", index=False)
-        # print(f"Saved data to {filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv")
+        savefile = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results.csv"
+        df.to_csv(savefile, index=False)
+        print(f"Saved data to {savefile}")
     else:
         # iterate over all self play pairs
+        print("Evaluating self play pairs saved to gif")
         for sp_seeds in tqdm(range(len(seed_pairs))):
             seed_val = seed_pairs[sp_seeds]
             seed_0, seed_1 = seed_val[0], seed_val[1]
@@ -475,13 +501,15 @@ def main(config):
                     plt.close()
 
                 # Save as gif with explicit loop parameter and duration
-                # imageio.mimsave(
-                #     f"{filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif",
-                #     frames,
-                #     fps=10,
-                #     loop=0  # 0 means loop forever
-                # )
-                # print(f"Saved gif to {filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif")
+
+                gif_path = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
+                imageio.mimsave(
+                    gif_path,
+                    frames,
+                    fps=10,
+                    loop=0  # 0 means loop forever
+                )
+                print(f"Saved gif to {gif_path}")
 
 if __name__ == "__main__":
     main()

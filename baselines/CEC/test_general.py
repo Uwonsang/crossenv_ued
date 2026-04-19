@@ -148,10 +148,10 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             batch_size, num_envs, flattened_obs_dim = obs.shape
             if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
+                reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
@@ -191,6 +191,7 @@ class ActorCriticRNN(nn.Module):
             # embedding = embedding.reshape((batch_size, num_envs, -1))
             embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
             embedding = nn.relu(embedding)
+        embedding = embedding.reshape((batch_size, num_envs, -1))
 
         #########
         # Actor
@@ -306,59 +307,22 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
     return (trajectories, init_env_states, init_obsvs)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="repro_config", config_name="test_general")
 def main(config):
     config = OmegaConf.to_container(config)
-    if config["FCP"]:
-        fcp_str = "fcp_"
-    else:
-        fcp_str = ""
-    if config["TRAIN_KWARGS"]["finetune"]:
-        finetune_appendage = "_improved_finetune"
-    else:
-        finetune_appendage = "_improved"
-
-    if config['ENV_KWARGS']['partial_obs']:
-        finetune_appendage += "_partial_obs"
-    if not config['LSTM']:
-        finetune_appendage += "_no_lstm"
-
-    if config['ENV_NAME'] == "overcooked":
-        from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
-    else:
-        from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
-
-    config["ENV_KWARGS"]["shuffle_inv_and_pot"] = False
-    config["ENV_KWARGS"]["check_held_out"] = False
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-        filepath = f'{filepath}/ik{config["TEST_KWARGS"]["ik"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
-    else:
-        filepath = f'{filepath}/ik{config["TEST_KWARGS"]["ik"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
-    # make path if it doesn't exist
-    os.makedirs(filepath, exist_ok=True)
-
-    if config['FCP_KWARGS']['train_oracle'] and config['FCP'] and config['ENV_KWARGS']['incentivize_strat'] == 2:
-        finetune_appendage += '_oracle'
-    if config['ENV_KWARGS']['incentivize_strat'] != 2:
-        finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
 
     ##################
     # Load all models for current ckpt id
     ##################
     param_list = []
     seed_list = []
-
     iter_range = range(6)
     for seed in iter_range:
-        # try:
-        if config["TEST_KWARGS"]["ik"] and config["ENV_NAME"] == "overcooked":  # want to load from ik model if we're testing ik model on overcooked
-            load_path = f"ckpts/ippo/{config['ENV_NAME']}/cramped_room_9/ik{config['TEST_KWARGS']['ik']}/{config['ENV_KWARGS']['random_reset_fn']}/graph{config['GRAPH_NET']}"
-        else:
-            load_path = filepath
+        load_path = config['MODEL_PATH']
         try:
-            with open(f"{load_path}/{fcp_str}seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "rb") as f:
+            filepath = f"{load_path}/{config['ENV_KWARGS']['layout']}/seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_updates2228.pkl"
+            breakpoint()
+            with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
@@ -368,7 +332,7 @@ def main(config):
             continue
     if len(param_list) == 0:
         print(f"No models found")
-        print(f"Loading from {load_path}/{fcp_str}seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl")
+        print(f"Loading from {load_path}/seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}.pkl")
         exit(0)
     seed_list = jnp.array(seed_list)
 
@@ -417,8 +381,8 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        df.to_csv(f"{filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv", index=False)
-        print(f"Saved data to {filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv")
+        # df.to_csv(f"{filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv", index=False)
+        # print(f"Saved data to {filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv")
     else:
         # iterate over all self play pairs
         for sp_seeds in tqdm(range(len(seed_pairs))):
@@ -511,13 +475,13 @@ def main(config):
                     plt.close()
 
                 # Save as gif with explicit loop parameter and duration
-                imageio.mimsave(
-                    f"{filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif",
-                    frames,
-                    fps=10,
-                    loop=0  # 0 means loop forever
-                )
-                print(f"Saved gif to {filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif")
+                # imageio.mimsave(
+                #     f"{filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif",
+                #     frames,
+                #     fps=10,
+                #     loop=0  # 0 means loop forever
+                # )
+                # print(f"Saved gif to {filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif")
 
 if __name__ == "__main__":
     main()

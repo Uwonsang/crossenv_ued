@@ -15,7 +15,7 @@ from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
-from minimax import sample_layout_reset_all, check_heldout_match_overcooked
+from baselines.CEC_UED.minimax import sample_layout_reset_all, check_heldout_match_overcooked
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
     flattened_dict = flatten_dict(params, sep=',')
@@ -152,6 +152,11 @@ class PLRLogWrapper(JaxMARLWrapper):
 
     def __init__(self, env, env_params):
         super().__init__(env)
+        if sample_layout_reset_all is None or check_heldout_match_overcooked is None:
+            raise ModuleNotFoundError(
+                "PLRLogWrapper requires minimax utilities. "
+                "Import `baselines.CEC_UED.minimax` or add `minimax` to PYTHONPATH."
+            )
         self.env_params = env_params
 
     @partial(jax.jit, static_argnums=(0,))

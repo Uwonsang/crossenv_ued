@@ -186,3 +186,4 @@ viz_results/*
 baselines/CEC_UED/minimax/analysis/buffer_viz/*
 baselines/CEC_UED/minimax/analysis/sampled_viz/*
 baselines/CEC/results/*
+baselines/CEC/figures/*

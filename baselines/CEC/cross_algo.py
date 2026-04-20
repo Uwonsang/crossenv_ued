@@ -314,8 +314,8 @@ def main(config):
                     df_dict['algo_1'].append(algo_1_name)
                     df_dict['algo_2'].append(algo_2_name)
     df = pd.DataFrame(df_dict)
-    df.to_csv(f"{config['SAVE_PATH']}/cross_algo_eval_onIK.csv", index=False)
-    print(f"Saved data to {config['SAVE_PATH']}/cross_algo_eval_onIK.csv")
+    df.to_csv(f"{config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv", index=False)
+    print(f"Saved data to {config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv")
 
 
 if __name__ == "__main__":

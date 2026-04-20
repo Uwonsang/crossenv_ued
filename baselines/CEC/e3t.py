@@ -679,7 +679,7 @@ def main(config):
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config['ENV_KWARGS']['random_reset_fn']}"
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
     print(f"Working on: \n{filepath}\n")
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

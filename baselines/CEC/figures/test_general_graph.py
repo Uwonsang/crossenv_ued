@@ -50,18 +50,22 @@ def load_grid(results_dir: Path) -> pd.DataFrame:
             continue
         r = df["reward"].astype(float)
         mean_r = float(r.mean())
-        # 시드 쌍 단위로 묶어서 변동성 추정 (중복 행은 평균)
+        # 시드 쌍 단위로 묶어 SEM(standard error of mean) 계산
         if "seed_1" in df.columns and "seed_2" in df.columns:
             g = df.groupby(["seed_1", "seed_2"], as_index=False)["reward"].mean()
-            std_across_pairs = float(g["reward"].std(ddof=1)) if len(g) > 1 else 0.0
+            n_pairs = len(g)
+            std_across_pairs = float(g["reward"].std(ddof=1)) if n_pairs > 1 else 0.0
+            sem_pairs = std_across_pairs / np.sqrt(n_pairs) if n_pairs > 1 else 0.0
         else:
-            std_across_pairs = float(r.std(ddof=1)) if len(r) > 1 else 0.0
+            n_pairs = len(r)
+            std_across_pairs = float(r.std(ddof=1)) if n_pairs > 1 else 0.0
+            sem_pairs = std_across_pairs / np.sqrt(n_pairs) if n_pairs > 1 else 0.0
         rows.append(
             {
                 "algorithm": alg,
                 "map": map_name,
                 "mean_reward": mean_r,
-                "std_pairs": std_across_pairs,
+                "sem_pairs": sem_pairs,
                 "n_rows": len(df),
             }
         )
@@ -92,7 +96,7 @@ def plot_per_map(grid: pd.DataFrame, out_path: Path, title_prefix: str = "") -> 
                 errs.append(0.0)
             else:
                 means.append(row["mean_reward"].iloc[0])
-                errs.append(row["std_pairs"].iloc[0])
+                errs.append(row["sem_pairs"].iloc[0])
         ax.bar(
             x,
             means,
@@ -123,13 +127,13 @@ def plot_per_map(grid: pd.DataFrame, out_path: Path, title_prefix: str = "") -> 
 def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
     overall = (
         grid.groupby("algorithm", as_index=False)
-        .agg(mean_reward=("mean_reward", "mean"), std_maps=("mean_reward", "std"))
+        .agg(mean_reward=("mean_reward", "mean"), std_maps=("mean_reward", "std"), n_maps=("mean_reward", "count"))
         .set_index("algorithm")
         .reindex(ALG_ORDER)
     )
     means = overall["mean_reward"].values.astype(float)
 
-    errs = overall["std_maps"].values.astype(float)
+    errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
@@ -174,7 +178,11 @@ def main():
     pivot.to_csv(out_path / "xp_per_map_table.csv", encoding="utf-8")
     overall_df = (
         grid.groupby("algorithm", as_index=False)
-        .agg(mean_over_maps=("mean_reward", "mean"), std_across_maps=("mean_reward", "std"))
+        .agg(mean_over_maps=("mean_reward", "mean"), std_across_maps=("mean_reward", "std"), n_maps=("mean_reward", "count"))
+    )
+    overall_df["sem_across_maps"] = overall_df["std_across_maps"] / np.sqrt(overall_df["n_maps"])
+    overall_df = (
+        overall_df
         .set_index("algorithm")
         .reindex(ALG_ORDER)
         .reset_index()

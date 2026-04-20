@@ -21,7 +21,7 @@ from omegaconf import OmegaConf
 # from sklearn.manifold import TSNE
 
 import jaxmarl
-from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.wrappers.baselines import LogWrapper, LogEnvState
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
@@ -35,6 +35,26 @@ import pandas as pd
 from tqdm import tqdm
 from jax_tqdm import scan_tqdm
 # import tsnex
+
+
+def _layout_dict_same_rng_as_reset_env(env, key):
+    """Match reset_env() RNG usage so layout dict aligns with held_out_goal/wall/pot rows."""
+    def reset_sub_dict(key, fn):
+        key, subkey = jax.random.split(key)
+        sampled_layout_dict = fn(subkey, ik=True)
+        _, _ = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
+        key, subkey = jax.random.split(key)
+        return sampled_layout_dict, key
+
+    asymm_ld, key = reset_sub_dict(key, make_asymm_advantages_9x9)
+    coord_ring_ld, key = reset_sub_dict(key, make_coord_ring_9x9)
+    counter_circuit_ld, key = reset_sub_dict(key, make_counter_circuit_9x9)
+    forced_coord_ld, key = reset_sub_dict(key, make_forced_coord_9x9)
+    cramped_room_ld, key = reset_sub_dict(key, make_cramped_room_9x9)
+    layout_dicts = [asymm_ld, coord_ring_ld, counter_circuit_ld, forced_coord_ld, cramped_room_ld]
+
+    index = int(jax.random.randint(key, (), minval=0, maxval=5))
+    return layout_dicts[index]
 
 
 def initialize_environment(config):
@@ -86,6 +106,10 @@ def initialize_environment(config):
         ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
         ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
+        eval_held_out_layouts = []
+        for i in range(100):
+            eval_held_out_layouts.append(_layout_dict_same_rng_as_reset_env(env, jax.random.key(i)))
+        config["eval_held_out_layouts"] = eval_held_out_layouts
     if config["ENV_NAME"] == "ToyCoop":
         # Generate 100 held-out states for ToyCoop
         @scan_tqdm(100)
@@ -246,8 +270,7 @@ class ActorCriticRNN(nn.Module):
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
 
-def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
-    
+def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, reset_layout=None):
     def _step(carry, unused):
         train_state_params_1, train_state_params_2, env_state, last_obs, last_done, hstate_1, hstate_2, rng = carry
         
@@ -289,9 +312,21 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
     # Initialize environment and RNN state
     rng = jax.random.PRNGKey(seed)
 
-    def get_rollout(rng, train_state_params_1=model_param_1, train_state_params_2=model_param_2, env=env, config=config):
+    def get_rollout(rng, train_state_params_1=model_param_1, train_state_params_2=model_param_2, env=env, config=config, reset_layout=reset_layout):
         rng, _rng = jax.random.split(rng)
-        obsv, env_state = env.reset(_rng)
+        if reset_layout is not None:
+            obsv, inner = env._env.custom_reset(
+                _rng, random_reset=False, shuffle_inv_and_pot=False, layout=reset_layout
+            )
+            env_state = LogEnvState(
+                inner,
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+            )
+        else:
+            obsv, env_state = env.reset(_rng)
         init_hstate_1 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
         init_hstate_2 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
         done_batch = jnp.zeros(env.num_agents, dtype=bool)
@@ -377,12 +412,14 @@ def main(config):
     # Evaluate pairs
     ##################
     @jax.jit
-    def eval_pair(seed_pair, seed_list, param_stack, config=config, env=env, network=network):
+    def eval_pair(seed_pair, seed_list, param_stack, reset_layout, config=config, env=env, network=network):
         seed_1, seed_2 = seed_pair[0], seed_pair[1]
         param_1 = jax.tree_map(lambda x: x[seed_1], param_stack)
         param_2 = jax.tree_map(lambda x: x[seed_2], param_stack)
 
-        (trajectories, init_env_states, init_obsvs) = get_rollouts(param_1, param_2, config, env, network)
+        (trajectories, init_env_states, init_obsvs) = get_rollouts(
+            param_1, param_2, config, env, network, reset_layout=reset_layout
+        )
         rewards = trajectories[4]['agent_0'].sum(axis=1)  # axis 1 is originally each timestep in a single trajectory, want cumulative reward by end
         true_seed_1 = seed_list[seed_1]
         true_seed_2 = seed_list[seed_2]
@@ -390,21 +427,24 @@ def main(config):
     
     if not config['TEST_KWARGS']['plot']:
         print("Evaluating pairs saved to csv")
-        eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None)))
-        eval_pair_res = eval_pair_fn(seed_pairs, seed_list, param_stack)
-        true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
-        ##################
-        # Save data
-        ##################
-        df_dict = {'seed_1': [], 'seed_2': [], 'reward': []}
-        for i in tqdm(range(len(true_seed_1))):
-            seed_1, seed_2 = true_seed_1[i], true_seed_2[i]
-            for j in range(rewards.shape[1]):
-                reward = rewards[i][j]
-                df_dict['seed_1'].append(seed_1)
-                df_dict['seed_2'].append(seed_2)
-                df_dict['reward'].append(reward)
-        df = pd.DataFrame(df_dict)
+        eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None, None)))
+        
+        df_parts = []
+        for hi in tqdm(range(len(config["eval_held_out_layouts"])), desc="held_out layouts"):
+            reset_layout = config["eval_held_out_layouts"][hi] if hi is not None else None
+            eval_pair_res = eval_pair_fn(seed_pairs, seed_list, param_stack, reset_layout)
+            true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
+            df_dict = {'seed_1': [], 'seed_2': [], 'reward': [], 'held_out_layout_idx': []}
+            for i in range(len(true_seed_1)):
+                seed_1, seed_2 = true_seed_1[i], true_seed_2[i]
+                for j in range(rewards.shape[1]):
+                    reward = rewards[i][j]
+                    df_dict['seed_1'].append(int(seed_1))
+                    df_dict['seed_2'].append(int(seed_2))
+                    df_dict['reward'].append(float(reward))
+                    df_dict['held_out_layout_idx'].append(int(hi))
+            df_parts.append(pd.DataFrame(df_dict))
+        df = pd.concat(df_parts, ignore_index=True)
         savefile = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results.csv"
         df.to_csv(savefile, index=False)
         print(f"Saved data to {savefile}")
@@ -415,7 +455,9 @@ def main(config):
             seed_val = seed_pairs[sp_seeds]
             seed_0, seed_1 = seed_val[0], seed_val[1]
 
-            seed_0, seed_1, rewards, trajectories, init_env_states = eval_pair([seed_0, seed_1], seed_list, param_stack)
+            seed_0, seed_1, rewards, trajectories, init_env_states = eval_pair(
+                [seed_0, seed_1], seed_list, param_stack, None
+            )
             all_freq_counts = []
             all_coordinate_embeddings = []
             for traj_num in tqdm(range(config['TEST_KWARGS']['num_trajs'])): 

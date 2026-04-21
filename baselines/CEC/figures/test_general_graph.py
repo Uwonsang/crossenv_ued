@@ -163,7 +163,7 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
 def main():
 
     results_path = Path(__file__).resolve().parent.parent / "results" / "test_general_5"
-    out_path = Path(__file__).resolve().parent / "test_general_graph_5"
+    out_path = Path(__file__).resolve().parent / "results" / "test_general_graph_5"
 
     grid = load_grid(results_path)
 

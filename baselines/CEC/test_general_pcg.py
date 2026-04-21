@@ -33,29 +33,9 @@ import functools
 from jax_tqdm import scan_tqdm
 import pandas as pd
 from tqdm import tqdm
-from jax_tqdm import scan_tqdm
+from baselines.CEC_UED.minimax.plr_utils import pad_wall_idx
+from flax.core import unfreeze
 # import tsnex
-
-
-def _layout_dict_same_rng_as_reset_env(env, key):
-    """Match reset_env() RNG usage so layout dict aligns with held_out_goal/wall/pot rows."""
-    def reset_sub_dict(key, fn):
-        key, subkey = jax.random.split(key)
-        sampled_layout_dict = fn(subkey, ik=True)
-        _, _ = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
-        key, subkey = jax.random.split(key)
-        return sampled_layout_dict, key
-
-    asymm_ld, key = reset_sub_dict(key, make_asymm_advantages_9x9)
-    coord_ring_ld, key = reset_sub_dict(key, make_coord_ring_9x9)
-    counter_circuit_ld, key = reset_sub_dict(key, make_counter_circuit_9x9)
-    forced_coord_ld, key = reset_sub_dict(key, make_forced_coord_9x9)
-    cramped_room_ld, key = reset_sub_dict(key, make_cramped_room_9x9)
-    layout_dicts = [asymm_ld, coord_ring_ld, counter_circuit_ld, forced_coord_ld, cramped_room_ld]
-
-    index = int(jax.random.randint(key, (), minval=0, maxval=5))
-    return layout_dicts[index]
-
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -67,28 +47,38 @@ def initialize_environment(config):
         def reset_env(key):
             def reset_sub_dict(key, fn):
                 key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
+                sampled_layout_dict = fn(subkey)
                 temp_o, temp_s = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
                 key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
+                return (temp_o, temp_s), sampled_layout_dict, key
+
+            def mk(fn):
+                def f(k):
+                    k, sk = jax.random.split(k)
+                    layout = fn(sk, ik=True)
+                    return pad_wall_idx(layout)
+                return f
                 
-            asymm_reset, key = reset_sub_dict(key, make_asymm_advantages_9x9)
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
+            asymm_reset, asymm_layout_dict, key = reset_sub_dict(key, mk(make_asymm_advantages_9x9))
+            coord_ring_reset, coord_ring_layout_dict, key = reset_sub_dict(key, mk(make_coord_ring_9x9))
+            counter_circuit_reset, counter_circuit_layout_dict, key = reset_sub_dict(key, mk(make_counter_circuit_9x9))
+            forced_coord_reset, forced_coord_layout_dict, key = reset_sub_dict(key, mk(make_forced_coord_9x9))
+            cramped_room_reset, cramped_room_layout_dict, key = reset_sub_dict(key, mk(make_cramped_room_9x9))
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
+            layout_dicts = [asymm_layout_dict, coord_ring_layout_dict, counter_circuit_layout_dict, forced_coord_layout_dict, cramped_room_layout_dict]
             # stack all layouts
             stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_dicts = jax.tree_map(lambda *x: jnp.stack(x), *layout_dicts)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
             sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
-            return sampled_reset
+            sampled_layout_dict = jax.tree_map(lambda x: x[index], stacked_layout_dicts)
+            return sampled_reset, sampled_layout_dict
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
             (i,) = runner_state
-            _, ho_state = reset_env(jax.random.key(i))
-            res = (ho_state.goal_pos, ho_state.wall_map, ho_state.pot_pos)
+            (_, ho_state), ho_layout_dict = reset_env(jax.random.key(i))
+            res = (ho_state.goal_pos, ho_state.wall_map, ho_state.pot_pos, ho_layout_dict)
             carry = (i+1,)
             return carry, res
         carry, res = jax.lax.scan(gen_held_out, (0,), jnp.arange(100), 100)
@@ -106,9 +96,10 @@ def initialize_environment(config):
         ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
         ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
-        eval_held_out_layouts = []
-        for i in range(100):
-            eval_held_out_layouts.append(_layout_dict_same_rng_as_reset_env(env, jax.random.key(i)))
+        # Build held-out layout dict as: {held_out_idx: single_layout_dict}
+        eval_held_out_layouts = [
+            jax.tree_map(lambda x, i=i: x[i], res[3]) for i in range(res[3]["agent_idx"].shape[0])
+        ]
         config["eval_held_out_layouts"] = eval_held_out_layouts
     if config["ENV_NAME"] == "ToyCoop":
         # Generate 100 held-out states for ToyCoop
@@ -407,6 +398,8 @@ def main(config):
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
     network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
 
+    stacked_layouts = jax.device_get(config["eval_held_out_layouts"])
+    eval_held_out_layouts = unfreeze(stacked_layouts)
     
     ##################
     # Evaluate pairs
@@ -430,8 +423,7 @@ def main(config):
         eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None, None)))
         
         df_parts = []
-        for hi in tqdm(range(len(config["eval_held_out_layouts"])), desc="held_out layouts"):
-            reset_layout = config["eval_held_out_layouts"][hi] if hi is not None else None
+        for hi, reset_layout in tqdm(enumerate(eval_held_out_layouts), desc="held_out layouts"):
             eval_pair_res = eval_pair_fn(seed_pairs, seed_list, param_stack, reset_layout)
             true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
             df_dict = {'seed_1': [], 'seed_2': [], 'reward': [], 'held_out_layout_idx': []}

@@ -34,6 +34,7 @@ from jaxmarl.environments.overcooked.layouts_rulebased_adv_restricted_layout imp
 
 
 
+
 BASE_REW_SHAPING_PARAMS = {
     "PLACEMENT_IN_POT_REW": 10, # reward for putting ingredients 
     "PLATE_PICKUP_REWARD": 3, # reward for picking up a plate

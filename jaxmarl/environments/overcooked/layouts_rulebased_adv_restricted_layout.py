@@ -643,6 +643,15 @@ WORM_BRANCH_PROBS = jnp.array([
 
 ITEM_COUNTS = jnp.array([2, 2, 3])   # easy, normal, hard
 
+
+GLOBAL_LAYOUT_CONFIG = {
+    "can_extend_carve": False,
+    "worm_steps": 20,
+    "max_worms": 12,
+    "turn_prob": 0.18,
+}
+
+
 def layout_to_skeleton(layout, height=9, width=9):
     orig_h, orig_w = layout.shape
     layout_skeleton = jnp.where(layout == 1, 1, 0).astype(jnp.int32)
@@ -1100,286 +1109,27 @@ def make_coord_ring_9x9(rng, ik=False, num_default_walls=65):
         return make_9x9_layout(rng, layout, rotate=False, num_base_walls=num_default_walls)
 
     def ik_coord_ring(rng, layout=coord_ring_array):
-        # --------------------------------------------------
-        # layout은 원래 5x5 기본 coord_ring
-        # skeleton은 이 기본맵을 9x9 base_layout(전부 wall)에
-        # make_9x9_layout과 같은 방식으로 [:h, :w]에 박아넣어서 시작
-        # --------------------------------------------------
         orig_h, orig_w = layout.shape
-        height, width = 9, 9
 
-        max_worms = 12
-        turn_prob = 0.18
+        skeleton = layout_to_skeleton(layout, height=9, width=9)
 
-        # --------------------------------------------------
-        # helper: seed에서 상하좌우 flood fill
-        # --------------------------------------------------
-        def flood_from_seed(open_mask, seed_idx):
-            sx = seed_idx // width
-            sy = seed_idx % width
-
-            seed_valid = open_mask[sx, sy]
-            reach = jnp.zeros((height, width), dtype=bool).at[sx, sy].set(seed_valid)
-
-            def step_fn(reach, _):
-                up = jnp.pad(reach[1:, :], ((0, 1), (0, 0)))
-                down = jnp.pad(reach[:-1, :], ((1, 0), (0, 0)))
-                left = jnp.pad(reach[:, 1:], ((0, 0), (0, 1)))
-                right = jnp.pad(reach[:, :-1], ((0, 0), (1, 0)))
-                expanded = reach | ((up | down | left | right) & open_mask)
-                return expanded, None
-
-            reach, _ = jax.lax.scan(step_fn, reach, xs=None, length=height * width)
-            return reach
-
-        # --------------------------------------------------
-        # helper: 가장 큰 연결 컴포넌트만 반환
-        # --------------------------------------------------
-        def largest_open_component_mask(open_mask):
-            flat_open = open_mask.reshape(-1)
-            all_idx = jnp.arange(height * width)
-
-            def one_component(idx):
-                comp = flood_from_seed(open_mask, idx)
-                size = jnp.sum(comp.astype(jnp.int32))
-                size = jnp.where(flat_open[idx], size, -1)
-                return comp, size
-
-            comps, sizes = jax.vmap(one_component)(all_idx)
-            best_idx = jnp.argmax(sizes)
-            return comps[best_idx]
-
-        # --------------------------------------------------
-        # 1) 난도 샘플링
-        # --------------------------------------------------
-        rng, r_diff = jax.random.split(rng)
-        difficulty_idx = jax.random.choice(
-            r_diff,
-            jnp.arange(3),
-            p=WORM_DIFFICULTY_PROBS
+        rng, skeleton, difficulty_idx = apply_worm_carving(
+            rng,
+            skeleton,
+            orig_h,
+            orig_w,
+            use_worm=GLOBAL_LAYOUT_CONFIG["use_worm"],
+            worm_steps=GLOBAL_LAYOUT_CONFIG["worm_steps"],
+            max_worms=GLOBAL_LAYOUT_CONFIG["max_worms"],
+            turn_prob=GLOBAL_LAYOUT_CONFIG["turn_prob"],
         )
 
-        worm_init_count = WORM_INIT_COUNTS[difficulty_idx]
-        worm_energy = WORM_ENERGIES[difficulty_idx]
-        worm_separate_enable = WORM_SEPARATE_ENABLES[difficulty_idx].astype(bool)
-        branch_prob = WORM_BRANCH_PROBS[difficulty_idx]
+        rng, modified_layout = place_overcooked_objects(rng, skeleton, difficulty_idx)
 
-        # --------------------------------------------------
-        # 2) 5x5 기본맵 -> 9x9 skeleton으로 확장
-        # 1 = wall, 0 = open
-        # --------------------------------------------------
-        layout_skeleton_5x5 = jnp.where(layout == 1, 1, 0).astype(jnp.int32)
-
-        base_skeleton = jnp.ones((height, width), dtype=jnp.int32)
-        skeleton = base_skeleton.at[:orig_h, :orig_w].set(layout_skeleton_5x5)
-
-        # --------------------------------------------------
-        # 3) worm 시작점: 5x5 원본 영역 내부의 열린 칸들 중에서만 뽑기
-        # --------------------------------------------------
-        inner_open_mask_2d = jnp.zeros((height, width), dtype=bool)
-        inner_open_mask_2d = inner_open_mask_2d.at[:orig_h, :orig_w].set(
-            skeleton[:orig_h, :orig_w] == 0
+        return make_9x9_layout(
+            rng, modified_layout, rotate=True, num_base_walls=num_default_walls
         )
 
-        open_mask = inner_open_mask_2d.reshape(-1)
-        open_logits = jnp.where(open_mask, 0.0, -1e9)
-
-        rng, r_start, r_dir = jax.random.split(rng, 3)
-        start_scores = open_logits + jax.random.gumbel(r_start, open_logits.shape)
-        start_idx = jnp.argsort(start_scores)[-max_worms:]
-        start_x = start_idx // width
-        start_y = start_idx % width
-
-        active = (jnp.arange(max_worms) < worm_init_count)
-        worm_x = start_x
-        worm_y = start_y
-        worm_dir = jax.random.randint(r_dir, shape=(max_worms,), minval=0, maxval=4)
-        worm_e = jnp.where(active, worm_energy, 0)
-
-        # --------------------------------------------------
-        # 4) worm 이동 + 분열
-        # --------------------------------------------------
-        def step_fn(carry, _):
-            skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng = carry
-
-            def worm_body(i, inner_carry):
-                skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng = inner_carry
-                rng, r_turn, r_lr, r_branch, r_branch_lr = jax.random.split(rng, 5)
-
-                is_active = active[i]
-
-                def do_active(_):
-                    x = worm_x[i]
-                    y = worm_y[i]
-                    d = worm_dir[i]
-                    e = worm_e[i]
-
-                    do_turn = jax.random.bernoulli(r_turn, turn_prob)
-                    turn_left = (d + 3) % 4
-                    turn_right = (d + 1) % 4
-                    turned = jax.lax.cond(
-                        jax.random.bernoulli(r_lr, 0.5),
-                        lambda _: turn_left,
-                        lambda _: turn_right,
-                        operand=None
-                    )
-                    nd = jax.lax.cond(do_turn, lambda _: turned, lambda _: d, operand=None)
-
-                    dx = jnp.array([-1, 0, 1, 0])[nd]
-                    dy = jnp.array([0, 1, 0, -1])[nd]
-
-                    nx = x + dx
-                    ny = y + dy
-
-                    # --------------------------------------------------
-                    # 핵심 수정:
-                    # worm은 9x9 전체가 아니라 원본 5x5 layout 범위 안에서만 움직임
-                    # --------------------------------------------------
-                    valid = (nx >= 0) & (nx < orig_h) & (ny >= 0) & (ny < orig_w)
-
-                    can_carve = valid & (skeleton[nx, ny] == 1)
-
-                    skeleton2 = jax.lax.cond(
-                        can_carve,
-                        lambda s: s.at[nx, ny].set(0),
-                        lambda s: s,
-                        skeleton
-                    )
-
-                    new_x = jax.lax.cond(can_carve, lambda _: nx, lambda _: x, operand=None)
-                    new_y = jax.lax.cond(can_carve, lambda _: ny, lambda _: y, operand=None)
-
-                    # 실제 carve 성공했을 때만 에너지 감소
-                    new_e = jax.lax.cond(can_carve, lambda _: e - 1, lambda _: e, operand=None)
-                    still_active = new_e > 0
-
-                    active2 = active.at[i].set(still_active)
-                    worm_x2 = worm_x.at[i].set(new_x)
-                    worm_y2 = worm_y.at[i].set(new_y)
-                    worm_dir2 = worm_dir.at[i].set(nd)
-                    worm_e2 = worm_e.at[i].set(jnp.maximum(new_e, 0))
-
-                    # branch
-                    can_branch = worm_separate_enable & still_active & (new_e >= 3)
-                    do_branch = can_branch & jax.random.bernoulli(r_branch, branch_prob)
-
-                    inactive_mask = ~active2
-                    slot = jnp.argmax(inactive_mask.astype(jnp.int32))
-                    has_slot = jnp.any(inactive_mask)
-
-                    branch_dir = jax.lax.cond(
-                        jax.random.bernoulli(r_branch_lr, 0.5),
-                        lambda _: (nd + 3) % 4,
-                        lambda _: (nd + 1) % 4,
-                        operand=None
-                    )
-                    branch_e = jnp.maximum(new_e // 2, 2)
-
-                    def spawn_branch(args):
-                        active2, worm_x2, worm_y2, worm_dir2, worm_e2 = args
-                        active2 = active2.at[slot].set(True)
-                        worm_x2 = worm_x2.at[slot].set(new_x)
-                        worm_y2 = worm_y2.at[slot].set(new_y)
-                        worm_dir2 = worm_dir2.at[slot].set(branch_dir)
-                        worm_e2 = worm_e2.at[slot].set(branch_e)
-                        return active2, worm_x2, worm_y2, worm_dir2, worm_e2
-
-                    active2, worm_x2, worm_y2, worm_dir2, worm_e2 = jax.lax.cond(
-                        do_branch & has_slot,
-                        spawn_branch,
-                        lambda args: args,
-                        (active2, worm_x2, worm_y2, worm_dir2, worm_e2)
-                    )
-
-                    return skeleton2, active2, worm_x2, worm_y2, worm_dir2, worm_e2, rng
-
-                return jax.lax.cond(
-                    is_active,
-                    do_active,
-                    lambda _: (skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng),
-                    operand=None
-                )
-
-            skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng = jax.lax.fori_loop(
-                0,
-                max_worms,
-                worm_body,
-                (skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng)
-            )
-
-            return (skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng), None
-
-        (skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng), _ = jax.lax.scan(
-            step_fn,
-            (skeleton, active, worm_x, worm_y, worm_dir, worm_e, rng),
-            xs=jnp.arange(20)
-        )
-
-        # --------------------------------------------------
-        # 5) 난도에 따라 아이템 개수 결정
-        # --------------------------------------------------
-        item_count = ITEM_COUNTS[difficulty_idx]
-
-        # --------------------------------------------------
-        # 6) reachable한 가장 큰 연결영역만 사용
-        # --------------------------------------------------
-        open_mask_2d = (skeleton == 0)
-        reachable_floor = largest_open_component_mask(open_mask_2d)
-        reachable_floor_i = reachable_floor.astype(jnp.int32)
-
-        up = jnp.pad(reachable_floor_i[1:, :], ((0, 1), (0, 0)))
-        down = jnp.pad(reachable_floor_i[:-1, :], ((1, 0), (0, 0)))
-        left = jnp.pad(reachable_floor_i[:, 1:], ((0, 0), (0, 1)))
-        right = jnp.pad(reachable_floor_i[:, :-1], ((0, 0), (1, 0)))
-        adj_reachable = up + down + left + right
-
-        counter_mask = ((skeleton == 1) & (adj_reachable >= 1)).reshape(-1)
-        counter_logits = jnp.where(counter_mask, 0.0, -1e9)
-
-        agent_mask = reachable_floor.reshape(-1)
-        agent_logits = jnp.where(agent_mask, 0.0, -1e9)
-
-        rng, r_counter, r_agent = jax.random.split(rng, 3)
-
-        MAX_ITEM_COUNT = 3
-        MAX_TOTAL_ITEM_SLOTS = MAX_ITEM_COUNT * 4
-
-        counter_scores = counter_logits + jax.random.gumbel(r_counter, counter_logits.shape)
-        counter_idx = jnp.argsort(counter_scores)[-MAX_TOTAL_ITEM_SLOTS:]
-        counter_idx = counter_idx.reshape(4, MAX_ITEM_COUNT)
-
-        agent_scores = agent_logits + jax.random.gumbel(r_agent, agent_logits.shape)
-        agent_idx = jnp.argsort(agent_scores)[-2:]
-
-        modified_layout = skeleton
-
-        def set_one(arr, flat_idx, value):
-            x = flat_idx // width
-            y = flat_idx % width
-            return arr.at[x, y].set(value)
-
-        def set_many(arr, flat_indices, value, count):
-            def body(i, a):
-                flat_idx = flat_indices[i]
-                x = flat_idx // width
-                y = flat_idx % width
-                return a.at[x, y].set(value)
-            return jax.lax.fori_loop(0, count, body, arr)
-
-        plate_idx_all = counter_idx[0]
-        onion_idx_all = counter_idx[1]
-        pot_idx_all   = counter_idx[2]
-        goal_idx_all  = counter_idx[3]
-
-        modified_layout = set_many(modified_layout, plate_idx_all, 4, item_count)
-        modified_layout = set_many(modified_layout, onion_idx_all, 5, item_count)
-        modified_layout = set_many(modified_layout, pot_idx_all, 6, item_count)
-        modified_layout = set_many(modified_layout, goal_idx_all, 3, item_count)
-
-        modified_layout = set_one(modified_layout, agent_idx[0], 2)
-        modified_layout = set_one(modified_layout, agent_idx[1], 2)
-
-        return make_9x9_layout(rng, modified_layout, rotate=True, num_base_walls=num_default_walls)
     return jax.lax.cond(ik, ik_coord_ring, default_coord_ring, rng, coord_ring_array)
 
     

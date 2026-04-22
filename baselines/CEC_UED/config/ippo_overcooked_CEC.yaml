@@ -57,3 +57,4 @@
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
 "model_name": "CEC"
+"save_frames": False

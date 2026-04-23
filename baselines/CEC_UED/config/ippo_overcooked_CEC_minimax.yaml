@@ -58,6 +58,17 @@
 "WANDB_MODE" : "disabled"
 "model_name": "IPPO_CEC_minimax"
 "save_frames": False
+"EVAL_KWARGS":
+  "eval_interval": 10
+  "num_envs": 5            
+  "num_steps": 400         
+  "max_steps": 400
+  "random_reset": False    
+  "check_held_out": False  
+  "shuffle_inv_and_pot": False
+  "random_reset_fn": "reset_all" 
+  "beta": 1.0
+  "argmax": False
 # Ued params 
 "PLR_UED_SCORE": "MAX_MC"
 "PLR_REPLAY_PROB": 0.5

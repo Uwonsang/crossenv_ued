@@ -32,6 +32,7 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
 from minimax import (
     PLRManager,
@@ -278,7 +279,6 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
-
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
@@ -307,6 +307,8 @@ def make_train(config, update_step=0):
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+
+    eval_envs = make_eval_envs_overcooked(config)
 
     ho_layouts = {"goal_idx": env.held_out_goal, "wall_idx": env.held_out_wall, "pot_idx":  env.held_out_pot }
     plr_ued_score = UEDScore[config["PLR_UED_SCORE"]]
@@ -720,6 +722,76 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
+            def eval_layout(eval_env, params, eval_rng):
+                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+                num_actors_eval = eval_env.num_agents * num_eval_envs
+
+                eval_rng, reset_rng = jax.random.split(eval_rng)
+                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+                init_hstate = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
+                init_done = jnp.zeros((num_actors_eval,), dtype=bool)
+                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+                runner_state_e = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+                def _eval_step(carry, _):
+                    env_state_e, obs_e, done_e, hstate_e, returns_e, rng_e = carry
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    obs_batch = batchify(obs_e, eval_env.agents, num_actors_eval)
+                    agent_positions = {"agent_0": env_state_e.env_state.agent_pos, "agent_1": env_state_e.env_state.agent_pos}
+                    agent_positions = batchify(agent_positions, eval_env.agents, num_actors_eval)
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        done_e[np.newaxis, :],
+                        agent_positions[np.newaxis, :],
+                    )
+                    hstate_next, pi, _ = network.apply(params, hstate_e, ac_in)
+                    pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
+                    sampled_action = pi.sample(seed=_rng_e)[0]
+                    greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
+                    action = jnp.where(config["EVAL_KWARGS"]["argmax"], greedy_action, sampled_action)
+
+                    env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
+                    env_act = {k: v.squeeze() for k, v in env_act.items()}
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                    obs_next, state_next, reward, done, _info = jax.vmap(
+                        eval_env.step, in_axes=(0, 0, 0)
+                    )(rng_step_e, env_state_e, env_act)
+
+                    done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
+                    returns_next = returns_e + reward["agent_0"]
+                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), None
+
+                runner_state, _ = jax.lax.scan(
+                    _eval_step, runner_state_e, None, int(config["EVAL_KWARGS"]["num_steps"])
+                )
+                state, obs, done, h_state, returns, rng = runner_state
+                return returns.mean()
+
+            run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
+
+            def _do_eval(_):
+                out = {}
+                base = jax.random.fold_in(rng, update_steps)
+                for i, layout_name in enumerate(EVAL_LAYOUTS_9):
+                    out[layout_name] = eval_layout(
+                        eval_envs[layout_name],
+                        train_state.params,
+                        jax.random.fold_in(base, i),
+                    )
+                out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
+                return out
+
+            def _skip_eval(_):
+                out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
+                out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                return out
+
+            metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
+
             plr_batch = plr_batch_from_traj(
                 traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
             
@@ -730,15 +802,19 @@ def make_train(config, update_step=0):
                 plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
 
             def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
-                        **metric["loss"],
-                    }
-                )
+                log_dict = {
+                    # the metrics have an agent dimension, but this is identical
+                    # for all agents so index into the 0th item of that dimension.
+                    "returns": metric["returns"],
+                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    **metric["loss"],
+                }
+                if "eval_returns" in metric:
+                    if np.isfinite(float(metric["eval_returns"]["mean"])):
+                        log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
+                        for _ln in EVAL_LAYOUTS_9:
+                            log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
+                wandb.log(log_dict)
                 step = int(metric["update_steps"])
 
                 def save_frames(filtered_state, step, file_path):

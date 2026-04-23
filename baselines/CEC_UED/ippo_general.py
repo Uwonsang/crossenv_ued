@@ -33,14 +33,7 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-
-EVAL_LAYOUTS_9 = [
-    "cramped_room_9",
-    "asymm_advantages_9",
-    "coord_ring_9",
-    "counter_circuit_9",
-    "forced_coord_9",
-]
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -323,6 +316,17 @@ def make_train(config, update_step=0):
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+
+    if config["save_env_state"]:
+        state_names  = ["agent_dir_idx", "agent_inv", "maze_map"]
+        state_shapes = {k: getattr(state, k).shape for k in state_names}
+        state_dtypes = {k: getattr(state, k).dtype for k in state_names}
+        save_every = int(config["save_env_state_interval"])
+        data_len = (int(config["NUM_UPDATES"]) + save_every - 1) // save_every
+
+        save_path = f"/app/baselines/CEC_UED/dataset/train_env_states.h5"
+        init_hdf5(save_path, state_names, state_shapes, state_dtypes, int(data_len), config["NUM_ENVS"])
+
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
@@ -739,30 +743,19 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"] and (step % config["save_frames_interval"] == 0):
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                    env_state_info = {
-                        "wall_map": np.array(metric["env_state_wall_map"]),
-                        "pot_pos": np.array(metric["env_state_pot_pos"]),
-                        "goal_pos": np.array(metric["env_state_goal_pos"]),
-                    }
-
-                def save_env_state(env_state_info, step, file_path):
-                    os.makedirs(file_path, exist_ok=True)
-                    save_path = os.path.join(file_path, f"step_{step:03}_env_state.pkl")
-                    with open(save_path, "wb") as f:
-                        pickle.dump(env_state_info, f)
-            
+                
                 if config["save_env_state"] and (step % config["save_env_state_interval"] == 0):
-                    save_env_state(env_state_info, step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/env_states")
+                    save_slot = step // int(config["save_env_state_interval"])
+                    arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
+                    save_to_hdf5(save_path, state_names, arrays, save_slot, step)
 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            
+
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
-                "env_state_wall_map": env_state.env_state.wall_map[0],
-                "env_state_pot_pos": env_state.env_state.pot_pos[0],
-                "env_state_goal_pos": env_state.env_state.goal_pos[0],
+                "env_state": env_state,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1

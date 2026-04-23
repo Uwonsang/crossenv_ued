@@ -737,7 +737,7 @@ def make_train(config, update_step=0):
                     save_path = os.path.join(file_path, filename)
                     imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
             
-                if config["save_frames"]:
+                if config["save_frames"] and (step % config["save_frames_interval"] == 0):
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
                 
             metric["returns"] = returns

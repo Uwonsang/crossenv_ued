@@ -2,7 +2,7 @@
 "LR": 3e-4 #checked
 "NUM_ENVS": 256
 "NUM_SEEDS": 1
-"NUM_STEPS": 256 #checked
+"NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
@@ -58,3 +58,15 @@
 "WANDB_MODE" : "disabled"
 "model_name": "CEC"
 "save_frames": False
+"save_frames_interval": 200
+"EVAL_KWARGS":
+  "eval_interval": 10
+  "num_envs": 5            
+  "num_steps": 400         
+  "max_steps": 400
+  "random_reset": False    
+  "check_held_out": False  
+  "shuffle_inv_and_pot": False
+  "random_reset_fn": "reset_all" 
+  "beta": 1.0
+  "argmax": False

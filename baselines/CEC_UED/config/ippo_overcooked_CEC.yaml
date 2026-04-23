@@ -59,6 +59,8 @@
 "model_name": "CEC"
 "save_frames": False
 "save_frames_interval": 200
+"save_env_state": True
+"save_env_state_interval": 10
 "EVAL_KWARGS":
   "eval_interval": 10
   "num_envs": 5            

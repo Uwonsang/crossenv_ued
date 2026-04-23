@@ -739,15 +739,31 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"] and (step % config["save_frames_interval"] == 0):
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                
+                    env_state_info = {
+                        "wall_map": np.array(metric["env_state_wall_map"]),
+                        "pot_pos": np.array(metric["env_state_pot_pos"]),
+                        "goal_pos": np.array(metric["env_state_goal_pos"]),
+                    }
+
+                def save_env_state(env_state_info, step, file_path):
+                    os.makedirs(file_path, exist_ok=True)
+                    save_path = os.path.join(file_path, f"step_{step:03}_env_state.pkl")
+                    with open(save_path, "wb") as f:
+                        pickle.dump(env_state_info, f)
+            
+                if config["save_env_state"] and (step % config["save_env_state_interval"] == 0):
+                    save_env_state(env_state_info, step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/env_states")
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
             
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
+                "env_state_wall_map": env_state.env_state.wall_map[0],
+                "env_state_pot_pos": env_state.env_state.pot_pos[0],
+                "env_state_goal_pos": env_state.env_state.goal_pos[0],
             }
-            
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically

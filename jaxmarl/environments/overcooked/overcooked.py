@@ -20,13 +20,13 @@ from jaxmarl.environments.overcooked.common import (
     DIR_TO_VEC,
     make_overcooked_map)
 # 아래는 layout 생성을 변형한 버전. 원한다면 주석을 풀고 원래 걸로 돌아갈 수 있음
-from jaxmarl.environments.overcooked.layouts_rulebased_adv_restricted_layout import overcooked_layouts as layouts
-from jaxmarl.environments.overcooked.layouts_rulebased_adv_restricted_layout import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9  
-from jaxmarl.environments.overcooked.layouts_rulebased_adv_restricted_layout import single_cramped_room
+# from jaxmarl.environments.overcooked.layouts_worm import overcooked_layouts as layouts
+# from jaxmarl.environments.overcooked.layouts_worm import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9  
+# from jaxmarl.environments.overcooked.layouts_worm import single_cramped_room
 
-# from jaxmarl.environments.overcooked.layouts_rulebased_adv import overcooked_layouts as layouts
-# from jaxmarl.environments.overcooked.layouts_rulebased_adv import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9, #make_coord_ring_custom_ljy_9x9
-# from jaxmarl.environments.overcooked.layouts_rulebased_adv import single_cramped_room
+from jaxmarl.environments.overcooked.layouts_rulebased_adaptive import overcooked_layouts as layouts
+from jaxmarl.environments.overcooked.layouts_rulebased_adaptive import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9 #make_coord_ring_custom_ljy_9x9
+from jaxmarl.environments.overcooked.layouts_rulebased_adaptive import single_cramped_room
 
 # from jaxmarl.environments.overcooked.layouts import overcooked_layouts as layouts
 # from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9 

@@ -1,9 +1,7 @@
 import os
 import h5py
 import numpy as np
-import jaxmarl
-from jaxmarl.environments.overcooked import overcooked_layouts
-from jaxmarl.wrappers.baselines import LogWrapper
+from scipy import ndimage
 
 EVAL_LAYOUTS_9 = [
     "cramped_room_9",
@@ -12,6 +10,24 @@ EVAL_LAYOUTS_9 = [
     "counter_circuit_9",
     "forced_coord_9",
 ]
+
+def classify_layout(maze_map_9x9_ch0: np.ndarray) -> str:
+    passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
+    n_passable = int(passable.sum())
+    _, n_components = ndimage.label(passable)
+
+    if n_passable == 6 and n_components == 1:
+        return "cramped_room_9"
+    elif n_passable == 6 and n_components == 2:
+        return "forced_coord_9"
+    elif n_passable == 8:
+        return "coord_ring_9"
+    elif n_passable == 14 and n_components == 1:
+        return "counter_circuit_9"
+    elif n_passable == 14 and n_components >= 2:
+        return "asymm_advantages_9"
+    return "unknown"
+
 
 def init_hdf5(save_path, field_names, field_shapes, field_dtypes, num_updates, num_envs):
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -39,6 +55,10 @@ def save_to_hdf5(save_path, field_names, arrays, update_idx, update_step):
         f["update_step"][idx] = int(update_step)
 
 def make_eval_envs_overcooked(config):
+    import jaxmarl
+    from jaxmarl.environments.overcooked import overcooked_layouts
+    from jaxmarl.wrappers.baselines import LogWrapper
+    
     if config["ENV_NAME"] != "overcooked":
         return {}
     if "EVAL_KWARGS" not in config:

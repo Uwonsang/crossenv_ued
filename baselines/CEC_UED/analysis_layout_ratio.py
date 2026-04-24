@@ -1,49 +1,7 @@
-"""
-Analyze the ratio of the 5 layout variants in the saved training dataset.
-
-Classification rule (from maze_map channel 0, active 9x9 region rows 4-12, cols 4-12):
-  Passable cells = value==1 (floor) or value==10 (agent)
-
-  passable | connected components | layout
-  ---------|---------------------|------------------
-      6    |          1          | cramped_room
-      6    |          2          | forced_coord
-      8    |          1          | coord_ring
-     14    |          1          | counter_circuit
-     14    |          2          | asymm_advantages
-"""
-
 import h5py
-import numpy as np
-from scipy import ndimage
+from algo_utils import classify_layout, EVAL_LAYOUTS_9
 
 DATA_PATH = "baselines/CEC_UED/dataset/train_env_states.h5"
-
-LAYOUT_NAMES = [
-    "cramped_room",
-    "asymm_advantages",
-    "coord_ring",
-    "counter_circuit",
-    "forced_coord",
-]
-
-def classify_layout(maze_map_9x9_ch0: np.ndarray) -> str:
-    passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
-    n_passable = int(passable.sum())
-    _, n_components = ndimage.label(passable)
-
-    if n_passable == 6 and n_components == 1:
-        return "cramped_room"
-    elif n_passable == 6 and n_components == 2:
-        return "forced_coord"
-    elif n_passable == 8:
-        return "coord_ring"
-    elif n_passable == 14 and n_components == 1:
-        return "counter_circuit"
-    elif n_passable == 14 and n_components >= 2:
-        # asymm_advantages IK variants add 2 "wall holes" that can be isolated,
-        # fragmenting into 2, 3, or 4 components depending on placement
-        return "asymm_advantages"
 
 
 def main():
@@ -58,13 +16,13 @@ def main():
     # Extract active 9x9 area, channel 0
     active = maze_map[:, :, 4:13, 4:13, 0]  # (num_saves, num_envs, 9, 9)
 
-    counts = {name: 0 for name in LAYOUT_NAMES}
+    counts = {name: 0 for name in EVAL_LAYOUTS_9}
     counts["unknown"] = 0
     total = 0
 
     per_step = []
     for s in range(num_saves):
-        step_counts = {name: 0 for name in LAYOUT_NAMES}
+        step_counts = {name: 0 for name in EVAL_LAYOUTS_9}
         step_counts["unknown"] = 0
         for e in range(num_envs):
             label = classify_layout(active[s, e])
@@ -83,7 +41,7 @@ def main():
     print("=" * 50)
     print("Overall layout distribution")
     print("=" * 50)
-    for name in LAYOUT_NAMES + ["unknown"]:
+    for name in EVAL_LAYOUTS_9 + ["unknown"]:
         n = counts[name]
         pct = 100.0 * n / total if total > 0 else 0
         bar = "#" * int(pct / 2)
@@ -94,11 +52,11 @@ def main():
     print("=" * 50)
     print("Per-snapshot breakdown")
     print("=" * 50)
-    header = f"{'step':>8} | " + " | ".join(f"{n[:10]:>10}" for n in LAYOUT_NAMES)
+    header = f"{'step':>8} | " + " | ".join(f"{n[:10]:>10}" for n in EVAL_LAYOUTS_9)
     print(header)
     print("-" * len(header))
     for step, sc in per_step:
-        row = f"{step:>8} | " + " | ".join(f"{sc[n]:>10}" for n in LAYOUT_NAMES)
+        row = f"{step:>8} | " + " | ".join(f"{sc[n]:>10}" for n in EVAL_LAYOUTS_9)
         if sc.get("unknown", 0) > 0:
             row += f" | unknown={sc['unknown']}"
         print(row)

@@ -56,7 +56,7 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
-"model_name": "IPPO_CEC_minimax"
+"model_name": "CEC_minimax"
 "save_frames": False
 "EVAL_KWARGS":
   "eval_interval": 10

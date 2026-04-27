@@ -189,3 +189,4 @@ baselines/CEC/results/*
 baselines/CEC/figures/map_check/*
 baselines/CEC/figures/results/*
 baselines/CEC_UED/dataset/*
+.idea/*

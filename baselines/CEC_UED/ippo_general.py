@@ -272,24 +272,6 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_eval_envs_overcooked(config):
-    if config["ENV_NAME"] != "overcooked":
-        return {}
-
-    allowed = {"max_steps", "random_reset", "check_held_out", "shuffle_inv_and_pot"}
-    base_env_kwargs = {k: v for k, v in config["EVAL_KWARGS"].items() if k in allowed}
-
-    envs = {}
-    for layout_name in EVAL_LAYOUTS_9:
-        env_kwargs = dict(base_env_kwargs)
-        env_kwargs["layout"] = overcooked_layouts[layout_name]
-        base_env = jaxmarl.make(config["ENV_NAME"], **env_kwargs)
-        envs[layout_name] = LogWrapper(
-            base_env,
-            env_params={"random_reset_fn": config["EVAL_KWARGS"]["random_reset_fn"]},
-        )
-    return envs
-
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)

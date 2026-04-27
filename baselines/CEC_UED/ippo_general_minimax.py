@@ -438,9 +438,9 @@ def make_train(config, update_step=0):
                 del info['shaped_reward']
 
                 filtered_state = {
-                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
-                    "agent_inv": env_state.env_state.agent_inv[0],
-                    "maze_map": env_state.env_state.maze_map[0]}
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx,
+                    "agent_inv": env_state.env_state.agent_inv,
+                    "maze_map": env_state.env_state.maze_map}
 
                 # --- Manually reset done envs with random new levels ---
                 done_all = done["__all__"]
@@ -706,6 +706,9 @@ def make_train(config, update_step=0):
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
+            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
+
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -826,6 +829,19 @@ def make_train(config, update_step=0):
                     total = maze_map.shape[0]
                     for name in EVAL_LAYOUTS_9:
                         log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
+                    
+                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
+                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
+                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
+                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
+                    for t in range(ep_done.shape[0]):
+                        for e in range(ep_done.shape[1]):
+                            if ep_done[t, e]:
+                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
+                                layout_returns[label].append(float(ep_rets[t, e]))
+                    for name in EVAL_LAYOUTS_9:
+                        log_dict[f"train_returns/{name}"] = np.mean(layout_returns[name])
+                    
                 wandb.log(log_dict)
                 step = int(metric["update_steps"])
 
@@ -884,6 +900,8 @@ def make_train(config, update_step=0):
                 "sampled_level_idxs": level_idxs,
                 "is_replay": is_replay,
                 "env_state": env_state,
+                "episode_returns_step": episode_returns_step,
+                "episode_done_step": episode_done_step,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)

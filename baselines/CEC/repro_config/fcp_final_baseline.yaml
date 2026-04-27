@@ -1,8 +1,8 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
 "LR": 3e-4
-"NUM_ENVS": 512
+"NUM_ENVS": 256
 "NUM_SEEDS": 1
-"NUM_STEPS": 256
+"NUM_STEPS": 400
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
@@ -54,7 +54,7 @@
   "train_oracle": False
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
+"PROJECT": "crossenv_ued_test"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "FCP"
 # FCP_Paths

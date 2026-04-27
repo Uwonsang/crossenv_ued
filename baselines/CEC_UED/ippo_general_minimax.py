@@ -874,6 +874,7 @@ def make_train(config, update_step=0):
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["env_state"] = env_state
             
             callback_metric = {
                 **metric,
@@ -882,6 +883,7 @@ def make_train(config, update_step=0):
                 "sampled_levels": levels,
                 "sampled_level_idxs": level_idxs,
                 "is_replay": is_replay,
+                "env_state": env_state,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)

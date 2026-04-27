@@ -630,6 +630,9 @@ def make_train(config, update_step=0):
             returns = metric["returned_episode_returns"][:, :, 0][
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
+            # Save before reduction for per-layout return logging in callback
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
+            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
@@ -780,8 +783,8 @@ def make_train(config, update_step=0):
                 **metric,
                 "train_filtered_state": train_filtered_state,
                 "env_state": env_state,
-                "episode_returns_step": metric["returned_episode_returns"][:, :, 0],
-                "episode_done_step": metric["returned_episode"][:, :, 0],
+                "episode_returns_step": episode_returns_step,
+                "episode_done_step": episode_done_step,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1

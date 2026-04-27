@@ -424,9 +424,9 @@ def make_train(config, update_step=0):
                 del info['shaped_reward']
 
                 filtered_state = {
-                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
-                    "agent_inv": env_state.env_state.agent_inv[0],
-                    "maze_map": env_state.env_state.maze_map[0]}
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx,
+                    "agent_inv": env_state.env_state.agent_inv,
+                    "maze_map": env_state.env_state.maze_map}
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()

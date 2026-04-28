@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import wandb
 
 SWEEP_CONFIG = {
-    "method": "bayes",
+    "method": "bayes",   # "grid" | "random" | "bayes"
     "metric": {
         "name": "returns",
         "goal": "maximize",
@@ -31,13 +31,13 @@ SWEEP_CONFIG = {
             "values": [1e-4, 3e-4, 1e-3],
         },
         "VF_COEF": {
-            "values": [0.5, 1.0, 2.0],
+            "values": [0.25, 0.5],
         },
         "NUM_MINIBATCHES": {
-            "values": [2, 4, 8],
+            "values": [4, 8, 16],
         },
         "ENT_COEF": {
-            "values": [0.005, 0.01, 0.02],
+            "values": [0.005, 0.01],
         },
         # nested under ENV_KWARGS — applied manually
         "layout": {
@@ -51,6 +51,7 @@ SWEEP_CONFIG = {
         },
     },
 }
+
 
 # mirrors repro_config/fcp_final_baseline.yaml
 BASE_CONFIG = {

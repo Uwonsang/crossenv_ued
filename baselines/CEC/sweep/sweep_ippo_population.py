@@ -20,7 +20,7 @@ import jax
 import wandb
 
 # ── Sweep configuration ────────────────────────────────────────────────────────
-# W&B sweep params must be flat — nested keys (layout, e3t_beta) are applied
+# W&B sweep params must be flat — nested keys (layout) are applied
 # manually in run_sweep_agent() below.
 SWEEP_CONFIG = {
     "method": "bayes",   # "grid" | "random" | "bayes"
@@ -33,10 +33,10 @@ SWEEP_CONFIG = {
             "values": [1e-4, 3e-4, 1e-3],
         },
         "VF_COEF": {
-            "values": [0.5, 1.0, 2.0],
+            "values": [0.25, 0.5, 1],
         },
         "NUM_MINIBATCHES": {
-            "values": [4, 8],
+            "values": [4, 8, 16],
         },
         "ENT_COEF": {
             "values": [0.005, 0.01],
@@ -51,31 +51,22 @@ SWEEP_CONFIG = {
                 "forced_coord_9",
             ],
         },
-        # FCP (Fictitious Co-Play) on/off
-        "FCP": {
-            "values": [True, False],
-        },
-        # nested under TRAIN_KWARGS — applied manually
-        # 0 = uniform partner, 1 = original probs, >1 = magnify extremes
-        "e3t_beta": {
-            "values": [0.0, 0.3, 0.55, 1.0],
-        },
     },
 }
 
 # ── Base config (mirrors repro_config/ippo_final_baseline.yaml) ───────────────
 BASE_CONFIG = {
     "ENV_NAME": "overcooked",
-    "LR": 3e-4,
+    "LR": 1e-3,
     "NUM_ENVS": 256,
     "NUM_SEEDS": 1,
     "NUM_STEPS": 400,
     "FC_DIM_SIZE": 256,
     "GRU_HIDDEN_DIM": 256,
-    "TOTAL_TIMESTEPS": 3e9,
-    "MAX_TRAIN_STEPS": 3e9,
+    "TOTAL_TIMESTEPS": 5e7,
+    "MAX_TRAIN_STEPS": 5e7,
     "UPDATE_EPOCHS": 4,
-    "NUM_MINIBATCHES": 2,
+    "NUM_MINIBATCHES": 8,
     "GAMMA": 0.99,
     "GAE_LAMBDA": 0.95,
     "CLIP_EPS": 0.2,

@@ -16,7 +16,7 @@ import jax
 import wandb
 
 SWEEP_CONFIG = {
-    "method": "bayes",
+    "method": "bayes",   # "grid" | "random" | "bayes"
     "metric": {
         "name": "returns",
         "goal": "maximize",
@@ -26,16 +26,13 @@ SWEEP_CONFIG = {
             "values": [1e-4, 3e-4, 1e-3],
         },
         "VF_COEF": {
-            "values": [0.5, 1.0, 2.0],
-        },
-        "MOA_COEF": {
-            "values": [0.5, 1.0, 2.0],
+            "values": [0.25, 0.5],
         },
         "NUM_MINIBATCHES": {
-            "values": [2, 4, 8],
+            "values": [4, 8, 16],
         },
         "ENT_COEF": {
-            "values": [0.005, 0.01, 0.02],
+            "values": [0.005, 0.01],
         },
         # nested under ENV_KWARGS — applied manually
         "layout": {
@@ -47,12 +44,9 @@ SWEEP_CONFIG = {
                 "forced_coord_9",
             ],
         },
-        # nested under TRAIN_KWARGS — applied manually
-        "e3t_beta": {
-            "values": [0.0, 0.3, 0.55, 1.0],
-        },
     },
 }
+
 
 # mirrors repro_config/e3t_final_baseline.yaml
 BASE_CONFIG = {
@@ -66,7 +60,7 @@ BASE_CONFIG = {
     "TOTAL_TIMESTEPS": 5e7,
     "MAX_TRAIN_STEPS": 5e7,
     "UPDATE_EPOCHS": 4,
-    "NUM_MINIBATCHES": 4,
+    "NUM_MINIBATCHES": 8,
     "GAMMA": 0.99,
     "GAE_LAMBDA": 0.95,
     "CLIP_EPS": 0.2,

@@ -116,21 +116,23 @@ def run_sweep_agent():
 
     run = wandb.init()
     sp = dict(wandb.config)
+    sweep_params = SWEEP_CONFIG["parameters"]
 
     config = copy.deepcopy(BASE_CONFIG)
 
-    # flat params
-    config["LR"]              = sp["LR"]
-    config["VF_COEF"]         = sp["VF_COEF"]
-    config["MOA_COEF"]        = sp["MOA_COEF"]
-    config["NUM_MINIBATCHES"] = sp["NUM_MINIBATCHES"]
-    config["ENT_COEF"]        = sp["ENT_COEF"]
+    # Only apply parameters that are explicitly present in SWEEP_CONFIG.
+    flat_param_keys = ["LR", "VF_COEF", "MOA_COEF", "NUM_MINIBATCHES", "ENT_COEF"]
+    for key in flat_param_keys:
+        if key in sweep_params:
+            config[key] = sp[key]
 
-    # nested params
-    config["ENV_KWARGS"]["layout"]     = sp["layout"]
-    config["TRAIN_KWARGS"]["e3t_beta"] = sp["e3t_beta"]
+    if "layout" in sweep_params:
+        config["ENV_KWARGS"]["layout"] = sp["layout"]
 
-    layout_name = sp["layout"]
+    if "e3t_beta" in sweep_params:
+        config["TRAIN_KWARGS"]["e3t_beta"] = sp["e3t_beta"]
+
+    layout_name = config["ENV_KWARGS"]["layout"]
     xpid = "sweep-%s" % time.strftime("%Y%m%d-%H%M%S")
     filepath = (
         f"ckpts/e3t/{config['ENV_NAME']}/{layout_name}"
@@ -141,17 +143,22 @@ def run_sweep_agent():
 
     run.name = (
         f"{layout_name}"
-        f"_lr{sp['LR']:.0e}_vf{sp['VF_COEF']}_moa{sp['MOA_COEF']}"
-        f"_mb{sp['NUM_MINIBATCHES']}_ent{sp['ENT_COEF']:.3f}"
-        f"_e3t{sp['e3t_beta']}"
+        f"_lr{config['LR']:.0e}_vf{config['VF_COEF']}_moa{config['MOA_COEF']}"
+        f"_mb{config['NUM_MINIBATCHES']}_ent{config['ENT_COEF']:.3f}"
     )
 
+    if "e3t_beta" in sweep_params:
+        run.name += f"_e3t{config['TRAIN_KWARGS']['e3t_beta']}"
+
     print(
-        f"[sweep/e3t] layout={layout_name}  e3t_beta={sp['e3t_beta']}\n"
-        f"            LR={sp['LR']}  VF_COEF={sp['VF_COEF']}  MOA_COEF={sp['MOA_COEF']}\n"
-        f"            NUM_MINIBATCHES={sp['NUM_MINIBATCHES']}  ENT_COEF={sp['ENT_COEF']}\n"
+        f"[sweep/e3t] layout={layout_name}\n"
+        f"            LR={config['LR']}  VF_COEF={config['VF_COEF']}  MOA_COEF={config['MOA_COEF']}\n"
+        f"            NUM_MINIBATCHES={config['NUM_MINIBATCHES']}  ENT_COEF={config['ENT_COEF']}\n"
         f"            ckpt dir: {filepath}"
     )
+
+    if "e3t_beta" in sweep_params:
+        print(f"            e3t_beta={config['TRAIN_KWARGS']['e3t_beta']}")
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_jit = jax.jit(make_train(config, 0), device=jax.devices()[0])

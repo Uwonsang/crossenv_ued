@@ -1,20 +1,20 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
-"LR": 3e-4
+"LR": 1e-3
 "NUM_ENVS": 256
 "NUM_SEEDS": 1
 "NUM_STEPS": 400
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
-"MAX_TRAIN_STEPS": 3e9
+"TOTAL_TIMESTEPS": 5e7 # 3e9 for overcooked
+"MAX_TRAIN_STEPS": 5e7
 "UPDATE_EPOCHS": 4
-"NUM_MINIBATCHES": 2
+"NUM_MINIBATCHES": 8
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
 "SCALE_CLIP_EPS": False
-"ENT_COEF": 0.005
-"VF_COEF": 1.0
+"ENT_COEF": 0.01
+"VF_COEF": 0.5 # TODO check 0.5 or 1.0
 "MOA_COEF": 1.0
 "MAX_GRAD_NORM": 0.5
 "ACTIVATION": "relu"

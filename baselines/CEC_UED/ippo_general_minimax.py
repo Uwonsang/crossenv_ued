@@ -487,7 +487,7 @@ def make_train(config, update_step=0):
             new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
             jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts)
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"], random=config["PLR_RANDOM"])
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"])
             
             if config["PLR_FORCE_UNIQUE"]:
                 level_idxs, dupe_mask = plr_mgr.dedupe_levels(

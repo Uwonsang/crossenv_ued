@@ -167,10 +167,12 @@ def run_sweep_agent():
     # e3t.make_train has no filepath arg — save checkpoint here
     runner_state = out["runner_state"]
     train_state = runner_state[0]
+    # e3t.py packs model state inside train_state (tuple) in some variants
+    model_state = train_state[0] if isinstance(train_state, (tuple, list)) else train_state
     rng_out = runner_state[-1]
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     with open(f"{filepath}/seed{config['SEED']}_ckpt0_e3t_updates{num_updates}.pkl", "wb") as f:
-        pickle.dump({"key": rng_out, "params": train_state.params, "update_steps": num_updates}, f)
+        pickle.dump({"key": rng_out, "params": model_state.params, "update_steps": num_updates}, f)
 
 
 def create_sweep(entity: str, project: str) -> str:

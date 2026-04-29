@@ -34,7 +34,6 @@ from jaxmarl.environments.overcooked.layouts_rulebased_adaptive import single_cr
 
 
 
-
 BASE_REW_SHAPING_PARAMS = {
     "PLACEMENT_IN_POT_REW": 10, # reward for putting ingredients 
     "PLATE_PICKUP_REWARD": 3, # reward for picking up a plate
@@ -1005,8 +1004,8 @@ if __name__ == "__main__":
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     import imageio
 
-    params={'random_reset_fn': 'reset_forced_coord'} # reset_all or reset_counter_circuit, reset_coord_ring
-    keys = jax.random.split(jax.random.PRNGKey(0), 10)
+    params={'random_reset_fn': 'reset_all'} # reset_all or reset_counter_circuit, reset_coord_ring , reset_cramped_room
+    keys = jax.random.split(jax.random.PRNGKey(0), 30)
     def render_reset(key):
         obs, state = env.reset(key, params=params)
         return render_fn(state)

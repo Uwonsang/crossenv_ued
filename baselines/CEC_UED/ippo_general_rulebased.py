@@ -708,7 +708,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}_worm_fixed_layout_reset_all_0421"
+        name=f"CEC_{layout_name}_seed{config['SEED']}_rulebased_adaptive_fixed_layout_coord_ring_fn_0427"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

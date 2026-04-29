@@ -964,15 +964,12 @@ def apply_worm_carving(
                 
                 # carve 후 counter 개수 계산 (보호 로직용)
                 skeleton_after_carve = skeleton.at[nx, ny].set(0)
-                # remaining_counters = jnp.sum(
-                #     (skeleton_after_carve[carve_min_x:carve_max_x, carve_min_y:carve_max_y] == 1).astype(jnp.int32)
-                # )
+    
                 
-                # # counter 보호 조건: can_extend_object_place=False 이면서 counter가 최소값 이하면 금지
-                # should_protect = (~can_extend_object_place) & (remaining_counters < min_counters)
-                remaining_counters = count_placeable_counters(skeleton_after_carve, orig_h, orig_w)
-                should_protect = (~can_extend_object_place) & (remaining_counters < min_counters)
-                
+                #remaining_counters = count_placeable_counters(skeleton_after_carve, orig_h, orig_w)
+                #should_protect = (~can_extend_object_place) & (remaining_counters < min_counters)
+                should_protect = False
+
                 can_carve = valid & is_wall & ~should_protect
 
                 skeleton2 = jax.lax.cond(

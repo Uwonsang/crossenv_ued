@@ -484,7 +484,13 @@ def layout_array_to_dict(grid, layout_name="array_layout", num_pots=2, num_plate
         num_base_walls = num_base_walls
     
         
-    wall_idx = jnp.ravel(idx_grid)[jnp.where(jnp.ravel(grid) == 1, size=num_base_walls)[0]]
+    flat_grid = jnp.ravel(grid)
+    # Keep fixed-size output for JIT, but pad with an existing wall index instead of 0.
+    # This avoids accidentally re-adding a removed opening at index 0.
+    fallback_wall_idx = jnp.argmax(flat_grid == 1)
+    wall_idx = jnp.ravel(idx_grid)[
+        jnp.where(flat_grid == 1, size=num_base_walls, fill_value=fallback_wall_idx)[0]
+    ]
     agent_idx = jnp.ravel(idx_grid)[jnp.where(jnp.ravel(grid) == 2, size=num_agents)[0]]
     goal_idx = jnp.ravel(idx_grid)[jnp.where(jnp.ravel(grid) == 3, size=num_goals)[0]]
     plate_pile_idx = jnp.ravel(idx_grid)[jnp.where(jnp.ravel(grid) == 4, size=num_plates)[0]]
@@ -589,14 +595,50 @@ def make_9x9_layout(rng, layout_grid, rotate=False, num_base_walls=None):
     return layout_dict
 
 
-# Global difficulty parameters (layout-agnostic naming)
-DIFFICULTY_LEVELS = ("easy", "normal", "hard")
-DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
+# Global difficulty parameters
+CRAMPED_ROOM_DIFFICULTY_LEVELS = ("easy", "normal", "hard")
+CRAMPED_ROOM_DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
 # Each row: [remove_from_need_one, remove_from_optional]
-DIFFICULTY_WALL_REMOVALS = jnp.array([
+CRAMPED_ROOM_DIFFICULTY_WALL_REMOVALS = jnp.array([
     [2, 0],
     [3, 1],
     [4, 2],
+], dtype=jnp.int32)
+
+ASYMM_ADVANTAGES_DIFFICULTY_LEVELS = ("easy", "normal", "hard")
+ASYMM_ADVANTAGES_DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
+# Each row: [remove_from_need_one, remove_from_optional]
+ASYMM_ADVANTAGES_DIFFICULTY_WALL_REMOVALS = jnp.array([
+    [4, 0],
+    [6, 1],
+    [8, 1],
+], dtype=jnp.int32)
+
+COORD_RING_DIFFICULTY_LEVELS = ("easy", "normal", "hard")
+COORD_RING_DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
+# Each row: [remove_from_need_one, remove_from_optional]
+COORD_RING_DIFFICULTY_WALL_REMOVALS = jnp.array([
+    [3, 0],
+    [4, 1],
+    [5, 1],
+], dtype=jnp.int32)
+
+FORCED_COORD_DIFFICULTY_LEVELS = ("easy", "normal", "hard")
+FORCED_COORD_DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
+# Each row: [remove_from_need_one, remove_from_optional]
+FORCED_COORD_DIFFICULTY_WALL_REMOVALS = jnp.array([
+    [3, 0],
+    [4, 1],
+    [5, 1],
+], dtype=jnp.int32)
+
+COUNTER_CIRCUIT_DIFFICULTY_LEVELS = ("easy", "normal", "hard")
+COUNTER_CIRCUIT_DIFFICULTY_PROBS = jnp.array([0.34, 0.33, 0.33], dtype=jnp.float32)
+# Each row: [remove_from_need_one, remove_from_optional]
+COUNTER_CIRCUIT_DIFFICULTY_WALL_REMOVALS = jnp.array([
+    [5, 0],
+    [7, 1],
+    [9, 2],
 ], dtype=jnp.int32)
 
 @jax.jit
@@ -618,29 +660,27 @@ def make_cramped_room_9x9(rng, ik=False, num_default_walls=67):
         need_one = jnp.array([1,2,3,5,9,10,14,16,17,18])
         optional_walls = jnp.array([0,4,15,19])
 
-        probs = DIFFICULTY_PROBS / jnp.sum(DIFFICULTY_PROBS)
+        probs = CRAMPED_ROOM_DIFFICULTY_PROBS / jnp.sum(CRAMPED_ROOM_DIFFICULTY_PROBS)
         difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
-        need_remove_count = DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
-        optional_remove_count = DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
+        need_remove_count = CRAMPED_ROOM_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+        optional_remove_count = CRAMPED_ROOM_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
         rng, rng_sub = jax.random.split(rng)
 
         need_perm = jax.random.permutation(rng_sub, need_one)
-        need_removed_candidates = need_perm[:4]
         rng, rng_sub = jax.random.split(rng)
 
         optional_perm = jax.random.permutation(rng_sub, optional_walls)
-        optional_removed_candidates = optional_perm[:2]
         rng, rng_sub = jax.random.split(rng)
 
-        need_active = jnp.arange(4) < need_remove_count
-        optional_active = jnp.arange(2) < optional_remove_count
+        need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+        optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
 
         need_removed_mask = jnp.any(
-            (all_walls[:, None] == need_removed_candidates[None, :]) & need_active[None, :],
+            (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
             axis=1,
         )
         optional_removed_mask = jnp.any(
-            (all_walls[:, None] == optional_removed_candidates[None, :]) & optional_active[None, :],
+            (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
             axis=1,
         )
 
@@ -648,15 +688,37 @@ def make_cramped_room_9x9(rng, ik=False, num_default_walls=67):
         wall_keep_probs = wall_keep_mask.astype(jnp.float32)
         wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
 
-        # sample 8 object positions (2 each for plate/onion/pot/goal) from remaining walls
-        object_positions = jax.random.choice(
+        # sample one position per object from kept need_one walls first
+        need_keep_mask = jnp.any(
+            (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+            axis=1,
+        )
+        need_keep_probs = need_keep_mask.astype(jnp.float32)
+        need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+        primary_positions = jax.random.choice(
             rng_sub,
-            all_walls,
-            shape=(8,),
+            need_one,
+            shape=(4,),
             replace=False,
-            p=wall_keep_probs,
+            p=need_keep_probs,
         )
         rng, rng_sub = jax.random.split(rng)
+
+        # sample additional one per object from remaining kept walls (excluding primary)
+        primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+        additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+        additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+        additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+        additional_positions = jax.random.choice(
+            rng_sub,
+            all_walls,
+            shape=(4,),
+            replace=False,
+            p=additional_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        object_positions = jnp.concatenate([primary_positions, additional_positions])
 
         # sample agent positions
         valid_agent_positions = jnp.array([6,7,8,11,12,13])
@@ -702,6 +764,132 @@ def calc_num_walls(layout):
     num_walls =jnp.where(layout == 1, 1, 0).sum()
     return 81 - (layout.shape[0] * layout.shape[1] - num_walls)
 
+# 아래는 중간 벽도 뚫려서 agent가 서로 영역에 들어갈 수 있음
+# @jax.jit
+# def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
+#     # 14 walls by default means num of walls in 9x9 is 81 - (36-14) = 51
+#     asymm_advantages_array = jnp.array([
+#         [5, 0, 1, 3, 1, 5, 1, 0, 3],
+#         [1, 0, 2, 0, 6, 0, 2, 0, 1],
+#         [1, 0, 0, 0, 6, 0, 0, 0, 1],
+#         [1, 1, 1, 4, 1, 4, 1, 1, 1],
+#     ])
+
+#     height, width = asymm_advantages_array.shape
+
+#     def default_asymm_advantages(rng, layout=asymm_advantages_array):
+#         return make_9x9_layout(rng, layout, rotate=False, num_base_walls=num_default_walls)
+
+#     def ik_asymm_advantages(rng, layout=asymm_advantages_array):
+#         height, width = layout.shape
+#         all_walls = jnp.array([0,1,2,3,4,5,6,7,8,9,13,17,18,22,26,27,28,29,30,31,32,33,34,35,])
+#         need_one = jnp.array([1,2,3,4,5,6,7,9,13,17,18,22,26,28,29,30,31,32,33,34])
+#         optional_walls = jnp.array([0,8,27,35])
+
+#         probs = ASYMM_ADVANTAGES_DIFFICULTY_PROBS / jnp.sum(ASYMM_ADVANTAGES_DIFFICULTY_PROBS)
+#         difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+#         need_remove_count = ASYMM_ADVANTAGES_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+#         optional_remove_count = ASYMM_ADVANTAGES_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
+#         rng, rng_sub = jax.random.split(rng)
+
+#         need_perm = jax.random.permutation(rng_sub, need_one)
+#         rng, rng_sub = jax.random.split(rng)
+
+#         optional_perm = jax.random.permutation(rng_sub, optional_walls)
+#         rng, rng_sub = jax.random.split(rng)
+
+#         need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+#         optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+#         need_removed_mask = jnp.any(
+#             (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+#             axis=1,
+#         )
+#         optional_removed_mask = jnp.any(
+#             (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+#             axis=1,
+#         )
+
+#         wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+#         wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+#         wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+#         # sample one position per object from kept need_one walls first
+#         need_keep_mask = jnp.any(
+#             (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+#             axis=1,
+#         )
+#         need_keep_probs = need_keep_mask.astype(jnp.float32)
+#         need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+#         primary_positions = jax.random.choice(
+#             rng_sub,
+#             need_one,
+#             shape=(4,),
+#             replace=False,
+#             p=need_keep_probs,
+#         )
+#         rng, rng_sub = jax.random.split(rng)
+
+#         # sample additional one per object from remaining kept walls (excluding primary)
+#         primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+#         additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+#         additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+#         additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+#         additional_positions = jax.random.choice(
+#             rng_sub,
+#             all_walls,
+#             shape=(4,),
+#             replace=False,
+#             p=additional_keep_probs,
+#         )
+#         rng, rng_sub = jax.random.split(rng)
+
+#         object_positions = jnp.concatenate([primary_positions, additional_positions])
+
+#         # sample agent positions
+#         valid_agent_0_positions = jnp.array([10, 11, 12, 19, 20, 21])
+#         valid_agent_1_positions = jnp.array([14,15,16,23,24,25])
+#         agent_0_idx = jax.random.choice(rng_sub, valid_agent_0_positions, shape=(1,), replace=False)
+#         rng, rng_sub = jax.random.split(rng)
+#         agent_1_idx = jax.random.choice(rng_sub, valid_agent_1_positions, shape=(1,), replace=False)
+#         agent_idx = jnp.concatenate([agent_0_idx, agent_1_idx])
+
+#         item_indices = jnp.concatenate([object_positions, agent_idx])
+#         # convert to 2d coordinates
+#         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
+#         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
+
+#         plate_idx = jnp.array([stacked_coords[0], stacked_coords[4]])
+#         onion_idx = jnp.array([stacked_coords[1], stacked_coords[5]])
+#         pot_idx = jnp.array([stacked_coords[2], stacked_coords[6]])
+#         goal_idx = jnp.array([stacked_coords[3], stacked_coords[7]])
+#         agent_idx = jnp.array([stacked_coords[10], stacked_coords[11]])
+
+
+#         def update_map(layout, item_indices, value):
+#             def scan_body(carry, idx):
+#                 layout, item_indices, value = carry
+#                 layout = layout.at[item_indices[idx][0], item_indices[idx][1]].set(value)
+#                 return (layout, item_indices, value), idx
+#             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
+#             return carry[0]
+#         modified_layout = jnp.zeros_like(layout)
+#         # create wall skeleton after difficulty-based removals
+#         wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
+#         modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
+
+
+#         modified_layout = update_map(modified_layout, plate_idx, 4)
+#         modified_layout = update_map(modified_layout, onion_idx, 5)
+#         modified_layout = update_map(modified_layout, pot_idx, 6)
+#         modified_layout = update_map(modified_layout, goal_idx, 3)
+#         modified_layout = update_map(modified_layout, agent_idx, 2)
+
+#         rng, rng_sub = jax.random.split(rng)
+#         return make_9x9_layout(rng, modified_layout, rotate=True, num_base_walls=num_default_walls)
+    
+#     return jax.lax.cond(ik, ik_asymm_advantages, default_asymm_advantages, rng, asymm_advantages_array)
+
 @jax.jit
 def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
     # 14 walls by default means num of walls in 9x9 is 81 - (36-14) = 51
@@ -712,29 +900,77 @@ def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
         [1, 1, 1, 4, 1, 4, 1, 1, 1],
     ])
 
-    height, width = asymm_advantages_array.shape
-
     def default_asymm_advantages(rng, layout=asymm_advantages_array):
         return make_9x9_layout(rng, layout, rotate=False, num_base_walls=num_default_walls)
 
     def ik_asymm_advantages(rng, layout=asymm_advantages_array):
         height, width = layout.shape
         all_walls = jnp.array([0,1,2,3,4,5,6,7,8,9,13,17,18,22,26,27,28,29,30,31,32,33,34,35,])
-        need_one = jnp.array([1,2,3,4,5,6,7,9,17,18,26,28,29,30,31,32,33,34,13,22])
-        # get a random permutation of need_one, and take the first 4
-        need_one_permutation = jax.random.permutation(rng, need_one)[:4]
+        # Keep center divider walls [4,13,22,31] non-removable to prevent crossing between sides.
+        need_one = jnp.array([1,2,3,5,6,7,9,17,18,26,28,29,30,32,33,34])
+        optional_walls = jnp.array([0,8,27,35])
+
+        probs = ASYMM_ADVANTAGES_DIFFICULTY_PROBS / jnp.sum(ASYMM_ADVANTAGES_DIFFICULTY_PROBS)
+        difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+        need_remove_count = ASYMM_ADVANTAGES_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+        optional_remove_count = ASYMM_ADVANTAGES_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
         rng, rng_sub = jax.random.split(rng)
 
-        # Create mask where 1 indicates wall not in need_one_permutation
-        wall_mask = jnp.ones(len(all_walls))
-        sorted_all_walls = jnp.sort(all_walls)
-        wall_mask = wall_mask.at[jnp.searchsorted(sorted_all_walls, need_one_permutation)].set(0)
-        wall_probs = wall_mask.astype(float) / jnp.sum(wall_mask)
-        # sample 6 walls from sorted_all_walls
-        additional = jax.random.choice(rng_sub, sorted_all_walls, shape=(6,), replace=False, p=wall_probs)
+        need_perm = jax.random.permutation(rng_sub, need_one)
         rng, rng_sub = jax.random.split(rng)
 
-        # sample agent positions
+        optional_perm = jax.random.permutation(rng_sub, optional_walls)
+        rng, rng_sub = jax.random.split(rng)
+
+        need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+        optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+        need_removed_mask = jnp.any(
+            (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+            axis=1,
+        )
+        optional_removed_mask = jnp.any(
+            (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+            axis=1,
+        )
+
+        wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+        wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+        wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+        # sample one position per object from kept need_one walls first
+        need_keep_mask = jnp.any(
+            (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+            axis=1,
+        )
+        need_keep_probs = need_keep_mask.astype(jnp.float32)
+        need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+        primary_positions = jax.random.choice(
+            rng_sub,
+            need_one,
+            shape=(4,),
+            replace=False,
+            p=need_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        # sample additional one per object from remaining kept walls (excluding primary)
+        primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+        additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+        additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+        additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+        additional_positions = jax.random.choice(
+            rng_sub,
+            all_walls,
+            shape=(4,),
+            replace=False,
+            p=additional_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        object_positions = jnp.concatenate([primary_positions, additional_positions])
+
+        # sample agent positions (left/right separated)
         valid_agent_0_positions = jnp.array([10, 11, 12, 19, 20, 21])
         valid_agent_1_positions = jnp.array([14,15,16,23,24,25])
         agent_0_idx = jax.random.choice(rng_sub, valid_agent_0_positions, shape=(1,), replace=False)
@@ -742,7 +978,7 @@ def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
         agent_1_idx = jax.random.choice(rng_sub, valid_agent_1_positions, shape=(1,), replace=False)
         agent_idx = jnp.concatenate([agent_0_idx, agent_1_idx])
 
-        item_indices = jnp.concatenate([need_one_permutation, additional, agent_idx])
+        item_indices = jnp.concatenate([object_positions, agent_idx])
         # convert to 2d coordinates
         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
@@ -751,9 +987,7 @@ def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
         onion_idx = jnp.array([stacked_coords[1], stacked_coords[5]])
         pot_idx = jnp.array([stacked_coords[2], stacked_coords[6]])
         goal_idx = jnp.array([stacked_coords[3], stacked_coords[7]])
-        wall_holes = jnp.array([stacked_coords[8], stacked_coords[9]])
-        agent_idx = jnp.array([stacked_coords[10], stacked_coords[11]])
-
+        agent_idx = jnp.array([stacked_coords[8], stacked_coords[9]])
 
         def update_map(layout, item_indices, value):
             def scan_body(carry, idx):
@@ -762,23 +996,21 @@ def make_asymm_advantages_9x9(rng, ik=False, num_default_walls=59):
                 return (layout, item_indices, value), idx
             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
             return carry[0]
-        modified_layout = jnp.zeros_like(layout)
-        # create the basic outline of the ring
-        wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
-        wall_coords = jnp.stack([wall_coords_x, wall_coords_y], axis=1)
-        modified_layout = update_map(modified_layout, wall_coords, 1)
 
+        modified_layout = jnp.zeros_like(layout)
+        # create wall skeleton after difficulty-based removals
+        wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
+        modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
 
         modified_layout = update_map(modified_layout, plate_idx, 4)
         modified_layout = update_map(modified_layout, onion_idx, 5)
         modified_layout = update_map(modified_layout, pot_idx, 6)
         modified_layout = update_map(modified_layout, goal_idx, 3)
-        modified_layout = update_map(modified_layout, wall_holes, 0)  # free space for agents to go to
         modified_layout = update_map(modified_layout, agent_idx, 2)
 
         rng, rng_sub = jax.random.split(rng)
         return make_9x9_layout(rng, modified_layout, rotate=True, num_base_walls=num_default_walls)
-    
+
     return jax.lax.cond(ik, ik_asymm_advantages, default_asymm_advantages, rng, asymm_advantages_array)
 
 @jax.jit
@@ -798,24 +1030,73 @@ def make_coord_ring_9x9(rng, ik=False, num_default_walls=65):
         height, width = layout.shape
         all_walls = jnp.array([0,1,2,3,4,5,9,10,12,14,15,19,20,21,22,23,24])
         need_one = jnp.array([1,2,3,5,9,10,14,15,19,21,22,23,12])
-        # get a random permutation of need_one, and take the first 4
-        need_one_permutation = jax.random.permutation(rng, need_one)[:4]
+        optional_walls = jnp.array([0,4,20,24])
+
+        probs = COORD_RING_DIFFICULTY_PROBS / jnp.sum(COORD_RING_DIFFICULTY_PROBS)
+        difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+        need_remove_count = COORD_RING_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+        optional_remove_count = COORD_RING_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
         rng, rng_sub = jax.random.split(rng)
 
-        # Create mask where 1 indicates wall not in need_one_permutation
-        wall_mask = jnp.ones(len(all_walls))
-        sorted_all_walls = jnp.sort(all_walls)
-        wall_mask = wall_mask.at[jnp.searchsorted(sorted_all_walls, need_one_permutation)].set(0)
-        wall_probs = wall_mask.astype(float) / jnp.sum(wall_mask)
-        # sample 4 walls from sorted_all_walls
-        additional = jax.random.choice(rng_sub, sorted_all_walls, shape=(4,), replace=False, p=wall_probs)
+        need_perm = jax.random.permutation(rng_sub, need_one)
         rng, rng_sub = jax.random.split(rng)
+
+        optional_perm = jax.random.permutation(rng_sub, optional_walls)
+        rng, rng_sub = jax.random.split(rng)
+
+        need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+        optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+        need_removed_mask = jnp.any(
+            (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+            axis=1,
+        )
+        optional_removed_mask = jnp.any(
+            (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+            axis=1,
+        )
+
+        wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+        wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+        wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+        # sample one position per object from kept need_one walls first
+        need_keep_mask = jnp.any(
+            (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+            axis=1,
+        )
+        need_keep_probs = need_keep_mask.astype(jnp.float32)
+        need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+        primary_positions = jax.random.choice(
+            rng_sub,
+            need_one,
+            shape=(4,),
+            replace=False,
+            p=need_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        # sample additional one per object from remaining kept walls (excluding primary)
+        primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+        additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+        additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+        additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+        additional_positions = jax.random.choice(
+            rng_sub,
+            all_walls,
+            shape=(4,),
+            replace=False,
+            p=additional_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        object_positions = jnp.concatenate([primary_positions, additional_positions])
 
         # sample agent positions
         valid_agent_positions = jnp.array([6,7,8,11,13,16,17,18])
         agent_idx = jax.random.choice(rng_sub, valid_agent_positions, shape=(2,), replace=False)
 
-        item_indices = jnp.concatenate([need_one_permutation, additional, agent_idx])
+        item_indices = jnp.concatenate([object_positions, agent_idx])
         # convert to 2d coordinates
         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
@@ -834,10 +1115,9 @@ def make_coord_ring_9x9(rng, ik=False, num_default_walls=65):
             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
             return carry[0]
         modified_layout = jnp.zeros_like(layout)
-        # create the basic outline of the ring
+        # create wall skeleton after difficulty-based removals
         wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
-        wall_coords = jnp.stack([wall_coords_x, wall_coords_y], axis=1)
-        modified_layout = update_map(modified_layout, wall_coords, 1)
+        modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
 
         modified_layout = update_map(modified_layout, plate_idx, 4)
         modified_layout = update_map(modified_layout, onion_idx, 5)
@@ -850,6 +1130,127 @@ def make_coord_ring_9x9(rng, ik=False, num_default_walls=65):
 
     return jax.lax.cond(ik, ik_coord_ring, default_coord_ring, rng, coord_ring_array)
 
+# 아래는 중간 벽도 뚫려서 agent가 서로 영역에 들어갈 수 있음
+# @jax.jit
+# def make_forced_coord_9x9(rng, ik=False, num_default_walls=67):
+#     forced_coord_array = jnp.array([
+#         [1,1,1,6,1],
+#         [5,0,1,0,6],
+#         [5,2,1,2,1],
+#         [4,0,1,0,1],
+#         [4,1,1,3,3],
+#     ])
+
+#     def default_forced_coord(rng, layout=forced_coord_array):
+#         return make_9x9_layout(rng, layout, rotate=False, num_base_walls=num_default_walls)
+
+#     def ik_forced_coord(rng, layout=forced_coord_array):
+#         height, width = layout.shape
+#         all_walls = jnp.array([0,1,2,3,4,5,7,9,10,12,14,15,17,19,20,21,22,23,24])
+#         need_one = jnp.array([1,5,10,15,21,17,12,7,3,9,14,19,23])
+#         optional_walls = jnp.array([0,2,4,20,22,24])
+
+#         probs = FORCED_COORD_DIFFICULTY_PROBS / jnp.sum(FORCED_COORD_DIFFICULTY_PROBS)
+#         difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+#         need_remove_count = FORCED_COORD_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+#         optional_remove_count = FORCED_COORD_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
+#         rng, rng_sub = jax.random.split(rng)
+
+#         need_perm = jax.random.permutation(rng_sub, need_one)
+#         rng, rng_sub = jax.random.split(rng)
+
+#         optional_perm = jax.random.permutation(rng_sub, optional_walls)
+#         rng, rng_sub = jax.random.split(rng)
+
+#         need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+#         optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+#         need_removed_mask = jnp.any(
+#             (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+#             axis=1,
+#         )
+#         optional_removed_mask = jnp.any(
+#             (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+#             axis=1,
+#         )
+
+#         wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+#         wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+#         wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+#         # sample one position per object from kept need_one walls first
+#         need_keep_mask = jnp.any(
+#             (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+#             axis=1,
+#         )
+#         need_keep_probs = need_keep_mask.astype(jnp.float32)
+#         need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+#         primary_positions = jax.random.choice(
+#             rng_sub,
+#             need_one,
+#             shape=(4,),
+#             replace=False,
+#             p=need_keep_probs,
+#         )
+#         rng, rng_sub = jax.random.split(rng)
+
+#         # sample additional one per object from remaining kept walls (excluding primary)
+#         primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+#         additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+#         additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+#         additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+#         additional_positions = jax.random.choice(
+#             rng_sub,
+#             all_walls,
+#             shape=(4,),
+#             replace=False,
+#             p=additional_keep_probs,
+#         )
+#         rng, rng_sub = jax.random.split(rng)
+
+#         object_positions = jnp.concatenate([primary_positions, additional_positions])
+
+#         # sample agent positions
+#         valid_agent_0_positions = jnp.array([6,11,16])
+#         valid_agent_1_positions = jnp.array([8,13,18])
+#         agent_0_idx = jax.random.choice(rng_sub, valid_agent_0_positions, shape=(1,), replace=False)
+#         rng, rng_sub = jax.random.split(rng)
+#         agent_1_idx = jax.random.choice(rng_sub, valid_agent_1_positions, shape=(1,), replace=False)
+#         agent_idx = jnp.concatenate([agent_0_idx, agent_1_idx])
+        
+#         item_indices = jnp.concatenate([object_positions, agent_idx])
+#         # convert to 2d coordinates
+#         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
+#         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
+
+#         plate_idx = jnp.array([stacked_coords[0], stacked_coords[4]])
+#         onion_idx = jnp.array([stacked_coords[1], stacked_coords[5]])
+#         pot_idx = jnp.array([stacked_coords[2], stacked_coords[6]])
+#         goal_idx = jnp.array([stacked_coords[3], stacked_coords[7]])
+#         agent_idx = jnp.array([stacked_coords[8], stacked_coords[9]])
+
+#         def update_map(layout, item_indices, value):
+#             def scan_body(carry, idx):
+#                 layout, item_indices, value = carry
+#                 layout = layout.at[item_indices[idx][0], item_indices[idx][1]].set(value)
+#                 return (layout, item_indices, value), idx
+#             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
+#             return carry[0]
+#         modified_layout = jnp.zeros_like(layout)
+#         # create wall skeleton after difficulty-based removals
+#         wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
+#         modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
+
+#         modified_layout = update_map(modified_layout, plate_idx, 4)
+#         modified_layout = update_map(modified_layout, onion_idx, 5)
+#         modified_layout = update_map(modified_layout, pot_idx, 6)
+#         modified_layout = update_map(modified_layout, goal_idx, 3)
+#         modified_layout = update_map(modified_layout, agent_idx, 2)
+
+#         rng, rng_sub = jax.random.split(rng)
+#         return make_9x9_layout(rng, modified_layout, rotate=True, num_base_walls=num_default_walls)
+
+#     return jax.lax.cond(ik, ik_forced_coord, default_forced_coord, rng, forced_coord_array)
 
 @jax.jit
 def make_forced_coord_9x9(rng, ik=False, num_default_walls=67):
@@ -867,29 +1268,79 @@ def make_forced_coord_9x9(rng, ik=False, num_default_walls=67):
     def ik_forced_coord(rng, layout=forced_coord_array):
         height, width = layout.shape
         all_walls = jnp.array([0,1,2,3,4,5,7,9,10,12,14,15,17,19,20,21,22,23,24])
-        need_one = jnp.array([1,5,10,15,21,17,12,7,3,9,14,19,23])
-        # get a random permutation of need_one, and take the first 4
-        need_one_permutation = jax.random.permutation(rng, need_one)[:4]
+        # Keep center divider walls [2,7,12,17,22] non-removable to prevent crossing between sides.
+        need_one = jnp.array([1,3,5,9,10,14,15,19,21,23])
+        optional_walls = jnp.array([0,4,20,24])
+
+        probs = FORCED_COORD_DIFFICULTY_PROBS / jnp.sum(FORCED_COORD_DIFFICULTY_PROBS)
+        difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+        need_remove_count = FORCED_COORD_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+        optional_remove_count = FORCED_COORD_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
         rng, rng_sub = jax.random.split(rng)
 
-        # Create mask where 1 indicates wall not in need_one_permutation
-        wall_mask = jnp.ones(len(all_walls))
-        sorted_all_walls = jnp.sort(all_walls)
-        wall_mask = wall_mask.at[jnp.searchsorted(sorted_all_walls, need_one_permutation)].set(0)
-        wall_probs = wall_mask.astype(float) / jnp.sum(wall_mask)
-        # sample 4 walls from sorted_all_walls
-        additional = jax.random.choice(rng_sub, sorted_all_walls, shape=(4,), replace=False, p=wall_probs)
+        need_perm = jax.random.permutation(rng_sub, need_one)
         rng, rng_sub = jax.random.split(rng)
 
-        # sample agent positions
+        optional_perm = jax.random.permutation(rng_sub, optional_walls)
+        rng, rng_sub = jax.random.split(rng)
+
+        need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+        optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+        need_removed_mask = jnp.any(
+            (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+            axis=1,
+        )
+        optional_removed_mask = jnp.any(
+            (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+            axis=1,
+        )
+
+        wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+        wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+        wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+        # sample one position per object from kept need_one walls first
+        need_keep_mask = jnp.any(
+            (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+            axis=1,
+        )
+        need_keep_probs = need_keep_mask.astype(jnp.float32)
+        need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+        primary_positions = jax.random.choice(
+            rng_sub,
+            need_one,
+            shape=(4,),
+            replace=False,
+            p=need_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        # sample additional one per object from remaining kept walls (excluding primary)
+        primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+        additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+        additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+        additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+        additional_positions = jax.random.choice(
+            rng_sub,
+            all_walls,
+            shape=(4,),
+            replace=False,
+            p=additional_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        object_positions = jnp.concatenate([primary_positions, additional_positions])
+
+        # sample agent positions (left/right separated)
         valid_agent_0_positions = jnp.array([6,11,16])
         valid_agent_1_positions = jnp.array([8,13,18])
         agent_0_idx = jax.random.choice(rng_sub, valid_agent_0_positions, shape=(1,), replace=False)
         rng, rng_sub = jax.random.split(rng)
         agent_1_idx = jax.random.choice(rng_sub, valid_agent_1_positions, shape=(1,), replace=False)
         agent_idx = jnp.concatenate([agent_0_idx, agent_1_idx])
-        
-        item_indices = jnp.concatenate([need_one_permutation, additional, agent_idx])
+
+        item_indices = jnp.concatenate([object_positions, agent_idx])
         # convert to 2d coordinates
         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
@@ -907,11 +1358,11 @@ def make_forced_coord_9x9(rng, ik=False, num_default_walls=67):
                 return (layout, item_indices, value), idx
             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
             return carry[0]
+
         modified_layout = jnp.zeros_like(layout)
-        # create the basic outline of the ring
+        # create wall skeleton after difficulty-based removals
         wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
-        wall_coords = jnp.stack([wall_coords_x, wall_coords_y], axis=1)
-        modified_layout = update_map(modified_layout, wall_coords, 1)
+        modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
 
         modified_layout = update_map(modified_layout, plate_idx, 4)
         modified_layout = update_map(modified_layout, onion_idx, 5)
@@ -941,24 +1392,73 @@ def make_counter_circuit_9x9(rng, ik=False, num_default_walls=59):
         height, width = layout.shape
         all_walls = jnp.array([0,1,2,3,4,5,6,7,8,15,16,18,19,20,21,23,24,31,32,33,34,35,36,37,38,39])
         need_one = jnp.array([1,2,3,4,5,6,8,15,16,18,19,20,21,23,24,31,33,34,35,36,37,38])
-        # get a random permutation of need_one, and take the first 4
-        need_one_permutation = jax.random.permutation(rng, need_one)[:4]
+        optional_walls = jnp.array([0,7,32,39])
+
+        probs = COUNTER_CIRCUIT_DIFFICULTY_PROBS / jnp.sum(COUNTER_CIRCUIT_DIFFICULTY_PROBS)
+        difficulty_id = jax.random.choice(rng, jnp.arange(3), shape=(), replace=True, p=probs)
+        need_remove_count = COUNTER_CIRCUIT_DIFFICULTY_WALL_REMOVALS[difficulty_id, 0]
+        optional_remove_count = COUNTER_CIRCUIT_DIFFICULTY_WALL_REMOVALS[difficulty_id, 1]
         rng, rng_sub = jax.random.split(rng)
 
-        # Create mask where 1 indicates wall not in need_one_permutation
-        wall_mask = jnp.ones(len(all_walls))
-        sorted_all_walls = jnp.sort(all_walls)
-        wall_mask = wall_mask.at[jnp.searchsorted(sorted_all_walls, need_one_permutation)].set(0)
-        wall_probs = wall_mask.astype(float) / jnp.sum(wall_mask)
-        # sample 4 walls from sorted_all_walls
-        additional = jax.random.choice(rng_sub, sorted_all_walls, shape=(4,), replace=False, p=wall_probs)
+        need_perm = jax.random.permutation(rng_sub, need_one)
         rng, rng_sub = jax.random.split(rng)
+
+        optional_perm = jax.random.permutation(rng_sub, optional_walls)
+        rng, rng_sub = jax.random.split(rng)
+
+        need_active = jnp.arange(need_one.shape[0]) < need_remove_count
+        optional_active = jnp.arange(optional_walls.shape[0]) < optional_remove_count
+
+        need_removed_mask = jnp.any(
+            (all_walls[:, None] == need_perm[None, :]) & need_active[None, :],
+            axis=1,
+        )
+        optional_removed_mask = jnp.any(
+            (all_walls[:, None] == optional_perm[None, :]) & optional_active[None, :],
+            axis=1,
+        )
+
+        wall_keep_mask = ~(need_removed_mask | optional_removed_mask)
+        wall_keep_probs = wall_keep_mask.astype(jnp.float32)
+        wall_keep_probs = wall_keep_probs / jnp.sum(wall_keep_probs)
+
+        # sample one position per object from kept need_one walls first
+        need_keep_mask = jnp.any(
+            (need_one[:, None] == all_walls[None, :]) & wall_keep_mask[None, :],
+            axis=1,
+        )
+        need_keep_probs = need_keep_mask.astype(jnp.float32)
+        need_keep_probs = need_keep_probs / jnp.sum(need_keep_probs)
+        primary_positions = jax.random.choice(
+            rng_sub,
+            need_one,
+            shape=(4,),
+            replace=False,
+            p=need_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        # sample additional one per object from remaining kept walls (excluding primary)
+        primary_mask_on_all = jnp.any(all_walls[:, None] == primary_positions[None, :], axis=1)
+        additional_keep_mask = wall_keep_mask & (~primary_mask_on_all)
+        additional_keep_probs = additional_keep_mask.astype(jnp.float32)
+        additional_keep_probs = additional_keep_probs / jnp.sum(additional_keep_probs)
+        additional_positions = jax.random.choice(
+            rng_sub,
+            all_walls,
+            shape=(4,),
+            replace=False,
+            p=additional_keep_probs,
+        )
+        rng, rng_sub = jax.random.split(rng)
+
+        object_positions = jnp.concatenate([primary_positions, additional_positions])
 
         # sample agent positions
         valid_agent_positions = jnp.array([9,10,11,12,13,14,17,22,25,26,27,28,29,30])
         agent_idx = jax.random.choice(rng_sub, valid_agent_positions, shape=(2,), replace=False)
 
-        item_indices = jnp.concatenate([need_one_permutation, additional, agent_idx])
+        item_indices = jnp.concatenate([object_positions, agent_idx])
         # convert to 2d coordinates
         x_coords, y_coords = jnp.unravel_index(item_indices, (height, width))
         stacked_coords = jnp.stack([x_coords, y_coords], axis=1)
@@ -977,10 +1477,9 @@ def make_counter_circuit_9x9(rng, ik=False, num_default_walls=59):
             carry, _ = jax.lax.scan(scan_body, (layout, item_indices, value), jnp.arange(len(item_indices)))
             return carry[0]
         modified_layout = jnp.zeros_like(layout)
-        # create the basic outline of the ring
+        # create wall skeleton after difficulty-based removals
         wall_coords_x, wall_coords_y = jnp.unravel_index(all_walls, (height, width))
-        wall_coords = jnp.stack([wall_coords_x, wall_coords_y], axis=1)
-        modified_layout = update_map(modified_layout, wall_coords, 1)
+        modified_layout = modified_layout.at[wall_coords_x, wall_coords_y].set(wall_keep_mask.astype(layout.dtype))
 
         modified_layout = update_map(modified_layout, plate_idx, 4)
         modified_layout = update_map(modified_layout, onion_idx, 5)

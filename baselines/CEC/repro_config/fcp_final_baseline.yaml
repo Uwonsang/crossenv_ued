@@ -1,6 +1,6 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
 "LR": 3e-4
-"NUM_ENVS": 256
+"NUM_ENVS": 32
 "NUM_SEEDS": 1
 "NUM_STEPS": 400
 "FC_DIM_SIZE": 256
@@ -12,7 +12,7 @@
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
-"SCALE_CLIP_EPS": False
+"SCALE_CLIP_EPS": True
 "ENT_COEF": 0.005
 "VF_COEF": 1.0
 "MOA_COEF": 1.0
@@ -54,7 +54,7 @@
   "train_oracle": False
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_test"
+"PROJECT": "crossenv_ued_baseline"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "FCP"
 # FCP_Paths

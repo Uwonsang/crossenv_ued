@@ -28,6 +28,7 @@ import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 from pathlib import Path
+import time
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -631,6 +632,7 @@ def make_train(config, update_step=0):
 
 @hydra.main(version_base=None, config_path="repro_config", config_name="fcp_final_baseline")
 def main(config):
+    save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
@@ -661,7 +663,7 @@ def main(config):
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}'
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
     config['filepath'] = filepath
 
     #####################

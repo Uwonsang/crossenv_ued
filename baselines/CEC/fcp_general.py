@@ -586,15 +586,31 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
+                current_return = float(metric["returns"])
+                if current_return > best_return[0]:
+                    best_return[0] = current_return
+                    os.makedirs(config['filepath'], exist_ok=True)
+                    ckpt_path = f"{config['filepath']}/fcp_seed{config['SEED']}_best.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'params': metric["params"],
+                            'returns': current_return,
+                            'update_steps': int(metric['update_steps']),
+                        }, f)
+
             returns = metric["returned_episode_returns"][:, :, 0][
                             metric["returned_episode"][:, :, 0].astype(jnp.int32)
                         ].mean()
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["params"] = train_state.params
+
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
+
+        best_return = [float('-inf')]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -646,6 +662,7 @@ def main(config):
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}'
+    config['filepath'] = filepath
 
     #####################
     # Load frozen params

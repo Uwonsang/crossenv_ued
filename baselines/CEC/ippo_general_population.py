@@ -586,32 +586,35 @@ def make_train(config, update_step=0, filepath=""):
             }
             rng = update_state[-1]
 
-            ckpt_id_counter = {"value": -1}
-
             def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
-                        **metric["loss"],
-                    }
-                )
-
-                save_interval = config["NUM_UPDATES"] // 19
+                wandb.log({
+                    "returns": metric["returns"],
+                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    **metric["loss"],
+                })
                 step = int(metric["update_steps"])
-                if save_interval > 0 and ((step % save_interval == 0 and step > 0) or step == (config["NUM_UPDATES"] -1)):
-                    print(f"[ippo_population] update {step}  returns {metric['returns']:.3f}")
-                    ckpt_id_counter["value"] += 1
-                    ckpt_id = ckpt_id_counter["value"]
+                params = jax.device_get(metric["params"])
+
+                if step == 0:
                     os.makedirs(filepath, exist_ok=True)
-                    with open(f"{filepath}/seed{config['SEED']}_ckpt{ckpt_id}_update{step}.pkl", "wb") as f:
-                        pickle.dump({
-                            'params': jax.device_get(metric["params"]),
-                            'final_update_step': step,
-                            'key': jax.device_get(metric["rng"]),
-                        }, f)
+                    with open(f"{filepath}/seed{config['SEED']}_init.pkl", "wb") as f:
+                        pickle.dump({'params': params, 'update_steps': step}, f)
+
+                current_return = float(metric["returns"])
+
+                if best_return[0] > 100:
+                    distance = abs(current_return - best_return[0] / 2)
+                    if distance < mid_distance[0]:
+                        mid_distance[0] = distance
+                        os.makedirs(filepath, exist_ok=True)
+                        with open(f"{filepath}/seed{config['SEED']}_mid.pkl", "wb") as f:
+                            pickle.dump({'params': params, 'returns': current_return, 'update_steps': step}, f)
+
+                if current_return > best_return[0]:
+                    best_return[0] = current_return
+                    os.makedirs(filepath, exist_ok=True)
+                    with open(f"{filepath}/seed{config['SEED']}_final.pkl", "wb") as f:
+                        pickle.dump({'params': params, 'returns': current_return, 'update_steps': step}, f)
 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
@@ -621,6 +624,9 @@ def make_train(config, update_step=0, filepath=""):
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
+
+        best_return = [float('-inf')]
+        mid_distance = [float('inf')]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (

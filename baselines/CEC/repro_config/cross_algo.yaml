@@ -1,28 +1,28 @@
-"ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
-"LR": 3e-4 #checked
-"NUM_ENVS": 256
+"ENV_NAME": "overcooked"  # ToyCoop or overcooked
+"LR": 3e-4
+"NUM_ENVS": 512
 "NUM_SEEDS": 1
-"NUM_STEPS": 400 #checked
+"NUM_STEPS": 400
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
-"MAX_TRAIN_STEPS": 3e9 #checked
-"UPDATE_EPOCHS": 4 #checked
-"NUM_MINIBATCHES": 2 #checked
-"GAMMA": 0.99 #checked
-"GAE_LAMBDA": 0.95 #checked
-"CLIP_EPS": 0.2 #checked
+"TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
+"MAX_TRAIN_STEPS": 3e9
+"UPDATE_EPOCHS": 4
+"NUM_MINIBATCHES": 2
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
 "SCALE_CLIP_EPS": False
-"ENT_COEF": 0.005 #checked
-"VF_COEF": 1.0 #checked
+"ENT_COEF": 0.005
+"VF_COEF": 1.0
 "MOA_COEF": 1.0
-"MAX_GRAD_NORM": 0.5 #checked
-"ACTIVATION": "relu" #checked
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
 "ANNEAL_LR": True
 "SEED": 0
 "ENV_KWARGS": 
-  "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 400 #TODO: check this
+  "random_reset" : False # relevant for which env to train/test on. If true, it is CEC, otherwise single task
+  "max_steps": 400
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -30,7 +30,7 @@
   "incentivize_strat": 2 # choose [0, 1, 2, 3] for top, bottom, none, or multiple
   # overcooked specific kwargs
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
-  "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
+  "layout": "coord_ring_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
 "TRAIN_KWARGS":
@@ -52,32 +52,10 @@
 "FCP": False
 "FCP_KWARGS":
   "train_oracle": True
+"MODEL_PATH": "/app/baselines_model"
+"SAVE_PATH": "/app/baselines/CEC/results/cross_algo"
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
-"WANDB_MODE" : "disabled"
-"model_name": "CEC_minimax"
-"save_frames": False
-"EVAL_KWARGS":
-  "eval_interval": 10
-  "num_envs": 5            
-  "num_steps": 400         
-  "max_steps": 400
-  "random_reset": False    
-  "check_held_out": False  
-  "shuffle_inv_and_pot": False
-  "random_reset_fn": "reset_all" 
-  "beta": 1.0
-  "argmax": False
-# Ued params 
-"PLR_UED_SCORE": "MAX_MC"
-"PLR_REPLAY_PROB": 0.5
-"PLR_BUFFER_SIZE": 4000
-"PLR_STALENESS_COEF": 0.3
-"PLR_TEMP": 0.1
-"PLR_USE_SCORE_RANKS": True
-"PLR_MIN_FILL_RATIO": 0.5
-"PLR_USE_ROBUST_PLR": True
-"PLR_FORCE_UNIQUE": True
-"PLR_BUFFER_SAVE": False
-"PLR_LEVEL_SAVE": False
+"WANDB_MODE" : "disabled" # disabled, online, offline
+"model_name": "IPPO" # CEC, E3T, FCP, IPPO

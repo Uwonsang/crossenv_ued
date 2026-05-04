@@ -27,7 +27,8 @@ import functools
 import pdb
 from jax_tqdm import scan_tqdm
 import yaml
-
+from pathlib import Path
+import time
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -586,15 +587,31 @@ def make_train(config, update_step=0):
                         **metric["loss"],
                     }
                 )
+                current_return = float(metric["returns"])
+                if current_return > best_return[0]:
+                    best_return[0] = current_return
+                    os.makedirs(config['filepath'], exist_ok=True)
+                    ckpt_path = f"{config['filepath']}/fcp_seed{config['SEED']}_best.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'params': metric["params"],
+                            'returns': current_return,
+                            'update_steps': int(metric['update_steps']),
+                        }, f)
+
             returns = metric["returned_episode_returns"][:, :, 0][
                             metric["returned_episode"][:, :, 0].astype(jnp.int32)
                         ].mean()
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["params"] = train_state.params
+
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
+
+        best_return = [float('-inf')]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -615,6 +632,7 @@ def make_train(config, update_step=0):
 
 @hydra.main(version_base=None, config_path="repro_config", config_name="fcp_final_baseline")
 def main(config):
+    save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
@@ -645,7 +663,8 @@ def main(config):
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}'
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
+    config['filepath'] = filepath
 
     #####################
     # Load frozen params
@@ -707,7 +726,8 @@ def main(config):
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
         seed_list = range(6)
-        custom_path = os.path.join(config['FCP_filepath'], config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
+        CKPT_ROOT = Path(__file__).resolve().parents[2] / "our_ckpts"
+        custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
         for ckpt_id, update_step in zip(ckpt_id_list, update_step_list):
             for ckpt_seed in seed_list:
                 print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl")
@@ -738,11 +758,11 @@ def main(config):
         
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

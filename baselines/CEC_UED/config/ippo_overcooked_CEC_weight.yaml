@@ -22,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : True #checked # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 400 #TODO: check this
+  "max_steps": 400
   "check_held_out": True  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
@@ -31,7 +31,7 @@
   # overcooked specific kwargs
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
-  "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
+  "random_reset_fn": "reset_all_weighted"  # reset_all or reset_counter_circuit
 "TRAINING": True
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
@@ -56,8 +56,16 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
-"model_name": "CEC_minimax"
+"model_name": "CEC_weight"
 "save_frames": False
+"save_frames_interval": 200
+"save_env_state": False
+"save_env_state_interval": 10
+# Layout index order: [asymm=0, coord_ring=1, counter_circuit=2, forced_coord=3, cramped_room=4]
+"LAYOUT_ANNEAL":
+  start_weights: [0.2, 0.2, 0.2, 0.2, 0.2]   # uniform at start
+  end_weights:   [0.25, 0.1, 0.25, 0.30, 0.1]   # less coord_ring + cramped_room at end
+  anneal_steps: 3e9                         # env steps over which to interpolate
 "EVAL_KWARGS":
   "eval_interval": 10
   "num_envs": 5            
@@ -69,15 +77,3 @@
   "random_reset_fn": "reset_all" 
   "beta": 1.0
   "argmax": False
-# Ued params 
-"PLR_UED_SCORE": "MAX_MC"
-"PLR_REPLAY_PROB": 0.5
-"PLR_BUFFER_SIZE": 4000
-"PLR_STALENESS_COEF": 0.3
-"PLR_TEMP": 0.1
-"PLR_USE_SCORE_RANKS": True
-"PLR_MIN_FILL_RATIO": 0.5
-"PLR_USE_ROBUST_PLR": True
-"PLR_FORCE_UNIQUE": True
-"PLR_BUFFER_SAVE": False
-"PLR_LEVEL_SAVE": False

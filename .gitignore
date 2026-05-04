@@ -183,3 +183,10 @@ baselines/CEC_UED/VAE/checkpoints/*
 baselines/CEC_UED/VAE/img_check_decoder/*
 our_ckpts/*
 viz_results/*
+baselines/CEC_UED/minimax/analysis/buffer_viz/*
+baselines/CEC_UED/minimax/analysis/sampled_viz/*
+baselines/CEC/results/*
+baselines/CEC/figures/map_check/*
+baselines/CEC/figures/results/*
+baselines/CEC_UED/dataset/*
+.idea/*

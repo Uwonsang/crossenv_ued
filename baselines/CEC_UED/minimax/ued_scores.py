@@ -8,9 +8,7 @@ LICENSE file in the root directory of this source tree.
 
 from functools import partial
 from enum import Enum
-from collections import namedtuple
 
-import einops
 import jax
 import jax.numpy as jnp
 
@@ -84,25 +82,18 @@ def compute_episodic_stats(
         length=len(metrics)
     )
 
-    """Score per level based on two agents."""
-    if len(n_episodes.shape) == 3:  # n_parallel envs x n_parallel eval_envs x n_env_agents
-        n_episodes = n_episodes.sum(-1)
-        max_metrics = max_metrics.max(-1)
-        sum_ep_metrics = sum_ep_metrics.sum(-1)
-
-    # Take mean over eval dimension
+    # (num_envs, num_agents)
     total_metrics_per_env = sum_ep_metrics.sum(-1)
     n_episodes_per_env = n_episodes.sum(-1)
     n_episodes_per_env = jnp.maximum(n_episodes_per_env, 1)
 
-    # Take max over eval dimension
     max_metrics_per_env = max_metrics.max(-1)
 
     return total_metrics_per_env/n_episodes_per_env, max_metrics_per_env
 
 
 @partial(jax.jit, static_argnums=(0,))
-def _compute_ued_scores(score_name: UEDScore, batch: namedtuple, info=None):
+def _compute_ued_scores(score_name, batch, info=None):
     """
     Compute UED score from a rollout batch.
     Individual score functions return a tuple of mean_scores and max_scores,
@@ -133,60 +124,6 @@ def _compute_ued_scores(score_name: UEDScore, batch: namedtuple, info=None):
 
     return mean_scores, max_scores, score_info
 
-
-@partial(jax.jit, static_argnums=(0, 2, 4, 5))
-def compute_ued_scores(score_name, batch, n_eval, info=None, ignore_val=None, per_agent=False):
-    if len(batch.dones.shape) == 3:
-        n_agents, n_steps, flat_batch_size = batch.dones.shape
-    else:
-        n_agents, n_steps, flat_batch_size, _ = batch.dones.shape
-
-    batch = jax.tree_util.tree_map(
-        lambda x: einops.rearrange(
-            x, 'a t (s e) ... -> a t s e ...',
-            a=n_agents, t=n_steps, s=flat_batch_size, e=n_eval), batch)
-
-    mean_env_returns_per_agent, max_env_returns_per_agent, score_info = \
-        jax.vmap(_compute_ued_scores, in_axes=(None, 0, 0))(
-            score_name, batch, info
-        )
-
-    if score_name in [UEDScore.RELATIVE_REGRET, UEDScore.MEAN_RELATIVE_REGRET]:
-        assert len(mean_env_returns_per_agent) == 2, \
-            "Standard PAIRED requires exactly 2 agents."
-
-    if score_name == UEDScore.RELATIVE_REGRET:
-        scores = jnp.clip(max_env_returns_per_agent[1]
-                          - mean_env_returns_per_agent[0], 0)
-
-    elif score_name == UEDScore.MEAN_RELATIVE_REGRET:
-        scores = jnp.clip(mean_env_returns_per_agent[1]
-                          - mean_env_returns_per_agent[0], 0)
-
-    elif score_name == UEDScore.POPULATION_REGRET:
-        max_env_returns = max_env_returns_per_agent.max(0)
-        mean_env_returns = mean_env_returns_per_agent.mean(0)
-        scores = max_env_returns - mean_env_returns
-    else:
-        if per_agent:
-            scores = mean_env_returns_per_agent
-            max_scores = max_env_returns_per_agent
-        else:
-            scores = mean_env_returns_per_agent.mean(0)
-            max_scores = max_env_returns_per_agent.max(0)
-
-    if ignore_val is not None:
-        if per_agent:
-            axis = (1, -1) if len(batch.dones.shape) == 3 else (1, -2, -1)
-        else:
-            axis = (0, 1, -1) if len(batch.dones.shape) == 3 else (0, 1, -2, -1)
-
-        incomplete_idxs = batch.dones.sum(axis=axis) == 0
-
-        scores = jnp.where(incomplete_idxs, ignore_val, scores)
-    return scores, score_info
-
-
 # ======== UED score computations ========
 
 
@@ -212,25 +149,19 @@ def compute_positive_value_loss(batch):
 
 
 def compute_max_mc(batch, info):
-    _, max_env_returns_per_agent = \
+    _, max_env_returns = \
         compute_episodic_stats(batch.rewards, batch.dones, time_average=False)
 
-    max_returns = jnp.maximum(max_env_returns_per_agent, info['max_returns'])
-    # Multi Agent setting, we have mutlitple values.
-    if len(batch.dones.shape) == 4:
-        max_returns = jnp.concatenate(
-            [max_returns[jnp.newaxis, :, jnp.newaxis, jnp.newaxis],
-                max_returns[jnp.newaxis, :, jnp.newaxis, jnp.newaxis]], axis=-1
-        )
-    else:
-        max_returns = max_returns[jnp.newaxis, :, jnp.newaxis]
+    max_returns = jnp.maximum(max_env_returns, info['max_returns'])
+
+    max_returns = max_returns[jnp.newaxis, :, jnp.newaxis] # (1, num_envs, 1)
     mean_scores, max_scores = compute_episodic_stats(
-        max_returns - batch.values,  # Can be negative
-        batch.dones,
+        max_returns - batch.values,  # Can be negative (time, num_envs, 1)
+        batch.dones, # (time, num_envs, 1)
         time_average=True
     )
 
-    score_info = {'max_returns': max_env_returns_per_agent}
+    score_info = {'max_returns': max_env_returns}
 
     return mean_scores, max_scores, score_info
 
@@ -241,17 +172,3 @@ def compute_value_disagreement(batch):
     )
 
     return mean_scores, max_scores, None
-
-
-#TODO:checked
-def compute_ued_scores_no_vmap(score_name: UEDScore, batch: namedtuple, info=None):
-    """Single (n_agents, n_steps, n_envs) batch; no agent-axis vmap (used by PLR)."""
-    return _compute_ued_scores(score_name, batch, info)
-
-#TODO:checked
-def plr_flatten_scores_to_env(scores, ne: int):
-    """Map score tensor to shape (ne,) for PLR parallel envs."""
-    x = jnp.ravel(jnp.asarray(scores))
-    pad_len = jnp.maximum(0, ne - x.shape[0])
-    x = jnp.pad(x, (0, pad_len))
-    return x[:ne]

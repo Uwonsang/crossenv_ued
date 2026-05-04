@@ -25,7 +25,6 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
@@ -33,13 +32,15 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
 
 from minimax import (
     PLRManager,
     UEDScore,
     plr_batch_from_traj,
     plr_ued_scores_and_info,
-    sample_layout_reset_all
+    sample_layout_reset_all,
+    layout_comparator,
 )
 
 def initialize_environment(config):
@@ -278,7 +279,6 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     x = x.reshape((num_actors, num_envs, -1))
     return {a: x[i] for i, a in enumerate(agent_list)}
 
-
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
@@ -308,19 +308,21 @@ def make_train(config, update_step=0):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    eval_envs = make_eval_envs_overcooked(config)
+
+    ho_layouts = {"goal_idx": env.held_out_goal, "wall_idx": env.held_out_wall, "pot_idx":  env.held_out_pot }
     plr_ued_score = UEDScore[config["PLR_UED_SCORE"]]
     plr_mgr = PLRManager(
-        example_level=sample_layout_reset_all(jax.random.PRNGKey(0)),
+        example_level = sample_layout_reset_all(jax.random.PRNGKey(0), ho_layouts),
         ued_score=plr_ued_score,
-        replay_prob=float(config["PLR_REPLAY_PROB"]),
-        buffer_size=int(config["PLR_BUFFER_SIZE"]),
-        staleness_coef=float(config["PLR_STALENESS_COEF"]),
-        temp=float(config["PLR_TEMP"]),
-        min_fill_ratio=float(config["PLR_MIN_FILL_RATIO"]),
-        use_score_ranks=bool(config["PLR_USE_SCORE_RANKS"]),
-        use_robust_plr=bool(config["PLR_USE_ROBUST_PLR"]),
-        use_parallel_eval=False,
-        comparator_fn=None,
+        replay_prob=config["PLR_REPLAY_PROB"],
+        buffer_size=config["PLR_BUFFER_SIZE"],
+        staleness_coef=config["PLR_STALENESS_COEF"],
+        temp=config["PLR_TEMP"],
+        min_fill_ratio=config["PLR_MIN_FILL_RATIO"],
+        use_score_ranks=config["PLR_USE_SCORE_RANKS"],
+        use_robust_plr=config["PLR_USE_ROBUST_PLR"],
+        comparator_fn=layout_comparator if config["PLR_FORCE_UNIQUE"] else None,
         n_devices=1,
     )
 
@@ -369,34 +371,32 @@ def make_train(config, update_step=0):
             tx=tx,
         )
 
-        def reset_from_layout(key, layout):
-            obs, es = env._env.custom_reset(
+        def reset_from_layout(key, layout_dict):
+            obs, env_state = env._env.custom_reset(
                 key,
                 random_reset=False,
                 shuffle_inv_and_pot=False,
-                layout=layout,
+                layout=layout_dict,
             )
-            st = LogEnvState(
-                es,
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-                jnp.zeros((env.num_agents,)),
-            )
-            return obs, st
 
-        # INIT ENV
+            state = LogEnvState(
+                env_state,
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+                jnp.zeros((env.num_agents,)),
+            )
+            return obs, state
+
+        # INIT ENV & PLR BUFFER
         rng, _rng = jax.random.split(rng)
         plr_buffer = plr_mgr.reset()
-        rng, r1, r2, r3 = jax.random.split(_rng, 4)
-        new_levels = jax.vmap(sample_layout_reset_all)(
-            jax.random.split(r1, config["NUM_ENVS"])
+        rng, rng_samp, rng_reset = jax.random.split(_rng, 3)
+        new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
+            jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts
         )
-        levels, _, _, plr_buffer = plr_mgr.sample(
-            r2, plr_buffer, new_levels, config["NUM_ENVS"]
-        )
-        reset_rng = jax.random.split(r3, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, levels)
+        reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+        obsv, env_state = jax.vmap(reset_from_layout)(reset_rng, new_levels)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
@@ -404,28 +404,14 @@ def make_train(config, update_step=0):
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
-            (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer) = runner_state
-            initial_hstate = hstate
-
-            # PLR SAMPLE #TODO: when sample new levels, but not until env max_step
-            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
-            new_levels = jax.vmap(sample_layout_reset_all)(
-                jax.random.split(rng_samp, config["NUM_ENVS"]) 
-            )
-            levels, level_idxs, _, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"]
-            )
-            reset_keys = jax.random.split(rng_reset, config["NUM_ENVS"])
-            obsv, env_state = jax.vmap(reset_from_layout)(reset_keys, levels)
-            last_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, update_step, levels = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-                agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}  
+                agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}  
                 agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
                 ac_in = (
                     obs_batch[np.newaxis, :],
@@ -444,19 +430,31 @@ def make_train(config, update_step=0):
                 rng, _rng = jax.random.split(rng)
                 rng_step = jax.random.split(_rng, config["NUM_ENVS"])
                 obsv, env_state, reward, done, info = jax.vmap(
-                    env.step, in_axes=(0, 0, 0)
+                    env.step_env, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
                 reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
-                
-                # remove shaped rewards
                 del info['shaped_reward']
 
                 filtered_state = {
-                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
-                    "agent_inv": env_state.env_state.agent_inv[0],
-                    "maze_map": env_state.env_state.maze_map[0]}
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx,
+                    "agent_inv": env_state.env_state.agent_inv,
+                    "maze_map": env_state.env_state.maze_map}
+
+                # --- Manually reset done envs with random new levels ---
+                done_all = done["__all__"]
+                rng, rng_reset = jax.random.split(rng)
+                reset_rng = jax.random.split(rng_reset, config["NUM_ENVS"])
+                obsv_re, env_state_re = jax.vmap(reset_from_layout)(reset_rng, levels)
+
+                def _select_reset(new_x, old_x):
+                    mask = done_all.reshape((done_all.shape[0],) + (1,) * (new_x.ndim - 1))
+                    return jnp.where(mask, new_x, old_x)
+
+                obsv = jax.tree_map(_select_reset, obsv_re, obsv)
+                new_inner = jax.tree_map(_select_reset, env_state_re.env_state, env_state.env_state)
+                env_state = env_state.replace(env_state=new_inner)
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -471,7 +469,7 @@ def make_train(config, update_step=0):
                     info,
                     agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, levels)
                 return runner_state, (
                     transition,
                     FilteredState(
@@ -481,16 +479,32 @@ def make_train(config, update_step=0):
                     ),
                 )
 
-            runner_state = (train_state, env_state, obsv, last_done, hstate, rng, update_steps)
+            (train_state, env_state, obsv, done_batch, hstate, rng, plr_buffer) = runner_state
+            initial_hstate = hstate
+
+            # --- PLR: sample levels and reset all envs at start of rollout ---
+            rng, rng_samp, rng_plr, rng_reset = jax.random.split(rng, 4)
+            new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
+            jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts)
+            levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"])
+            
+            if config["PLR_FORCE_UNIQUE"]:
+                level_idxs, dupe_mask = plr_mgr.dedupe_levels(
+                    plr_buffer, levels, level_idxs)
+            else:
+                dupe_mask = None
+            
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps, levels)
             runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, update_steps, levels = runner_state
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
-            agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
+            agent_positions = {'agent_0': env_state.env_state.agent_pos[:, 0, :], 'agent_1': env_state.env_state.agent_pos[:, 1, :]}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
             ac_in = (
                 last_obs_batch[np.newaxis, :],
@@ -642,9 +656,42 @@ def make_train(config, update_step=0):
                 targets,
                 rng,
             )
-            update_state, loss_info = jax.lax.scan(
-                _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
+
+            def _run_update(update_state):
+                return jax.lax.scan(
+                    _update_epoch, update_state, None, config["UPDATE_EPOCHS"])
+
+            def _skip_update(update_state):
+                zeros = jnp.zeros(
+                    (config["UPDATE_EPOCHS"], config["NUM_MINIBATCHES"]),
+                    dtype=jnp.float32,
+                )
+                ratio_zeros = jnp.zeros(
+                    (
+                        config["UPDATE_EPOCHS"],
+                        config["NUM_MINIBATCHES"],
+                        config["NUM_STEPS"],
+                        config["NUM_ACTORS"] // config["NUM_MINIBATCHES"],
+                    ),
+                    dtype=jnp.float32,
+                )
+                loss_info = (
+                    zeros,
+                    (zeros, zeros, zeros, ratio_zeros, zeros, zeros),
+                )
+                return update_state, loss_info
+
+            do_update = jnp.logical_or(
+                jnp.logical_not(jnp.array(config["PLR_USE_ROBUST_PLR"])),
+                is_replay)
+
+            update_state, loss_info = jax.lax.cond(
+                do_update,
+                _run_update,
+                _skip_update,
+                update_state,
             )
+
             train_state = update_state[0]
             metric = traj_batch.info
             metric = jax.tree_map(
@@ -659,6 +706,9 @@ def make_train(config, update_step=0):
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
+            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
+
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
@@ -675,16 +725,130 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
-                        **metric["loss"],
-                    }
+            def eval_layout(eval_env, params, eval_rng):
+                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+                num_actors_eval = eval_env.num_agents * num_eval_envs
+
+                eval_rng, reset_rng = jax.random.split(eval_rng)
+                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+                init_hstate = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
+                init_done = jnp.zeros((num_actors_eval,), dtype=bool)
+                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+                runner_state_e = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+                def _eval_step(carry, _):
+                    env_state_e, obs_e, done_e, hstate_e, returns_e, rng_e = carry
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    obs_batch = batchify(obs_e, eval_env.agents, num_actors_eval)
+                    agent_positions = {"agent_0": env_state_e.env_state.agent_pos, "agent_1": env_state_e.env_state.agent_pos}
+                    agent_positions = batchify(agent_positions, eval_env.agents, num_actors_eval)
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        done_e[np.newaxis, :],
+                        agent_positions[np.newaxis, :],
+                    )
+                    hstate_next, pi, _ = network.apply(params, hstate_e, ac_in)
+                    pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
+                    sampled_action = pi.sample(seed=_rng_e)[0]
+                    greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
+                    action = jnp.where(config["EVAL_KWARGS"]["argmax"], greedy_action, sampled_action)
+
+                    env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
+                    env_act = {k: v.squeeze() for k, v in env_act.items()}
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                    obs_next, state_next, reward, done, _info = jax.vmap(
+                        eval_env.step, in_axes=(0, 0, 0)
+                    )(rng_step_e, env_state_e, env_act)
+
+                    done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
+                    returns_next = returns_e + reward["agent_0"]
+                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), None
+
+                runner_state, _ = jax.lax.scan(
+                    _eval_step, runner_state_e, None, int(config["EVAL_KWARGS"]["num_steps"])
                 )
+                state, obs, done, h_state, returns, rng = runner_state
+                return returns.mean()
+
+            run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
+
+            def _do_eval(_):
+                out = {}
+                base = jax.random.fold_in(rng, update_steps)
+                for i, layout_name in enumerate(EVAL_LAYOUTS_9):
+                    out[layout_name] = eval_layout(
+                        eval_envs[layout_name],
+                        train_state.params,
+                        jax.random.fold_in(base, i),
+                    )
+                out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
+                return out
+
+            def _skip_eval(_):
+                out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
+                out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                return out
+
+            metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
+
+            plr_batch = plr_batch_from_traj(
+                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
+            
+            ued_scores, update_info = plr_ued_scores_and_info(
+                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
+
+            plr_buffer = plr_mgr.update(
+                plr_buffer, levels, level_idxs, ued_scores, info=update_info, dupe_mask=dupe_mask)
+
+            def callback(metric):
+                log_dict = {
+                    # the metrics have an agent dimension, but this is identical
+                    # for all agents so index into the 0th item of that dimension.
+                    "returns": metric["returns"],
+                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    **metric["loss"],
+                }
+                if "eval_returns" in metric:
+                    if np.isfinite(float(metric["eval_returns"]["mean"])):
+                        log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
+                        for _ln in EVAL_LAYOUTS_9:
+                            log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
+
+                if config["ENV_NAME"] == "overcooked":
+                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
+                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
+                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
+                    for e in range(maze_map.shape[0]):
+                        label = classify_layout(active[e])
+                        if label in layout_counts:
+                            layout_counts[label] += 1
+                    total = maze_map.shape[0]
+                    for name in EVAL_LAYOUTS_9:
+                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
+                    
+                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
+                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
+                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
+                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
+                    for t in range(ep_done.shape[0]):
+                        for e in range(ep_done.shape[1]):
+                            if ep_done[t, e]:
+                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
+                                layout_returns[label].append(float(ep_rets[t, e]))
+                    for name in EVAL_LAYOUTS_9:
+                        returns_for_layout = layout_returns[name]
+                        log_dict[f"train_returns/{name}"] = (
+                            float(np.mean(returns_for_layout))
+                            if len(returns_for_layout) > 0
+                            else float("nan")
+                        )
+                        log_dict[f"train_returns_count/{name}"] = len(returns_for_layout)
+                    
+                wandb.log(log_dict)
                 step = int(metric["update_steps"])
 
                 def save_frames(filtered_state, step, file_path):
@@ -698,25 +862,56 @@ def make_train(config, update_step=0):
             
                 if config["save_frames"]:
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
+
+                if config["PLR_BUFFER_SAVE"]:
+                    plr_save_period = config["NUM_UPDATES"] // 19
+                    if plr_save_period > 0 and (step % plr_save_period == 0):
+                        plr_save_dir = os.path.join(config["filepath"], "plr_buffer")
+                        os.makedirs(plr_save_dir, exist_ok=True)
+                        plr_save_path = os.path.join(plr_save_dir, f"plr_buffer_step_{step:03d}.pkl")
+                        plr_buffer_data = {"levels": {k: np.array(v) for k, v in metric["plr_buffer"].levels.items()}}
+                        with open(plr_save_path, "wb") as f:
+                            pickle.dump({
+                                    "update_step": step,
+                                    "plr_buffer": plr_buffer_data,
+                                },  f)
+
+                if config["PLR_LEVEL_SAVE"]:
+                    sampled_save_dir = os.path.join(config["filepath"], "plr_sampled_levels")
+                    os.makedirs(sampled_save_dir, exist_ok=True)
+                    sampled_save_path = os.path.join(sampled_save_dir, f"sampled_levels_step_{step:03d}.pkl")
+                    sampled_levels_data = {
+                        "levels": {k: np.array(v) for k, v in metric["sampled_levels"].items()},
+                        "level_idxs": np.array(metric["sampled_level_idxs"]),
+                        "is_replay": bool(np.array(metric["is_replay"])),
+                    }
+                    with open(sampled_save_path, "wb") as f:
+                        pickle.dump(
+                            {
+                                "update_step": step,
+                                "sampled": sampled_levels_data,
+                            },
+                            f,
+                        )
                 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
+            metric["env_state"] = env_state
             
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
+                "plr_buffer": plr_buffer,
+                "sampled_levels": levels,
+                "sampled_level_idxs": level_idxs,
+                "is_replay": is_replay,
+                "env_state": env_state,
+                "episode_returns_step": episode_returns_step,
+                "episode_done_step": episode_done_step,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
-            plr_batch = plr_batch_from_traj(
-                traj_batch, advantages, config["NUM_STEPS"], env.num_agents, config["NUM_ENVS"])
-            
-            ued_scores, update_info = plr_ued_scores_and_info(
-                plr_ued_score, plr_batch, plr_buffer, level_idxs, config["NUM_ENVS"])
-
-            plr_buffer = plr_mgr.update(
-                plr_buffer, levels, level_idxs, ued_scores, info=update_info)
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng, plr_buffer)
 
             return (runner_state, update_steps), metric
@@ -770,7 +965,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
@@ -815,10 +1010,11 @@ def main(config):
         model_params = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
+    config["filepath"] = filepath
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
+    train_fn = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
+    out = train_fn(rng, model_params, final_update_step)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]

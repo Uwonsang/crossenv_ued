@@ -1,8 +1,8 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 512
+"NUM_ENVS": 32
 "NUM_SEEDS": 1
-"NUM_STEPS": 256 #checked
+"NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
@@ -12,7 +12,7 @@
 "GAMMA": 0.99 #checked
 "GAE_LAMBDA": 0.95 #checked
 "CLIP_EPS": 0.2 #checked
-"SCALE_CLIP_EPS": False
+"SCALE_CLIP_EPS": True
 "ENT_COEF": 0.005 #checked
 "VF_COEF": 1.0 #checked
 "MOA_COEF": 1.0
@@ -29,7 +29,7 @@
   "partial_obs": False
   "incentivize_strat": 2 # choose [0, 1, 2, 3] for top, bottom, none, or multiple
   # overcooked specific kwargs
-  "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
+  "shuffle_inv_and_pot": True # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
@@ -56,5 +56,19 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled"
-"model_name": "IPPO_CEC_VAE"
-"save_frames": True
+"model_name": "CEC"
+"save_frames": False
+"save_frames_interval": 200
+"save_env_state": False
+"save_env_state_interval": 10
+"EVAL_KWARGS":
+  "eval_interval": 10
+  "num_envs": 5            
+  "num_steps": 400         
+  "max_steps": 400
+  "random_reset": False    
+  "check_held_out": False  
+  "shuffle_inv_and_pot": False
+  "random_reset_fn": "reset_all" 
+  "beta": 1.0
+  "argmax": False

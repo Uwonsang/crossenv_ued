@@ -8,35 +8,19 @@ import os
 import pickle
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
-import optax
-from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
-from flax.training.train_state import TrainState
 import distrax
 import hydra
 from omegaconf import OmegaConf
-import gc
-from sklearn.manifold import TSNE
 
 import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
-from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
-import imageio
-import matplotlib.pyplot as plt
-from graph_layer import make_graph_toy_coop, GATLayer, make_graph_overcooked
-
-import wandb
-import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import pandas as pd
 from tqdm import tqdm
-import tsnex
 from actor_networks import ScannedRNN, ActorCriticE3T, ActorCriticRNN
 
 def initialize_environment(config):
@@ -174,9 +158,9 @@ def load_ik_models(config):
     param_list = []
     seed_list = []
     for seed in range(6):
-        load_path = f"ckpts/ippo/{config['ENV_NAME']}/cramped_room_9/ikTrue/reset_all/graphTrue"
+        load_path = f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved.pkl"
         try:
-            with open(f"{load_path}/seed{seed}_ckpt29_improved.pkl", "rb") as f:
+            with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
@@ -200,13 +184,13 @@ def load_ik_finetune_models(config):
             continue
     param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
-def load_sk_models(config):
+def load_sk_models(config): #ippo
     param_list = []
     seed_list = []
     for seed in range(6):
-        load_path = f"ckpts/ippo/{config['ENV_NAME']}/{config['ENV_KWARGS']['layout']}/ikFalse/reset_all/graphTrue"
+        load_path = f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt19_update22887.pkl"
         try:
-            with open(f"{load_path}/seed{seed}_ckpt15_improved.pkl", "rb") as f:
+            with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
@@ -219,9 +203,9 @@ def load_e3t_models(config):
     param_list = []
     seed_list = []
     for seed in range(6):
-        load_path = f"ckpts/ippo/{config['ENV_NAME']}/{config['ENV_KWARGS']['layout']}/ikFalse/reset_all/graphTrue"
+        load_path = f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_e3t_updates22888.pkl"
         try:
-            with open(f"{load_path}/seed{seed}_ckpt15_e3t.pkl", "rb") as f:
+            with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
@@ -234,9 +218,9 @@ def load_fcp_models(config):
     param_list = []
     seed_list = []
     for seed in range(6):
-        load_path = f"ckpts/ippo/{config['ENV_NAME']}/{config['ENV_KWARGS']['layout']}/ikFalse/reset_all/graphTrue"
+        load_path = f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_improved_fcp_updates22888.pkl"
         try:
-            with open(f"{load_path}/fcp_seed{seed}_ckpt19_improved.pkl", "rb") as f:
+            with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
@@ -247,32 +231,12 @@ def load_fcp_models(config):
     return param_stack, jnp.array(seed_list)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="repro_config", config_name="cross_algo")
 def main(config):
     config = OmegaConf.to_container(config)
-    if config["FCP"]:
-        fcp_str = "fcp_"
-    else:
-        fcp_str = ""
-    if config["TRAIN_KWARGS"]["finetune"]:
-        finetune_appendage = "_improved_finetune"
-    else:
-        finetune_appendage = "_improved"
-    # if config['TRAIN_KWARGS']['finetune']:
-    #     config['LR'] = config['LR'] / 10
-    #     finetune_appendage = "_finetune"
-    #     fcp_str = "fcp_"
-    # else:
-    #     finetune_appendage = "_improved"
-    #     fcp_str = ""
     config["ENV_KWARGS"]["shuffle_inv_and_pot"] = False
     config["ENV_KWARGS"]["check_held_out"] = False
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config["TEST_KWARGS"]["ik"]}/{config['ENV_KWARGS']['random_reset_fn']}/graph{config["GRAPH_NET"]}"
-    # make path if it doesn't exist
-    os.makedirs(filepath, exist_ok=True)
+    os.makedirs(config['SAVE_PATH'], exist_ok=True)
 
 
     ##################
@@ -282,13 +246,12 @@ def main(config):
     sk_param_stack, sk_seed_list = load_sk_models(config)
     fcp_param_stack, fcp_seed_list = load_fcp_models(config)
     e3t_param_stack, e3t_seed_list = load_e3t_models(config)
-    ik_finetune_param_stack, ik_finetune_seed_list = load_ik_finetune_models(config)
+    # ik_finetune_param_stack, ik_finetune_seed_list = load_ik_finetune_models(config)
     assert len(ik_seed_list) > 0
     assert len(sk_seed_list) > 0
     assert len(fcp_seed_list) > 0
     assert len(e3t_seed_list) > 0
-    assert len(ik_finetune_seed_list) > 0
-
+    # assert len(ik_finetune_seed_list) > 0
 
     # gc.collect()
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
@@ -306,9 +269,10 @@ def main(config):
     sk_info = (sk_param_stack, sk_seed_list, regular_network, 'sk')
     fcp_info = (fcp_param_stack, fcp_seed_list, regular_network, 'fcp')
     e3t_info = (e3t_param_stack, e3t_seed_list, e3t_network, 'e3t')
-    ik_finetune_info = (ik_finetune_param_stack, ik_finetune_seed_list, regular_network, 'ik_finetune')
+    # ik_finetune_info = (ik_finetune_param_stack, ik_finetune_seed_list, regular_network, 'ik_finetune')
 
-    info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_finetune_info]
+    info_list = [ik_info, sk_info, fcp_info, e3t_info]
+    # info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_finetune_info]
 
 
 
@@ -350,8 +314,8 @@ def main(config):
                     df_dict['algo_1'].append(algo_1_name)
                     df_dict['algo_2'].append(algo_2_name)
     df = pd.DataFrame(df_dict)
-    df.to_csv(f"{filepath}/cross_algo_eval_onIK_{config['ENV_KWARGS']['random_reset']}.csv", index=False)
-    print(f"Saved data to {filepath}/cross_algo_eval_onIK_{config['ENV_KWARGS']['random_reset']}.csv")
+    df.to_csv(f"{config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv", index=False)
+    print(f"Saved data to {config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv")
 
 
 if __name__ == "__main__":

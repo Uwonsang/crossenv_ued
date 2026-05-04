@@ -1,8 +1,8 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
 "LR": 3e-4
-"NUM_ENVS": 512
+"NUM_ENVS": 32
 "NUM_SEEDS": 1
-"NUM_STEPS": 256
+"NUM_STEPS": 400
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
@@ -12,7 +12,7 @@
 "GAMMA": 0.99
 "GAE_LAMBDA": 0.95
 "CLIP_EPS": 0.2
-"SCALE_CLIP_EPS": False
+"SCALE_CLIP_EPS": True
 "ENT_COEF": 0.005
 "VF_COEF": 1.0
 "MOA_COEF": 1.0
@@ -23,7 +23,7 @@
 "ENV_KWARGS": 
   "random_reset" : False # relevant for which env to train/test on. If true, it is CEC, otherwise single task
   "max_steps": 400
-  "check_held_out": True  # if false, we don't check if the reset env is held out
+  "check_held_out": False  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False
   "partial_obs": False
@@ -54,6 +54,6 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
+"PROJECT": "crossenv_ued_baseline"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "e3t"

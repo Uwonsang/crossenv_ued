@@ -1,6 +1,5 @@
-from typing import Sequence, NamedTuple, Any
+from typing import Sequence
 import flax.linen as nn
-from graph_layer import GATLayer, GCNLayer, make_graph
 import jax
 import jax.numpy as jnp
 from flax.linen.initializers import constant, orthogonal
@@ -8,8 +7,7 @@ import numpy as np
 import distrax
 from pdb import set_trace as T
 import functools
-from typing import Sequence, NamedTuple, Any, Dict
-
+from typing import Sequence, Dict
 
 
 class ScannedRNN(nn.Module):
@@ -49,49 +47,27 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
-            batch_size, num_envs, flattened_obs_dim = obs.shape
-            # if self.config["ENV_NAME"] == "overcooked":
-            #     reshaped_obs = obs.reshape(-1, 7,7,26)
-            # else:
-            #     reshaped_obs = obs.reshape(-1, 5,5,3)
-            reshaped_obs = obs.reshape(-1, *self.config["obs_dim"])
-            # # use 2 conv nets
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"]*2,
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(reshaped_obs)
-            # embedding = nn.relu(embedding)
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"],
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(embedding)
-            # embedding = nn.relu(embedding)
+        batch_size, num_envs, flattened_obs_dim = obs.shape
+        if self.config["CONV_NET"]:
+            if self.config["ENV_NAME"] == "overcooked":
+                reshaped_obs = obs.reshape(-1, 9,9,26)
+            else:
+                reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
+                features=64,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             embedding = nn.Conv(
-                features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
+                features=32,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(embedding)
             embedding = nn.relu(embedding)
-
-            # reshaped_obs = obs.reshape(-1, flattened_obs_dim)
-            # reshaped_agent_positions = agent_positions.reshape((-1, 2, 2))
-            # make_graph_fn = make_graph_overcooked if self.config["ENV_NAME"] == "overcooked" else make_graph_toy_coop
-            # node_feats, adj_mat = jax.vmap(make_graph_fn)(reshaped_obs, reshaped_agent_positions)
-            # embedding = GATLayer(self.config["FC_DIM_SIZE"], num_heads=2)(node_feats, adj_mat)
 
             embedding = embedding.reshape((batch_size, num_envs, -1))
         else:
@@ -101,17 +77,21 @@ class ActorCriticRNN(nn.Module):
             self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
-        # embedding = nn.Dense(
-        #     self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        # )(embedding)
-        # embedding = nn.relu(embedding)
+
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            # self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
+            self.config["FC_DIM_SIZE"] * 2,
+            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
 
-        rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        if self.config["LSTM"]:
+            rnn_in = (embedding, dones)
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        else:
+            embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
+            embedding = nn.relu(embedding)
+        embedding = embedding.reshape((batch_size, num_envs, -1))
 
         #########
         # Actor
@@ -133,14 +113,7 @@ class ActorCriticRNN(nn.Module):
                 actor_mean
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 2
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 3
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        
@@ -180,28 +153,12 @@ class ActorCriticE3T(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
+        if self.config["CONV_NET"]:
             batch_size, num_envs, flattened_obs_dim = obs.shape
-            # if self.config["ENV_NAME"] == "overcooked":
-            #     reshaped_obs = obs.reshape(-1, 7,7,26)
-            # else:
-            #     reshaped_obs = obs.reshape(-1, 5,5,3)
-            reshaped_obs = obs.reshape(-1, *self.config["obs_dim"])
-            # # use 2 conv nets
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"]*2,
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(reshaped_obs)
-            # embedding = nn.relu(embedding)
-            # embedding = nn.Conv(
-            #     features=self.config["FC_DIM_SIZE"],
-            #     kernel_size=(2, 2),
-            #     kernel_init=orthogonal(np.sqrt(2)),
-            #     bias_init=constant(0.0),
-            # )(embedding)
-            # embedding = nn.relu(embedding)
+            if self.config["ENV_NAME"] == "overcooked":
+                reshaped_obs = obs.reshape(-1, 9,9,26)
+            else:
+                reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
                 features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
@@ -217,12 +174,6 @@ class ActorCriticE3T(nn.Module):
                 bias_init=constant(0.0),
             )(embedding)
             embedding = nn.relu(embedding)
-
-            # reshaped_obs = obs.reshape(-1, flattened_obs_dim)
-            # reshaped_agent_positions = agent_positions.reshape((-1, 2, 2))
-            # make_graph_fn = make_graph_overcooked if self.config["ENV_NAME"] == "overcooked" else make_graph_toy_coop
-            # node_feats, adj_mat = jax.vmap(make_graph_fn)(reshaped_obs, reshaped_agent_positions)
-            # embedding = GATLayer(self.config["FC_DIM_SIZE"], num_heads=2)(node_feats, adj_mat)
 
             embedding = embedding.reshape((batch_size, num_envs, -1))
         else:
@@ -245,7 +196,7 @@ class ActorCriticE3T(nn.Module):
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
         #########
-        # Model of other agent
+        # Model of other agent (patner_prediction module-> 7,8,9 index in original e3t paper)
         #########
         prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(embedding)
         prediction_other = nn.leaky_relu(prediction_other)
@@ -280,14 +231,7 @@ class ActorCriticE3T(nn.Module):
                 actor_mean
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 2
-            # actor_mean = nn.Dense(
-            #     self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0)
-            # )(actor_mean)
-            # actor_mean = nn.relu(actor_mean)  # extra layer 3
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        

@@ -151,6 +151,7 @@ class CurriculumLogEnvState:
     returned_episode_returns: float
     returned_episode_lengths: int
     total_env_steps: int
+    layout_weights: jnp.ndarray
 
 
 class CurriculumLogWrapper(JaxMARLWrapper):
@@ -189,6 +190,7 @@ class CurriculumLogWrapper(JaxMARLWrapper):
             returned_episode_returns=jnp.zeros((self._env.num_agents,)),
             returned_episode_lengths=jnp.zeros((self._env.num_agents,)),
             total_env_steps=jnp.zeros((), dtype=jnp.int32),
+            layout_weights=jnp.ones(5) / 5,
         )
         return obs, state
 
@@ -220,6 +222,7 @@ class CurriculumLogWrapper(JaxMARLWrapper):
             returned_episode_returns=state.returned_episode_returns * (1 - ep_done) + new_episode_return * ep_done,
             returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done) + new_episode_length * ep_done,
             total_env_steps=state.total_env_steps + 1,
+            layout_weights=weights,
         )
         if self.replace_info:
             info = {}

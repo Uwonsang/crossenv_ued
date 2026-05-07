@@ -12,7 +12,7 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
+from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
 import hydra
@@ -25,7 +25,6 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
@@ -310,6 +309,8 @@ def make_train(config, update_step=0):
         save_path = f"/app/baselines/CEC_UED/dataset/train_env_states.h5"
         init_hdf5(save_path, state_names, state_shapes, state_dtypes, int(data_len), config["NUM_ENVS"])
 
+    config["LAYOUT_ANNEAL"]["anneal_steps"] = config["TOTAL_TIMESTEPS"] / config["NUM_ENVS"]
+    
     env = CurriculumLogWrapper(
         env,
         env_params={'random_reset_fn': 'reset_all_weighted'},
@@ -748,8 +749,7 @@ def make_train(config, update_step=0):
                             else float("nan")
                         )
 
-                    total_steps = float(np.array(metric["env_state"].total_env_steps).mean())
-                    weights = env._compute_weights(total_steps)
+                    weights = np.array(metric["env_state"].layout_weights[0])
                     layout_names = ["asymm", "coord_ring", "counter_circuit", "forced_coord", "cramped_room"]
                     for i, name in enumerate(layout_names):
                         log_dict[f"layout_weight/{name}"] = float(weights[i])

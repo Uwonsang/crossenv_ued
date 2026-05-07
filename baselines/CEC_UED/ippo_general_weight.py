@@ -741,7 +741,18 @@ def make_train(config, update_step=0):
                                 label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
                                 layout_returns[label].append(float(ep_rets[t, e]))
                     for name in EVAL_LAYOUTS_9:
-                        log_dict[f"train_returns/{name}"] = np.mean(layout_returns[name])
+                        returns_for_layout = layout_returns[name]
+                        log_dict[f"train_returns/{name}"] = (
+                            float(np.mean(returns_for_layout))
+                            if len(returns_for_layout) > 0
+                            else float("nan")
+                        )
+
+                    total_steps = float(np.array(metric["env_state"].total_env_steps).mean())
+                    weights = env._compute_weights(total_steps)
+                    layout_names = ["asymm", "coord_ring", "counter_circuit", "forced_coord", "cramped_room"]
+                    for i, name in enumerate(layout_names):
+                        log_dict[f"layout_weight/{name}"] = float(weights[i])
                 wandb.log(log_dict)
                 
                 step = int(metric["update_steps"])

@@ -845,9 +845,7 @@ def make_train(config, update_step=0):
                             float(np.mean(returns_for_layout))
                             if len(returns_for_layout) > 0
                             else float("nan")
-                        )
-                        log_dict[f"train_returns_count/{name}"] = len(returns_for_layout)
-                    
+                        )                    
                 wandb.log(log_dict)
                 step = int(metric["update_steps"])
 

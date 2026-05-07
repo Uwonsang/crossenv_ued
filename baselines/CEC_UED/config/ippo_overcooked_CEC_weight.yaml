@@ -5,8 +5,8 @@
 "NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
-"MAX_TRAIN_STEPS": 3e9 #checked
+"TOTAL_TIMESTEPS": 1e7 #checked #for overcooked : 3e9
+"MAX_TRAIN_STEPS": 1e7 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
@@ -64,8 +64,8 @@
 # Layout index order: [asymm=0, coord_ring=1, counter_circuit=2, forced_coord=3, cramped_room=4]
 "LAYOUT_ANNEAL":
   start_weights: [0.2, 0.2, 0.2, 0.2, 0.2]   # uniform at start
-  end_weights:   [0.25, 0.1, 0.25, 0.30, 0.1]   # less coord_ring + cramped_room at end
-  anneal_steps: 3e9                         # env steps over which to interpolate
+  end_weights:   [0.3, 0.05, 0.3, 0.3, 0.05]   # less coord_ring + cramped_room at end
+  anneal_steps: 1e7                         # env steps over which to interpolate
 "EVAL_KWARGS":
   "eval_interval": 10
   "num_envs": 5            

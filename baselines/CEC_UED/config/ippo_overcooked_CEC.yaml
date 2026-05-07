@@ -1,6 +1,6 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 32
+"NUM_ENVS": 128
 "NUM_SEEDS": 1
 "NUM_STEPS": 400 #checked
 "FC_DIM_SIZE": 256

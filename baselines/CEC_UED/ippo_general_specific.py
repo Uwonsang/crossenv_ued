@@ -715,34 +715,6 @@ def make_train(config, update_step=0):
                         for _ln in EVAL_LAYOUTS_9:
                             log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
 
-                if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
-
-                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
-                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
-                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
-                    for t in range(ep_done.shape[0]):
-                        for e in range(ep_done.shape[1]):
-                            if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
-                                layout_returns[label].append(float(ep_rets[t, e]))
-                    for name in EVAL_LAYOUTS_9:
-                        returns_for_layout = layout_returns[name]
-                        log_dict[f"train_returns/{name}"] = (
-                            float(np.mean(returns_for_layout))
-                            if len(returns_for_layout) > 0
-                            else float("nan")
-                        )
                 wandb.log(log_dict)
                 
                 step = int(metric["update_steps"])

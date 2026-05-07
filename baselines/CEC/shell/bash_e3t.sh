@@ -5,7 +5,7 @@ layout=$2
 
 SEEDS=(0 1 2 3 4 5)
 for seed in "${SEEDS[@]}"; do
-    XLA_PYTHON_CLIENT_MEM_FRACTION=0.5 CUDA_VISIBLE_DEVICES=${gpu} python baselines/CEC/e3t.py \
+    CUDA_VISIBLE_DEVICES=${gpu} python baselines/CEC/e3t.py \
       ENV_KWARGS.layout=${layout} \
       SEED=$seed \
       WANDB_MODE=online

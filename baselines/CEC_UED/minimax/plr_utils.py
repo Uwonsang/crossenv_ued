@@ -1,6 +1,13 @@
 import jax
 import jax.numpy as jnp
-from jaxmarl.environments.overcooked.layouts import (
+# from jaxmarl.environments.overcooked.layouts import (
+#     make_asymm_advantages_9x9,
+#     make_coord_ring_9x9,
+#     make_counter_circuit_9x9,
+#     make_forced_coord_9x9,
+#     make_cramped_room_9x9,
+# )
+from jaxmarl.environments.overcooked.layouts_rulebased_adaptive import (
     make_asymm_advantages_9x9,
     make_coord_ring_9x9,
     make_counter_circuit_9x9,

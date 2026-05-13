@@ -375,7 +375,7 @@ def make_train(config, update_step=0):
             obs, env_state = env._env.custom_reset(
                 key,
                 random_reset=False,
-                shuffle_inv_and_pot=False,
+                shuffle_inv_and_pot=True,#주석 처리 부분 4 : 실제 뽑은 layout pot 상태 셔플 False,
                 layout=layout_dict,
             )
 
@@ -487,7 +487,7 @@ def make_train(config, update_step=0):
             new_levels = jax.vmap(sample_layout_reset_all, in_axes=(0, None))(
             jax.random.split(rng_samp, config["NUM_ENVS"]), ho_layouts)
             levels, level_idxs, is_replay, plr_buffer = plr_mgr.sample(
-                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"])
+                rng_plr, plr_buffer, new_levels, config["NUM_ENVS"],True)
             
             if config["PLR_FORCE_UNIQUE"]:
                 level_idxs, dupe_mask = plr_mgr.dedupe_levels(
@@ -705,9 +705,9 @@ def make_train(config, update_step=0):
             returns = metric["returned_episode_returns"][:, :, 0][
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
-            # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
-            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
-            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
+            # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...) # 주석 처리한 부분 (train returns)
+            # episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
+            # episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
 
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
@@ -818,35 +818,39 @@ def make_train(config, update_step=0):
                         for _ln in EVAL_LAYOUTS_9:
                             log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
 
-                if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
+                # 주석 처리 부분2 #layout_ratio/ , train_returns/..
+                # if config["ENV_NAME"] == "overcooked":
+                #     maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
+                #     active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
+                #     layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
+                #     for e in range(maze_map.shape[0]):
+                #         label = classify_layout(active[e])
+                #         if label in layout_counts:
+                #             layout_counts[label] += 1
+                #     total = maze_map.shape[0]
+                #     for name in EVAL_LAYOUTS_9:
+                #         log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
                     
-                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
-                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
-                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
-                    for t in range(ep_done.shape[0]):
-                        for e in range(ep_done.shape[1]):
-                            if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
-                                layout_returns[label].append(float(ep_rets[t, e]))
-                    for name in EVAL_LAYOUTS_9:
-                        returns_for_layout = layout_returns[name]
-                        log_dict[f"train_returns/{name}"] = (
-                            float(np.mean(returns_for_layout))
-                            if len(returns_for_layout) > 0
-                            else float("nan")
-                        )
-                        log_dict[f"train_returns_count/{name}"] = len(returns_for_layout)
+                #     ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
+                #     ep_done = np.array(metric["episode_done_step"]).astype(bool)
+                #     step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
+                #     layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
+                #     for t in range(ep_done.shape[0]):
+                #         for e in range(ep_done.shape[1]):
+                #             if ep_done[t, e]:
+                #                 label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
+                #                 # 레이블에 없는 경우, 그냥 unknown으로 기록.
+                #                 if label not in layout_returns:
+                #                     layout_returns[label] = []
+                #                 layout_returns[label].append(float(ep_rets[t, e]))
+                #     for name in EVAL_LAYOUTS_9:
+                #         returns_for_layout = layout_returns[name]
+                #         log_dict[f"train_returns/{name}"] = (
+                #             float(np.mean(returns_for_layout))
+                #             if len(returns_for_layout) > 0
+                #             else float("nan")
+                #         )
+                #         log_dict[f"train_returns_count/{name}"] = len(returns_for_layout)
                     
                 wandb.log(log_dict)
                 step = int(metric["update_steps"])
@@ -905,9 +909,10 @@ def make_train(config, update_step=0):
                 "sampled_levels": levels,
                 "sampled_level_idxs": level_idxs,
                 "is_replay": is_replay,
-                "env_state": env_state,
-                "episode_returns_step": episode_returns_step,
-                "episode_done_step": episode_done_step,
+                #주석 처리 부분3 # "train_returns_step": episode_returns_step,
+                # "env_state": env_state,
+                # "episode_returns_step": episode_returns_step,
+                # "episode_done_step": episode_done_step,
             }
             
             jax.experimental.io_callback(callback, None, callback_metric)
@@ -965,7 +970,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}_Adaptive_Random"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

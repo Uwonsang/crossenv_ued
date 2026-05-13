@@ -70,7 +70,7 @@
   "beta": 1.0
   "argmax": False
 # Ued params 
-"PLR_UED_SCORE": "MAX_MC" # options: "MAX_MC", "RETURN", "L1_VALUE_LOSS"
+"PLR_UED_SCORE": "L1_VALUE_LOSS" # options: "MAX_MC", "RETURN", "L1_VALUE_LOSS"
 "PLR_REPLAY_PROB": 0.5
 "PLR_BUFFER_SIZE": 4000
 "PLR_STALENESS_COEF": 0.3

@@ -970,7 +970,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}_Adaptive_Random"
+        name=f"CEC_minimax_{layout_name}_seed{config['SEED']}_Adaptive_{config['PLR_UED_SCORE']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

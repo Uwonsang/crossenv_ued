@@ -717,8 +717,7 @@ def main(config):
         rng = jax.random.PRNGKey(config["SEED"])
     
     if len(frozen_param_stack) == 0:
-        ckpt_id_list = [0, 10, 19]
-        update_step_list = [1204, 13244, 22887]
+        ckpt_id_list = ['init', 'final', 'mid']
         if config['ENV_KWARGS']['random_reset']:
             ckpt_id_list = [9, 19, 29]
         elif config['ENV_KWARGS']['partial_obs']:  # handle partial obs for toy env 
@@ -726,19 +725,19 @@ def main(config):
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
         seed_list = range(6)
-        CKPT_ROOT = Path(__file__).resolve().parents[2] / "our_ckpts"
-        custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'], 'ikFalse', 'reset_all')
-        for ckpt_id, update_step in zip(ckpt_id_list, update_step_list):
+        CKPT_ROOT = Path(__file__).resolve().parents[2] / config['FCP_filepath']
+        custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'])
+        for ckpt_id in ckpt_id_list:
             for ckpt_seed in seed_list:
-                print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl")
+                print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl")
                 if os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"
                 elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"
                 elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"
-                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl"):
-                    path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_ckpt{ckpt_id}_update{update_step}.pkl"
+                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"):
+                    path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"
                 else:
                     continue
                 with open(path_to_open, "rb") as f:

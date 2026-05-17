@@ -54,8 +54,8 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued"
-"WANDB_MODE" : "disabled"
+"PROJECT": "crossenv_ued_ljy"
+"WANDB_MODE" : "online"
 "model_name": "CEC_weight"
 "save_frames": False
 "save_frames_interval": 200
@@ -63,8 +63,8 @@
 "save_env_state_interval": 10
 # Layout index order: [asymm=0, coord_ring=1, counter_circuit=2, forced_coord=3, cramped_room=4]
 "LAYOUT_ANNEAL":
-  start_weights: [0.2, 0.2, 0.2, 0.2, 0.2]   # uniform at start
-  end_weights:   [0.25, 0.1, 0.25, 0.30, 0.1]   # less coord_ring + cramped_room at end
+  start_weights: [0.3, 0.2, 0.05, 0.05, 0.4]   # uniform at start
+  end_weights:   [0.1, 0.1, 0.35, 0.35, 0.1]   # less coord_ring + cramped_room at end
   anneal_steps: 3e9                         # env steps over which to interpolate
 "EVAL_KWARGS":
   "eval_interval": 10

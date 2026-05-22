@@ -105,6 +105,33 @@ def initialize_environment(config):
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
+def _is_connected_jax(passable_9x9):
+    """Flood fill: True iff all passable cells form one connected component."""
+    flat = passable_9x9.astype(jnp.float32).flatten()
+    visited = jnp.zeros_like(flat).at[jnp.argmax(flat)].set(1.0).reshape(9, 9)
+    def _spread(v, _):
+        nbr = jnp.maximum(
+            jnp.maximum(jnp.pad(v[1:],   ((0,1),(0,0))), jnp.pad(v[:-1],  ((1,0),(0,0)))),
+            jnp.maximum(jnp.pad(v[:,1:], ((0,0),(0,1))), jnp.pad(v[:,:-1],((0,0),(1,0)))),
+        )
+        return passable_9x9.astype(jnp.float32) * jnp.maximum(v, nbr), None
+    visited, _ = jax.lax.scan(_spread, visited, None, 18)
+    return jnp.sum(visited) == jnp.sum(passable_9x9.astype(jnp.float32))
+
+
+def _classify_layout_jax(maze_map_9x9_ch0):
+    """Return layout ID: 0=cramped_room_9, 1=asymm_advantages_9, 2=coord_ring_9,
+                         3=counter_circuit_9, 4=forced_coord_9"""
+    passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
+    n = passable.sum()
+    conn = _is_connected_jax(passable)
+    return jnp.where(n == 8, 2,
+           jnp.where(n == 6,
+               jnp.where(conn, 0, 4),
+               jnp.where(conn, 3, 1)
+           )).astype(jnp.int32)
+
+
 class ScannedRNN(nn.Module):
     @functools.partial(
         nn.scan,
@@ -480,6 +507,85 @@ def make_train(config, update_step=0):
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
+            # ── per-layout gradient conflict ──────────────────────────────
+            _LAYOUT_NAMES = [
+                "cramped_room_9", "asymm_advantages_9", "coord_ring_9",
+                "counter_circuit_9", "forced_coord_9",
+            ]
+            original_params = train_state.params
+
+            # subsample: use only the first _GC_STEPS steps to reduce activation memory
+            _GC_STEPS = config.get("GRAD_CONFLICT_STEPS", 32)
+            _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
+            _gc_adv  = advantages[:_GC_STEPS]
+            _gc_tgt  = targets[:_GC_STEPS]
+
+            # classify each (step, env) from maze_map → (_GC_STEPS, NUM_ENVS)
+            _n_se = _GC_STEPS * config["NUM_ENVS"]
+            _active_flat = train_filtered_state.maze_map[:_GC_STEPS, :, 4:13, 4:13, 0].reshape(_n_se, 9, 9)
+            _layout_ids = jax.vmap(_classify_layout_jax)(_active_flat).reshape(
+                _GC_STEPS, config["NUM_ENVS"]
+            )
+            # tile to actors: [agent0_envs..., agent1_envs...] → (_GC_STEPS, NUM_ACTORS)
+            _actor_layout = jnp.tile(_layout_ids, [1, env.num_agents])
+
+            def _tdot(g1, g2):
+                return sum(
+                    jnp.sum(a * b)
+                    for a, b in zip(jax.tree_util.tree_leaves(g1), jax.tree_util.tree_leaves(g2))
+                )
+
+            def _tnorm2(g):
+                return sum(jnp.sum(a ** 2) for a in jax.tree_util.tree_leaves(g))
+
+            # Accumulate only scalars (norms, dots) — never store more than the
+            # current gradient pytree + previously accumulated scalar values.
+            _norms_sq = []   # list of 5 scalar JAX values
+            _dots = {}       # (i, j) -> scalar dot product, i < j
+            _prev_grads = [] # grows to at most 5 pytrees, freed by XLA after last use
+
+            for _lid in range(5):
+                _mask = (_actor_layout == _lid).astype(jnp.float32)  # (_GC_STEPS, NUM_ACTORS)
+                _cnt = _mask.sum() + 1e-8
+
+                def _layout_loss(p, mask=_mask, cnt=_cnt):
+                    _, pi, value = jax.checkpoint(network.apply)(
+                        p, initial_hstate,
+                        (_gc_traj.obs, _gc_traj.done, _gc_traj.agent_positions),
+                    )
+                    lp = pi.log_prob(_gc_traj.action)
+                    adv_mean = (_gc_adv * mask).sum() / cnt
+                    adv_std = jnp.sqrt(((_gc_adv - adv_mean) ** 2 * mask).sum() / cnt + 1e-8)
+                    gae = (_gc_adv - adv_mean) / (adv_std + 1e-8)
+                    ratio = jnp.exp(lp - _gc_traj.log_prob)
+                    vpc = _gc_traj.value + (value - _gc_traj.value).clip(
+                        -config["CLIP_EPS"], config["CLIP_EPS"]
+                    )
+                    vl = 0.5 * (jnp.maximum(
+                        jnp.square(value - _gc_tgt), jnp.square(vpc - _gc_tgt)
+                    ) * mask).sum() / cnt
+                    al = -(jnp.minimum(
+                        ratio * gae,
+                        jnp.clip(ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]) * gae,
+                    ) * mask).sum() / cnt
+                    ent = (pi.entropy() * mask).sum() / cnt
+                    return al + config["VF_COEF"] * vl - config["ENT_COEF"] * ent
+
+                _g = jax.grad(_layout_loss)(original_params)
+                _norms_sq.append(_tnorm2(_g))
+                for _prev_lid, _g_prev in enumerate(_prev_grads):
+                    _dots[(_prev_lid, _lid)] = _tdot(_g_prev, _g)
+                _prev_grads.append(_g)
+
+            grad_conflict = {}
+            for _i in range(5):
+                for _j in range(_i + 1, 5):
+                    cos = _dots[(_i, _j)] / (
+                        jnp.sqrt(_norms_sq[_i] * _norms_sq[_j]) + 1e-8
+                    )
+                    grad_conflict[f"grad_conflict/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"] = cos
+            # ── end gradient conflict ──────────────────────────────────────
+
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
@@ -629,6 +735,7 @@ def make_train(config, update_step=0):
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
+                **grad_conflict,
             }
             rng = update_state[-1]
 

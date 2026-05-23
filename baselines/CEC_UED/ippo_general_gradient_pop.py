@@ -383,7 +383,7 @@ def make_train(config, update_step=0):
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
-            params=network_params,
+            params=flax.core.freeze(network_params),
             tx=tx,
         )
 
@@ -1020,7 +1020,7 @@ def main(config):
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
+        name=f"CEC_gradient_pop_{layout_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

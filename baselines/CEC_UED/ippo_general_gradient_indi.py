@@ -132,6 +132,24 @@ def _classify_layout_jax(maze_map_9x9_ch0):
            )).astype(jnp.int32)
 
 
+class CriticHead(nn.Module):
+    config: Dict
+
+    @nn.compact
+    def __call__(self, embedding):
+        x = nn.Dense(self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
+        x = nn.relu(x)
+        x = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(x)
+        x = nn.relu(x)
+        if self.config["ENV_NAME"] == "overcooked":
+            x = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(x)
+            x = nn.relu(x)
+            x = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(x)
+            x = nn.relu(x)
+        x = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(x)
+        return x.squeeze(-1)
+
+
 class ScannedRNN(nn.Module):
     @functools.partial(
         nn.scan,
@@ -245,30 +263,14 @@ class ActorCriticRNN(nn.Module):
         pi = distrax.Categorical(logits=actor_mean)
 
         #########
-        # Critic
+        # Critic — 5 independent heads, one per base layout
         #########
-        critic = nn.Dense(self.config["FC_DIM_SIZE"]*2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
-        critic = nn.relu(critic)
-        critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            critic
-        )
-        critic = nn.relu(critic)
-        if self.config["ENV_NAME"] == "overcooked":
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 1
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 2
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
+        values_all = jnp.stack(
+            [CriticHead(config=self.config, name=f"critic_{i}")(embedding) for i in range(5)],
+            axis=-1,
+        )  # (*batch, 5)
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        return hidden, pi, values_all
 
 
 class Transition(NamedTuple):
@@ -281,6 +283,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
+    layout_id: jnp.ndarray  # int32 in [0,4], one per actor
 
 @struct.dataclass
 class FilteredState:
@@ -411,7 +414,13 @@ def make_train(config, update_step=0):
                     last_done[np.newaxis, :],
                     agent_positions[np.newaxis, :],
                 )
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+                hstate, pi, values_all = network.apply(train_state.params, hstate, ac_in)
+                # classify layout per env, tile to actors
+                _cur_maze = env_state.env_state.maze_map[:, 4:13, 4:13, 0]  # (NUM_ENVS, 9, 9)
+                _layout_ids = jax.vmap(_classify_layout_jax)(_cur_maze)     # (NUM_ENVS,)
+                _actor_layout_id = jnp.tile(_layout_ids, env.num_agents)    # (NUM_ACTORS,)
+                # select the value from the correct head per actor
+                value = values_all.squeeze(0)[jnp.arange(config["NUM_ACTORS"]), _actor_layout_id]
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 env_act = unbatchify(
@@ -448,7 +457,8 @@ def make_train(config, update_step=0):
                     log_prob.squeeze(),
                     obs_batch,
                     info,
-                    agent_positions
+                    agent_positions,
+                    _actor_layout_id,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
                 return runner_state, (
@@ -478,8 +488,11 @@ def make_train(config, update_step=0):
                 last_done[np.newaxis, :],
                 agent_positions[np.newaxis, :],
             )
-            _, _, last_val = network.apply(train_state.params, hstate, ac_in)
-            last_val = last_val.squeeze()
+            _, _, last_values_all = network.apply(train_state.params, hstate, ac_in)
+            _last_maze = env_state.env_state.maze_map[:, 4:13, 4:13, 0]  # (NUM_ENVS, 9, 9)
+            _last_layout_ids = jax.vmap(_classify_layout_jax)(_last_maze)  # (NUM_ENVS,)
+            _last_actor_layout_id = jnp.tile(_last_layout_ids, env.num_agents)  # (NUM_ACTORS,)
+            last_val = last_values_all.squeeze(0)[jnp.arange(config["NUM_ACTORS"]), _last_actor_layout_id]
 
             def _calculate_gae(traj_batch, last_val):
                 def _get_advantages(gae_and_next_value, transition):
@@ -515,7 +528,7 @@ def make_train(config, update_step=0):
             original_params = train_state.params
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
-            _GC_STEPS = config.get("GRAD_CONFLICT_STEPS", 32)
+            _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
             _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
             _gc_adv  = advantages[:_GC_STEPS]
             _gc_tgt  = targets[:_GC_STEPS]
@@ -545,19 +558,18 @@ def make_train(config, update_step=0):
                 'value': {'norms_sq': [], 'dots': {}, 'prev': []},
             }
 
-            _sample_counts = []  # raw sample count per layout (for quality monitoring)
             for _lid in range(5):
                 _mask = (_actor_layout == _lid).astype(jnp.float32)  # (_GC_STEPS, NUM_ACTORS)
                 _cnt = _mask.sum() + 1e-8
-                _sample_counts.append(_mask.sum())
 
                 # Single forward pass per layout; 2 backward passes via vjp cotangents.
-                def _fwd(p, mask=_mask, cnt=_cnt):
-                    _, pi, value = jax.checkpoint(network.apply)(
+                def _fwd(p, mask=_mask, cnt=_cnt, lid=_lid):
+                    _, pi, values_all = jax.checkpoint(network.apply)(
                         p, initial_hstate,
                         (_gc_traj.obs, _gc_traj.done, _gc_traj.agent_positions),
                     )
                     lp = pi.log_prob(_gc_traj.action)
+                    value = values_all[..., lid]  # use this layout's value head
                     adv_mean = (_gc_adv * mask).sum() / cnt
                     adv_std = jnp.sqrt(((_gc_adv - adv_mean) ** 2 * mask).sum() / cnt + 1e-8)
                     gae = (_gc_adv - adv_mean) / (adv_std + 1e-8)
@@ -587,15 +599,11 @@ def make_train(config, update_step=0):
                     _s['prev'].append(_g)
 
             grad_conflict = {}
-            # per-layout sample counts — interpret cosine similarity values alongside these:
-            # low count → noisy gradient → cosine similarity less reliable
-            for _lid, _name in enumerate(_LAYOUT_NAMES):
-                grad_conflict[f"grad_conflict/sample_count/{_name}"] = _sample_counts[_lid]
 
             for _loss_type, _s in _gc_state.items():
                 # per-layout gradient norms
                 for _i in range(5):
-                    grad_conflict[f"grad_conflict/{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
+                    grad_conflict[f"grad_conflict_{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
                         jnp.sqrt(_s['norms_sq'][_i])
                     )
                 # pairwise cosine similarities
@@ -605,7 +613,7 @@ def make_train(config, update_step=0):
                             jnp.sqrt(_s['norms_sq'][_i] * _s['norms_sq'][_j]) + 1e-8
                         )
                         grad_conflict[
-                            f"grad_conflict/{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
+                            f"grad_conflict_{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
                         ] = cos
                 # joint update alignment: cos(g_i, g_all) where g_all = sum of all 5 layout gradients
                 # measures how much each layout's update aligns with the combined training direction
@@ -614,7 +622,7 @@ def make_train(config, update_step=0):
                 for _i in range(5):
                     _dot_i_all = _tdot(_s['prev'][_i], _g_all)
                     _align = _dot_i_all / (jnp.sqrt(_s['norms_sq'][_i] * _norm_all_sq) + 1e-8)
-                    grad_conflict[f"grad_conflict/{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
+                    grad_conflict[f"grad_conflict_{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
                     # leave-one-out: cos(g_i, g_all - g_i) — removes self-contribution
                     _g_others = jax.tree_map(lambda ga, gi: ga - gi, _g_all, _s['prev'][_i])
                     _norm_others_sq = _tnorm2(_g_others)
@@ -622,7 +630,7 @@ def make_train(config, update_step=0):
                     _align_loo = _dot_i_others / (
                         jnp.sqrt(_s['norms_sq'][_i] * _norm_others_sq) + 1e-8
                     )
-                    grad_conflict[f"grad_conflict/{_loss_type}/alignment_loo/{_LAYOUT_NAMES[_i]}"] = _align_loo
+                    grad_conflict[f"grad_conflict_{_loss_type}/alignment_loo/{_LAYOUT_NAMES[_i]}"] = _align_loo
             # ── end gradient conflict ──────────────────────────────────────
 
             # UPDATE NETWORK
@@ -632,11 +640,15 @@ def make_train(config, update_step=0):
 
                     def _loss_fn(params, init_hstate, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        _, pi, value = network.apply(
+                        _, pi, values_all = network.apply(
                             params,
                             jax.tree_map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
+                        # values_all: (NUM_STEPS, MINIBATCH_SIZE, 5) — select per-layout head
+                        value = jnp.take_along_axis(
+                            values_all, traj_batch.layout_id[..., None], axis=-1
+                        ).squeeze(-1)
                         log_prob = pi.log_prob(traj_batch.action)
 
                         # CALCULATE VALUE LOSS

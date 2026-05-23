@@ -31,6 +31,7 @@ import time
 import yaml
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
+import flax.core
 import chex
 import imageio
 from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
@@ -264,7 +265,7 @@ class ActorCriticRNN(nn.Module):
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0), name='critic_output')(
             critic
         )
 
@@ -392,11 +393,15 @@ def make_train(config, update_step=0):
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
+        # PopArt running statistics: network predicts normalized values
+        popart_mu = jnp.zeros(())
+        popart_sigma = jnp.ones(())
+
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
-            runner_state, update_steps = update_runner_state
+            runner_state, update_steps, popart_mu, popart_sigma = update_runner_state
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
@@ -482,28 +487,34 @@ def make_train(config, update_step=0):
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
+                # Denormalize network outputs (normalized) to real scale for GAE
+                last_val_real = last_val * popart_sigma + popart_mu
+
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
-                    done, value, reward = (
+                    done, value_norm, reward = (
                         transition.global_done,
                         transition.value,
                         transition.reward,
                     )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    value_real = value_norm * popart_sigma + popart_mu
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value_real
                     gae = (
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
-                    return (gae, value), gae
+                    return (gae, value_real), gae
 
                 _, advantages = jax.lax.scan(
                     _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
+                    (jnp.zeros_like(last_val_real), last_val_real),
                     traj_batch,
                     reverse=True,
                     unroll=16,
                 )
-                return advantages, advantages + traj_batch.value
+                # targets are real-scale returns; _loss_fn will normalize before comparing
+                targets_real = advantages + traj_batch.value * popart_sigma + popart_mu
+                return advantages, targets_real
 
             advantages, targets = _calculate_gae(traj_batch, last_val)
 
@@ -515,10 +526,11 @@ def make_train(config, update_step=0):
             original_params = train_state.params
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
-            _GC_STEPS = config.get("GRAD_CONFLICT_STEPS", 32)
+            _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
             _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
             _gc_adv  = advantages[:_GC_STEPS]
-            _gc_tgt  = targets[:_GC_STEPS]
+            # targets are real-scale; normalize for value loss in _fwd (network outputs normalized)
+            _gc_tgt  = (targets[:_GC_STEPS] - popart_mu) / popart_sigma
 
             # classify each (step, env) from maze_map → (_GC_STEPS, NUM_ENVS)
             _n_se = _GC_STEPS * config["NUM_ENVS"]
@@ -595,7 +607,7 @@ def make_train(config, update_step=0):
             for _loss_type, _s in _gc_state.items():
                 # per-layout gradient norms
                 for _i in range(5):
-                    grad_conflict[f"grad_conflict/{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
+                    grad_conflict[f"grad_conflict_{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
                         jnp.sqrt(_s['norms_sq'][_i])
                     )
                 # pairwise cosine similarities
@@ -605,7 +617,7 @@ def make_train(config, update_step=0):
                             jnp.sqrt(_s['norms_sq'][_i] * _s['norms_sq'][_j]) + 1e-8
                         )
                         grad_conflict[
-                            f"grad_conflict/{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
+                            f"grad_conflict_{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
                         ] = cos
                 # joint update alignment: cos(g_i, g_all) where g_all = sum of all 5 layout gradients
                 # measures how much each layout's update aligns with the combined training direction
@@ -614,7 +626,7 @@ def make_train(config, update_step=0):
                 for _i in range(5):
                     _dot_i_all = _tdot(_s['prev'][_i], _g_all)
                     _align = _dot_i_all / (jnp.sqrt(_s['norms_sq'][_i] * _norm_all_sq) + 1e-8)
-                    grad_conflict[f"grad_conflict/{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
+                    grad_conflict[f"grad_conflict_{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
                     # leave-one-out: cos(g_i, g_all - g_i) — removes self-contribution
                     _g_others = jax.tree_map(lambda ga, gi: ga - gi, _g_all, _s['prev'][_i])
                     _norm_others_sq = _tnorm2(_g_others)
@@ -622,7 +634,7 @@ def make_train(config, update_step=0):
                     _align_loo = _dot_i_others / (
                         jnp.sqrt(_s['norms_sq'][_i] * _norm_others_sq) + 1e-8
                     )
-                    grad_conflict[f"grad_conflict/{_loss_type}/alignment_loo/{_LAYOUT_NAMES[_i]}"] = _align_loo
+                    grad_conflict[f"grad_conflict_{_loss_type}/alignment_loo/{_LAYOUT_NAMES[_i]}"] = _align_loo
             # ── end gradient conflict ──────────────────────────────────────
 
             # UPDATE NETWORK
@@ -639,12 +651,13 @@ def make_train(config, update_step=0):
                         )
                         log_prob = pi.log_prob(traj_batch.action)
 
-                        # CALCULATE VALUE LOSS
+                        # CALCULATE VALUE LOSS (in normalized space)
+                        targets_norm = (targets - popart_mu) / popart_sigma
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_losses = jnp.square(value - targets_norm)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets_norm)
                         value_loss = 0.5 * jnp.maximum(
                             value_losses, value_losses_clipped
                         ).mean()
@@ -745,6 +758,31 @@ def make_train(config, update_step=0):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
+
+            # ── PopArt: update EMA stats and correct output layer weights ──
+            _pa_alpha = config["POPART_ALPHA"]
+            _batch_mu = targets.mean()
+            _batch_var = targets.var()
+            _mu_new = (1 - _pa_alpha) * popart_mu + _pa_alpha * _batch_mu
+            _sigma_new = jnp.sqrt(jnp.maximum(
+                (1 - _pa_alpha) * (popart_sigma ** 2 + popart_mu ** 2)
+                + _pa_alpha * (_batch_var + _batch_mu ** 2)
+                - _mu_new ** 2,
+                1e-8,
+            ))
+            # Preserve outputs precisely: rescale critic_output layer so the
+            # real-scale prediction is unchanged despite the new normalization.
+            _pa_params = flax.core.unfreeze(train_state.params)
+            _pa_params['params']['critic_output']['kernel'] = (
+                popart_sigma / _sigma_new
+            ) * _pa_params['params']['critic_output']['kernel']
+            _pa_params['params']['critic_output']['bias'] = (
+                popart_sigma * _pa_params['params']['critic_output']['bias'] + popart_mu - _mu_new
+            ) / _sigma_new
+            train_state = train_state.replace(params=flax.core.freeze(_pa_params))
+            popart_mu, popart_sigma = _mu_new, _sigma_new
+            # ── end PopArt ────────────────────────────────────────────────
+
             metric = traj_batch.info
             metric = jax.tree_map(
                 lambda x: x.reshape(
@@ -774,6 +812,8 @@ def make_train(config, update_step=0):
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
+                "popart/mu": popart_mu,
+                "popart/sigma": popart_sigma,
                 **grad_conflict,
             }
             rng = update_state[-1]
@@ -922,7 +962,7 @@ def make_train(config, update_step=0):
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
-            return (runner_state, update_steps), metric
+            return (runner_state, update_steps, popart_mu, popart_sigma), metric
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -933,9 +973,10 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+        out_carry, metric = jax.lax.scan(
+            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
+        runner_state = out_carry[0]
         return {"runner_state": runner_state}
 
     return train

@@ -72,3 +72,6 @@
   "random_reset_fn": "reset_all" 
   "beta": 1.0
   "argmax": False
+# for gradient conflict
+"GRAD_CONFLICT_STEPS": 32
+"POPART_ALPHA": 0.01

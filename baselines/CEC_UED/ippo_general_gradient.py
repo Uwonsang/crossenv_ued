@@ -538,17 +538,21 @@ def make_train(config, update_step=0):
             def _tnorm2(g):
                 return sum(jnp.sum(a ** 2) for a in jax.tree_util.tree_leaves(g))
 
-            # Accumulate only scalars (norms, dots) — never store more than the
-            # current gradient pytree + previously accumulated scalar values.
-            _norms_sq = []   # list of 5 scalar JAX values
-            _dots = {}       # (i, j) -> scalar dot product, i < j
-            _prev_grads = [] # grows to at most 5 pytrees, freed by XLA after last use
+            # Per-loss-type scalar accumulators: norms_sq[lid], dots[(i,j)], prev[lid]
+            # actor and value are logged; entropy is excluded (less interpretable).
+            _gc_state = {
+                'actor': {'norms_sq': [], 'dots': {}, 'prev': []},
+                'value': {'norms_sq': [], 'dots': {}, 'prev': []},
+            }
 
+            _sample_counts = []  # raw sample count per layout (for quality monitoring)
             for _lid in range(5):
                 _mask = (_actor_layout == _lid).astype(jnp.float32)  # (_GC_STEPS, NUM_ACTORS)
                 _cnt = _mask.sum() + 1e-8
+                _sample_counts.append(_mask.sum())
 
-                def _layout_loss(p, mask=_mask, cnt=_cnt):
+                # Single forward pass per layout; 2 backward passes via vjp cotangents.
+                def _fwd(p, mask=_mask, cnt=_cnt):
                     _, pi, value = jax.checkpoint(network.apply)(
                         p, initial_hstate,
                         (_gc_traj.obs, _gc_traj.done, _gc_traj.agent_positions),
@@ -558,32 +562,67 @@ def make_train(config, update_step=0):
                     adv_std = jnp.sqrt(((_gc_adv - adv_mean) ** 2 * mask).sum() / cnt + 1e-8)
                     gae = (_gc_adv - adv_mean) / (adv_std + 1e-8)
                     ratio = jnp.exp(lp - _gc_traj.log_prob)
+                    al = -(jnp.minimum(
+                        ratio * gae,
+                        jnp.clip(ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]) * gae,
+                    ) * mask).sum() / cnt
                     vpc = _gc_traj.value + (value - _gc_traj.value).clip(
                         -config["CLIP_EPS"], config["CLIP_EPS"]
                     )
                     vl = 0.5 * (jnp.maximum(
                         jnp.square(value - _gc_tgt), jnp.square(vpc - _gc_tgt)
                     ) * mask).sum() / cnt
-                    al = -(jnp.minimum(
-                        ratio * gae,
-                        jnp.clip(ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]) * gae,
-                    ) * mask).sum() / cnt
-                    ent = (pi.entropy() * mask).sum() / cnt
-                    return al + config["VF_COEF"] * vl - config["ENT_COEF"] * ent
+                    return al, vl
 
-                _g = jax.grad(_layout_loss)(original_params)
-                _norms_sq.append(_tnorm2(_g))
-                for _prev_lid, _g_prev in enumerate(_prev_grads):
-                    _dots[(_prev_lid, _lid)] = _tdot(_g_prev, _g)
-                _prev_grads.append(_g)
+                _, _vjp_fn = jax.vjp(_fwd, original_params)
+                # cotangent (1, 0) → actor gradient; (0, 1) → value gradient
+                _g_actor, = _vjp_fn((1.0, 0.0))
+                _g_value, = _vjp_fn((0.0, 1.0))
+
+                for _loss_type, _g in [('actor', _g_actor), ('value', _g_value)]:
+                    _s = _gc_state[_loss_type]
+                    _s['norms_sq'].append(_tnorm2(_g))
+                    for _prev_lid, _g_prev in enumerate(_s['prev']):
+                        _s['dots'][(_prev_lid, _lid)] = _tdot(_g_prev, _g)
+                    _s['prev'].append(_g)
 
             grad_conflict = {}
-            for _i in range(5):
-                for _j in range(_i + 1, 5):
-                    cos = _dots[(_i, _j)] / (
-                        jnp.sqrt(_norms_sq[_i] * _norms_sq[_j]) + 1e-8
+            # per-layout sample counts — interpret cosine similarity values alongside these:
+            # low count → noisy gradient → cosine similarity less reliable
+            for _lid, _name in enumerate(_LAYOUT_NAMES):
+                grad_conflict[f"grad_conflict/sample_count/{_name}"] = _sample_counts[_lid]
+
+            for _loss_type, _s in _gc_state.items():
+                # per-layout gradient norms
+                for _i in range(5):
+                    grad_conflict[f"grad_conflict/{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
+                        jnp.sqrt(_s['norms_sq'][_i])
                     )
-                    grad_conflict[f"grad_conflict/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"] = cos
+                # pairwise cosine similarities
+                for _i in range(5):
+                    for _j in range(_i + 1, 5):
+                        cos = _s['dots'][(_i, _j)] / (
+                            jnp.sqrt(_s['norms_sq'][_i] * _s['norms_sq'][_j]) + 1e-8
+                        )
+                        grad_conflict[
+                            f"grad_conflict/{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
+                        ] = cos
+                # joint update alignment: cos(g_i, g_all) where g_all = sum of all 5 layout gradients
+                # measures how much each layout's update aligns with the combined training direction
+                _g_all = jax.tree_map(lambda *gs: sum(gs), *_s['prev'])
+                _norm_all_sq = _tnorm2(_g_all)
+                for _i in range(5):
+                    _dot_i_all = _tdot(_s['prev'][_i], _g_all)
+                    _align = _dot_i_all / (jnp.sqrt(_s['norms_sq'][_i] * _norm_all_sq) + 1e-8)
+                    grad_conflict[f"grad_conflict/{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
+                    # leave-one-out: cos(g_i, g_all - g_i) — removes self-contribution
+                    _g_others = jax.tree_map(lambda ga, gi: ga - gi, _g_all, _s['prev'][_i])
+                    _norm_others_sq = _tnorm2(_g_others)
+                    _dot_i_others = _tdot(_s['prev'][_i], _g_others)
+                    _align_loo = _dot_i_others / (
+                        jnp.sqrt(_s['norms_sq'][_i] * _norm_others_sq) + 1e-8
+                    )
+                    grad_conflict[f"grad_conflict/{_loss_type}/alignment_loo/{_LAYOUT_NAMES[_i]}"] = _align_loo
             # ── end gradient conflict ──────────────────────────────────────
 
             # UPDATE NETWORK
@@ -902,7 +941,7 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC")
+@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")

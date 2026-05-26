@@ -1085,12 +1085,20 @@ def main(config):
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
+    popart_mu_final = runner_state[2]
+    popart_sigma_final = runner_state[3]
 
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_e3t_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
+        ckpt = {
+            'key': rng,
+            'params': model_state.params,
+            'update_steps': num_updates,
+            'popart_mu': popart_mu_final,
+            'popart_sigma': popart_sigma_final,
+            }
         pickle.dump(ckpt, f)
 
     print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_e3t_updates{num_updates}.pkl")

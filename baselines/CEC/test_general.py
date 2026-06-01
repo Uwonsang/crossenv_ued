@@ -192,19 +192,21 @@ def main(config):
 
     param_list = []
     seed_list = []
-    iter_range = range(6)
+    iter_range = range(config['NUM_MODELS'])
     def find_model_path(seed):
         if config["model_name"] == "CEC":
-            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved.pkl"]
+            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_updates58593.pkl"] 
         elif config["model_name"] == "FCP":
             patterns = [
-                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_improved_fcp_updates22888.pkl",
+                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/fcp_seed{seed}_best.pkl",
             ]
         elif config["model_name"] == "E3T":
-            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_e3t_updates22888.pkl"]
+            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_best_e3t.pkl"]
         elif config["model_name"] == "IPPO":
             patterns = [
-                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt19_update22887.pkl"]
+                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"]
+        elif config["model_name"] == "CEC_POP_ART":
+            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"] 
         for pat in patterns:
             matches = sorted(glob_module.glob(pat))
             if matches:
@@ -222,6 +224,7 @@ def main(config):
                 del previous_ckpt
         except:
             continue
+    
     if len(param_list) == 0:
         print(f"No models found")
         exit(0)

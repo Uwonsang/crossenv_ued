@@ -1013,7 +1013,6 @@ def main(config):
     print(f"Starting from update step {final_update_step}")
     train_fn = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_fn(rng, model_params, final_update_step)
-    jax.block_until_ready(out)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
@@ -1029,7 +1028,10 @@ def main(config):
     print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
-    wandb.finish()
+    
+    jax.effects_barrier()
+    jax.clear_caches()
+    wandb.finish() 
 
 if __name__ == "__main__":
     main()

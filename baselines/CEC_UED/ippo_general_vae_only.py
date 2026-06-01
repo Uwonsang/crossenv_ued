@@ -816,7 +816,6 @@ def main(config):
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
-    jax.block_until_ready(out)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
@@ -832,7 +831,10 @@ def main(config):
 
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}")
     print(f'Saved to {filepath}/{fcp_prefix}train_info_seed{config["SEED"]}_ckpt{config["TRAIN_KWARGS"]["ckpt_id"]}{finetune_appendage}.png')
-    wandb.finish()
+    
+    jax.effects_barrier()
+    jax.clear_caches()
+    wandb.finish() 
 
 if __name__ == "__main__":
     main()

@@ -988,10 +988,10 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
         )
-        out_carry, metric = jax.lax.scan(
+        runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
-        runner_state = out_carry[0]
+        
         return {"runner_state": runner_state}
 
     return train
@@ -1104,6 +1104,10 @@ def main(config):
     print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_e3t_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
+
+    jax.effects_barrier()
+    jax.clear_caches()
+    wandb.finish() 
 
 if __name__ == "__main__":
     main()

@@ -235,7 +235,10 @@ def main(config):
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
     seed_pairs = seed_pairs.reshape((2, -1)).T
-
+    
+    # remove pairs of the same seed
+    if config['CROSS_PLAY_ONLY']:
+        seed_pairs = seed_pairs[seed_pairs[:, 0] != seed_pairs[:, 1]]
     ##################
     # Initialize environment and network
     ##################

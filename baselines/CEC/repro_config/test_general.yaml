@@ -41,7 +41,7 @@
 "TEST_KWARGS":
   "beta": 1.0
   "argmax": False  # otherwise we sample from policy
-  "num_trajs": 2
+  "num_trajs": 10
   "plot": False  # if true, will get precedence over saving data
   "self_play": False  # get's full cross play matrix
   "ik": False # relevant to which model to load (ik vs sk)
@@ -55,6 +55,7 @@
 "MODEL_PATH": "/app/nas/models/new_baselines_model"
 "SAVE_PATH": "/app/baselines/CEC/results/test_general"
 "NUM_MODELS": 3
+"CROSS_PLAY_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"

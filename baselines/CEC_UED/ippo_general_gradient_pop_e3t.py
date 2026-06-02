@@ -1085,6 +1085,7 @@ def main(config):
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
+    final_rng = train_state[-1]
     popart_mu_final = runner_state[2]
     popart_sigma_final = runner_state[3]
 
@@ -1093,7 +1094,7 @@ def main(config):
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_e3t_updates{num_updates}.pkl", "wb") as f:
         ckpt = {
-            'key': rng,
+            'key': final_rng,
             'params': model_state.params,
             'update_steps': num_updates,
             'popart_mu': popart_mu_final,

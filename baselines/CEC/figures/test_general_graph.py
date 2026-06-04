@@ -8,14 +8,15 @@ import numpy as np
 import pandas as pd
 import os
 
+ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC", "CEC_POP_ART"]
+
+_ALG_PAT = "|".join(re.escape(a) for a in sorted(ALG_ORDER, key=len, reverse=True))
 FNAME_RE = re.compile(
-    r"^(?P<alg>[A-Za-z0-9]+)_(?P<map>.+)_9_XP_results\.csv$"
+    rf"^(?P<alg>{_ALG_PAT})_(?P<map>.+)_9_XP_results\.csv$"
 )
 
-ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC"]
-
 # IPPO, E3T, FCP, CEC — "5 Heldout Grids" style (red / purple / gold / forest green)
-ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733"]
+ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733", "#008000"]
 
 MAP_ORDER = [
     "asymm_advantages",
@@ -162,8 +163,8 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
 
 def main():
 
-    results_path = Path(__file__).resolve().parent.parent / "results" / "test_general_5"
-    out_path = Path(__file__).resolve().parent / "results" / "test_general_graph_5"
+    results_path = Path(__file__).resolve().parent.parent / "results" / "test_general"
+    out_path = Path(__file__).resolve().parent / "results" / "test_general_graph"
 
     grid = load_grid(results_path)
 

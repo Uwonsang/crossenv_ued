@@ -23,7 +23,7 @@ Training and evaluation code for **Cross-Environment Coordination (CEC)** and co
 | [test_e3t.py](test_e3t.py) | Evaluation script specific to E3T checkpoints (includes t-SNE embedding) |
 | [test_oracle.py](test_oracle.py) | Evaluates an oracle agent (trained per-layout) as an upper-bound baseline |
 | [test_cross_env.py](test_cross_env.py) | Evaluates cross-environment generalization |
-| [test_all_models_cross.py](test_all_models_cross.py) | Batch evaluation across all model types (IPPO, E3T, FCP, CEC) |
+| [test_all_models_cross.py](test_all_models_cross.py) | Batch evaluation across all model types (IPPO, E3T, FCP, CEC, CEC_POP_ART) |
 | [cross_algo.py](cross_algo.py) | Shared cross-play rollout logic used by eval scripts |
 
 ### Networks

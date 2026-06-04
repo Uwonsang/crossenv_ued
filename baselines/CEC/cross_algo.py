@@ -157,8 +157,8 @@ def get_rollouts(model_param_1, model_param_2, config, env, network_1, network_2
 def load_ik_models(config):
     param_list = []
     seed_list = []
-    for seed in range(6):
-        load_path = f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved.pkl"
+    for seed in range(config['NUM_MODELS']):
+        load_path = f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_updates58593.pkl"
         try:
             with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
@@ -169,10 +169,11 @@ def load_ik_models(config):
             continue
     param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
+
 def load_ik_finetune_models(config):
     param_list = []
     seed_list = []
-    for seed in range(6):
+    for seed in range(config['NUM_MODELS']):
         load_path = f"ckpts/ippo/{config['ENV_NAME']}/{config['ENV_KWARGS']['layout']}/ikFalse/reset_all/graphTrue"
         try:
             with open(f"{load_path}/seed{seed}_ckpt1_improved_finetune.pkl", "rb") as f:
@@ -184,11 +185,12 @@ def load_ik_finetune_models(config):
             continue
     param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
+
 def load_sk_models(config): #ippo
     param_list = []
     seed_list = []
-    for seed in range(6):
-        load_path = f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt19_update22887.pkl"
+    for seed in range(config['NUM_MODELS']):
+        load_path = f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"
         try:
             with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
@@ -199,11 +201,12 @@ def load_sk_models(config): #ippo
             continue
     param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
+
 def load_e3t_models(config):
     param_list = []
     seed_list = []
-    for seed in range(6):
-        load_path = f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_e3t_updates22888.pkl"
+    for seed in range(config['NUM_MODELS']):
+        load_path = f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_best_e3t.pkl"
         try:
             with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
@@ -214,15 +217,37 @@ def load_e3t_models(config):
             continue
     param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
+
 def load_fcp_models(config):
     param_list = []
     seed_list = []
-    for seed in range(6):
-        load_path = f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_improved_fcp_updates22888.pkl"
+    for seed in range(config['NUM_MODELS']):
+        load_path = f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/fcp_seed{seed}_best.pkl"
         try:
             with open(load_path, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
+                param_list.append(model_params)
+                seed_list.append(seed)
+        except:
+            continue
+    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    return param_stack, jnp.array(seed_list)
+
+def load_ik_models_pop_art(config):
+    param_list = []
+    seed_list = []
+    for seed in range(config['NUM_MODELS']):
+        load_path = f"{config['MODEL_PATH']}/CEC_POP_ART/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"
+        try:
+            with open(load_path, "rb") as f:
+                previous_ckpt = pickle.load(f)
+                model_params = previous_ckpt['params']
+                import flax.core
+                p = flax.core.unfreeze(model_params)
+                if 'critic_output' in p.get('params', {}):
+                    p['params']['Dense_11'] = p['params'].pop('critic_output')
+                model_params = flax.core.freeze(p)
                 param_list.append(model_params)
                 seed_list.append(seed)
         except:
@@ -246,6 +271,7 @@ def main(config):
     sk_param_stack, sk_seed_list = load_sk_models(config)
     fcp_param_stack, fcp_seed_list = load_fcp_models(config)
     e3t_param_stack, e3t_seed_list = load_e3t_models(config)
+    ik_param_stack_pop_art, ik_seed_list_pop_art = load_ik_models_pop_art(config)
     # ik_finetune_param_stack, ik_finetune_seed_list = load_ik_finetune_models(config)
     assert len(ik_seed_list) > 0
     assert len(sk_seed_list) > 0
@@ -269,9 +295,10 @@ def main(config):
     sk_info = (sk_param_stack, sk_seed_list, regular_network, 'sk')
     fcp_info = (fcp_param_stack, fcp_seed_list, regular_network, 'fcp')
     e3t_info = (e3t_param_stack, e3t_seed_list, e3t_network, 'e3t')
+    ik_pop_art_info = (ik_param_stack_pop_art, ik_seed_list_pop_art, regular_network, 'ik_pop_art')
     # ik_finetune_info = (ik_finetune_param_stack, ik_finetune_seed_list, regular_network, 'ik_finetune')
 
-    info_list = [ik_info, sk_info, fcp_info, e3t_info]
+    info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_pop_art_info]
     # info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_finetune_info]
 
 

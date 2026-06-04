@@ -206,7 +206,9 @@ def main(config):
             patterns = [
                 f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"]
         elif config["model_name"] == "CEC_POP_ART":
-            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"] 
+            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"]
+        elif config["model_name"] == "CEC_POP_ART_TEST":
+            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART_TEST/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29.pkl"]
         for pat in patterns:
             matches = sorted(glob_module.glob(pat))
             if matches:
@@ -219,6 +221,12 @@ def main(config):
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
+                if config["model_name"] in ("CEC_POP_ART", "CEC_POP_ART_TEST"):
+                    import flax.core
+                    p = flax.core.unfreeze(model_params)
+                    if 'critic_output' in p.get('params', {}):
+                        p['params']['Dense_11'] = p['params'].pop('critic_output')
+                    model_params = flax.core.freeze(p)
                 param_list.append(model_params)
                 seed_list.append(seed)
                 del previous_ckpt
@@ -245,7 +253,7 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    if config["model_name"] == "CEC" or config["model_name"] == "FCP" or config["model_name"] == "IPPO":
+    if config["model_name"] in ("CEC", "FCP", "IPPO", "CEC_POP_ART", "CEC_POP_ART_TEST"):
         network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
     elif config["model_name"] == "E3T":
         network = ActorCriticE3T(env.action_space("agent_0").n, config=config)

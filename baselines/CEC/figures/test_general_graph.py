@@ -7,8 +7,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import os
+import hydra
+from omegaconf import OmegaConf
 
-ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC", "CEC_POP_ART"]
+# ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC", "CEC_POP_ART"]
+ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC"]
 
 _ALG_PAT = "|".join(re.escape(a) for a in sorted(ALG_ORDER, key=len, reverse=True))
 FNAME_RE = re.compile(
@@ -16,7 +19,8 @@ FNAME_RE = re.compile(
 )
 
 # IPPO, E3T, FCP, CEC — "5 Heldout Grids" style (red / purple / gold / forest green)
-ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733", "#008000"]
+# ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733", "#008000"]
+ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733"]
 
 MAP_ORDER = [
     "asymm_advantages",
@@ -39,7 +43,7 @@ def _alg_color_map() -> dict[str, str]:
     return {alg: c for alg, c in zip(ALG_ORDER, ALG_COLORS)}
 
 
-def load_grid(results_dir: Path) -> pd.DataFrame:
+def load_grid(config, results_dir: Path) -> pd.DataFrame:
     rows = []
     for path in sorted(results_dir.glob("*_9_XP_results.csv")):
         m = FNAME_RE.match(path.name)
@@ -49,6 +53,8 @@ def load_grid(results_dir: Path) -> pd.DataFrame:
         df = pd.read_csv(path)
         if "reward" not in df.columns:
             continue
+        if config["XP_ONLY"]:
+            df = df[df["seed_1"] != df["seed_2"]]
         r = df["reward"].astype(float)
         mean_r = float(r.mean())
         # 시드 쌍 단위로 묶어 SEM(standard error of mean) 계산
@@ -161,12 +167,14 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
     plt.close(fig)
 
 
-def main():
+@hydra.main(version_base=None, config_path="../repro_config", config_name="test_general")
+def main(config):
+    config = OmegaConf.to_container(config)
 
-    results_path = Path(__file__).resolve().parent.parent / "results" / "test_general"
-    out_path = Path(__file__).resolve().parent / "results" / "test_general_graph"
+    results_path = Path(__file__).resolve().parent.parent / "results" / f"test_general_{config['NUM_MODELS']}" 
+    out_path = Path(__file__).resolve().parent / "results" / f"test_general_graph_{config['NUM_MODELS']}"
 
-    grid = load_grid(results_path)
+    grid = load_grid(config, results_path)
 
     os.makedirs(out_path, exist_ok=True)
     plot_per_map(grid, out_path / "xp_per_map.png")

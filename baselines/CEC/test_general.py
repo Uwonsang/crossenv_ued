@@ -9,12 +9,7 @@ import glob as glob_module
 import pickle
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
-import optax
-from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
-from flax.training.train_state import TrainState
 import distrax
 import hydra
 from omegaconf import OmegaConf
@@ -188,7 +183,9 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    os.makedirs(config['SAVE_PATH'], exist_ok=True)
+    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"])
+    config['SAVE_PATH_FINAL'] = save_path_final
+    os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
 
     param_list = []
     seed_list = []
@@ -244,9 +241,6 @@ def main(config):
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
     seed_pairs = seed_pairs.reshape((2, -1)).T
     
-    # remove pairs of the same seed
-    if config['CROSS_PLAY_ONLY']:
-        seed_pairs = seed_pairs[seed_pairs[:, 0] != seed_pairs[:, 1]]
     ##################
     # Initialize environment and network
     ##################
@@ -290,7 +284,7 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        savefile = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results.csv"
+        savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results.csv"
         df.to_csv(savefile, index=False)
         print(f"Saved data to {savefile}")
     else:
@@ -387,7 +381,7 @@ def main(config):
 
                 # Save as gif with explicit loop parameter and duration
 
-                gif_path = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
+                gif_path = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
                 imageio.mimsave(
                     gif_path,
                     frames,

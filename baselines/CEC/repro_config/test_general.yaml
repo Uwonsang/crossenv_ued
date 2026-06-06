@@ -55,7 +55,7 @@
 "MODEL_PATH": "/app/nas/models/new_baselines_model"
 "SAVE_PATH": "/app/baselines/CEC/results/test_general"
 "NUM_MODELS": 3
-"CROSS_PLAY_ONLY": True
+"XP_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"

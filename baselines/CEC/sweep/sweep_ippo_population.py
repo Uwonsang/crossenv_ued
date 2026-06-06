@@ -23,7 +23,7 @@ import wandb
 # W&B sweep params must be flat — nested keys (layout) are applied
 # manually in run_sweep_agent() below.
 SWEEP_CONFIG = {
-    "method": "bayes",   # "grid" | "random" | "bayes"
+    "method": "grid",   # "grid" | "random" | "bayes"
     "metric": {
         "name": "returns",
         "goal": "maximize",
@@ -33,13 +33,10 @@ SWEEP_CONFIG = {
             "values": [1e-4, 3e-4, 1e-3],
         },
         "VF_COEF": {
-            "values": [0.25, 0.5, 1],
+            "values": [1],
         },
         "NUM_MINIBATCHES": {
-            "values": [4, 8, 16],
-        },
-        "ENT_COEF": {
-            "values": [0.005, 0.01],
+            "values": [2, 4],
         },
         # nested under ENV_KWARGS — applied manually
         "layout": {
@@ -60,13 +57,13 @@ BASE_CONFIG = {
     "LR": 1e-3,
     "NUM_ENVS": 256,
     "NUM_SEEDS": 1,
-    "NUM_STEPS": 400,
+    "NUM_STEPS": 256,
     "FC_DIM_SIZE": 256,
     "GRU_HIDDEN_DIM": 256,
     "TOTAL_TIMESTEPS": 5e7,
     "MAX_TRAIN_STEPS": 5e7,
     "UPDATE_EPOCHS": 4,
-    "NUM_MINIBATCHES": 8,
+    "NUM_MINIBATCHES": 2,
     "GAMMA": 0.99,
     "GAE_LAMBDA": 0.95,
     "CLIP_EPS": 0.2,
@@ -111,7 +108,7 @@ BASE_CONFIG = {
     "FCP": False,
     "FCP_KWARGS": {"train_oracle": True},
     "ENTITY": "overcooked_ai",
-    "PROJECT": "crossenv_ued_test",
+    "PROJECT": "crossenv_ued_short",
     "WANDB_MODE": "online",
     "model_name": "IPPO",
 }

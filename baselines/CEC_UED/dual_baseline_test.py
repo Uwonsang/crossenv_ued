@@ -1,0 +1,22 @@
+# 1. Figure 3의 IPPO baseline / FCP partner population
+for s in 0 1 2 3 4 5; do
+  python3 baselines/CEC_UED/ippo_general_dual_destination.py \
+    SEED=$s \
+    ENV_KWARGS.random_reset=false \
+    ENV_KWARGS.check_held_out=false
+
+
+# # 2. Figure 3의 CEC
+# for s in 0 1 2 3 4 5; do
+#   python3 baselines/CEC_UED/ippo_general_dual_destination.py \
+#     SEED=$s \
+#     ENV_KWARGS.random_reset=true \
+#     ENV_KWARGS.check_held_out=true
+# done
+
+# # 3. Figure 3의 FCP
+# for s in 0 1 2 3 4 5; do
+#   python3 baselines/CEC_UED/fcp_general_dual_destination.py \
+#     SEED=$s \
+#     FCP_PARTNER_ROOT=ckpts/ippo/ToyCoop/ikFalse/reset_all
+# done

@@ -33,7 +33,7 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -325,6 +325,7 @@ def make_train(config, update_step=0):
 
     def train(rng, model_params=None, update_step=0):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+        remaining_updates = int(config["NUM_UPDATES"]) - update_step
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -366,7 +367,7 @@ def make_train(config, update_step=0):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
@@ -715,34 +716,6 @@ def make_train(config, update_step=0):
                         for _ln in EVAL_LAYOUTS_9:
                             log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
 
-                if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
-
-                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
-                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
-                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
-                    for t in range(ep_done.shape[0]):
-                        for e in range(ep_done.shape[1]):
-                            if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
-                                layout_returns[label].append(float(ep_rets[t, e]))
-                    for name in EVAL_LAYOUTS_9:
-                        returns_for_layout = layout_returns[name]
-                        log_dict[f"train_returns/{name}"] = (
-                            float(np.mean(returns_for_layout))
-                            if len(returns_for_layout) > 0
-                            else float("nan")
-                        )
                 wandb.log(log_dict)
                 
                 step = int(metric["update_steps"])
@@ -763,6 +736,19 @@ def make_train(config, update_step=0):
                     arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
                     save_to_hdf5(save_path, state_names, arrays, save_slot, step)
 
+                save_interval = config.get("SAVE_CKPT_INTERVAL", 0)
+                if save_interval > 0 and step > 0 and step % save_interval == 0:
+                    mid_ckpt_dir = config["MID_CKPT_DIR"]
+                    os.makedirs(mid_ckpt_dir, exist_ok=True)
+                    mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
+                    with open(mid_ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'params': metric['params'],
+                            'final_update_step': step,
+                            'wandb_run_id': wandb.run.id,
+                        }, f)
+                    print(f"[Resume ckpt] step={step} saved → {mid_ckpt_path}")
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
 
@@ -772,6 +758,7 @@ def make_train(config, update_step=0):
                 "env_state": env_state,
                 "episode_returns_step": episode_returns_step,
                 "episode_done_step": episode_done_step,
+                "params": train_state.params,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
             update_steps = update_steps + 1
@@ -788,7 +775,7 @@ def make_train(config, update_step=0):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step), jnp.arange(remaining_updates), remaining_updates
         )
         return {"runner_state": runner_state}
 
@@ -825,21 +812,47 @@ def main(config):
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-    
-    layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
-    )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+
+    # filepath: RESUME_XPID가 있으면 그 xpid 재사용, 없으면 새 xpid 생성
+    resume_xpid = config.get("RESUME_XPID", "")
+    active_xpid = resume_xpid if resume_xpid else xpid
+
+    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
+        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+    filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
+
+    # Mid-run checkpoint dir: xpid 폴더 안에 위치
+    config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
+
+    mid_ckpt_path = os.path.join(config['MID_CKPT_DIR'], "resume_ckpt.pkl")
+    _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    wandb_resume_id = None
+    if _has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            _peek = pickle.load(f)
+        wandb_resume_id = _peek.get('wandb_run_id', None)
+
+    layout_name = config["ENV_KWARGS"]["layout"]
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["IPPO", "RNN", "SP"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=f"CEC_{layout_name}_seed{config['SEED']}"
+        )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
@@ -847,7 +860,14 @@ def main(config):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    # Auto-resume from mid-run checkpoint if available
+    if _has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = _peek['params']
+        final_update_step = _peek['final_update_step']
+        rng = jax.random.PRNGKey(config["SEED"])
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)

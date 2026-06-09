@@ -323,9 +323,10 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
+
+    def train(rng, model_params=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-        remaining_updates = int(config["NUM_UPDATES"]) - update_step
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -901,7 +902,7 @@ def main(config):
 
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
+    out = train_jit(rng, model_params)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]

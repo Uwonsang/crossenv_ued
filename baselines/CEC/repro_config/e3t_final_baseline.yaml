@@ -1,12 +1,12 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked
 "LR": 3e-4
-"NUM_ENVS": 128
+"NUM_ENVS": 64
 "NUM_SEEDS": 1
-"NUM_STEPS": 400
+"NUM_STEPS": 256
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
-"MAX_TRAIN_STEPS": 3e9
+"TOTAL_TIMESTEPS": 5e7 # 3e9 for overcooked
+"MAX_TRAIN_STEPS": 5e7
 "UPDATE_EPOCHS": 4
 "NUM_MINIBATCHES": 2
 "GAMMA": 0.99

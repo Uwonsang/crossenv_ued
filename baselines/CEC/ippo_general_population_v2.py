@@ -601,8 +601,9 @@ def make_train(config, update_step=0, filepath=""):
                 if current_threshold > last_saved_threshold[0]:
                     last_saved_threshold[0] = current_threshold
                     os.makedirs(filepath, exist_ok=True)
-                    with open(f"{filepath}/seed{config['SEED']}_return{current_return:.1f}.pkl", "wb") as f:
+                    with open(f"{filepath}/seed{config['SEED']}_ckpt_{ckpt_count[0]}.pkl", "wb") as f:
                         pickle.dump({'params': params, 'returns': current_return, 'update_steps': step}, f)
+                    ckpt_count[0] += 1
 
                 # Save best return checkpoint
                 if current_return > best_return[0]:
@@ -622,6 +623,7 @@ def make_train(config, update_step=0, filepath=""):
 
         best_return = [float('-inf')]
         last_saved_threshold = [-10]
+        ckpt_count = [0]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (

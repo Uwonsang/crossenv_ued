@@ -693,7 +693,7 @@ def main(config):
         mode=config["WANDB_MODE"],
         name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
     )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath = f"ckpts/e3t/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
@@ -717,7 +717,7 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
+        finetune_filepath =f"ckpts/e3t/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             finetune_filepath += f"/{config['ENV_KWARGS']['layout']}"
         finetune_filepath = f"{finetune_filepath}/ikFalse"

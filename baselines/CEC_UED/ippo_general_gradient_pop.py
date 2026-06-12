@@ -514,14 +514,11 @@ def make_train(config, update_step=0):
 
             # ── critic quality: how well does the critic fit the targets it's trained on? ──
             _value_norm = traj_batch.value
-            _value_real = _value_norm * popart_sigma + popart_mu
-            _err_raw = targets - _value_real
             _err_norm = _targets_norm - _value_norm
 
-            target_stats["critic/explained_var_raw"] = 1.0 - _err_raw.var() / (targets.var() + 1e-8)
-            target_stats["critic/explained_var_popart"] = 1.0 - _err_norm.var() / (_targets_norm.var() + 1e-8)
-            target_stats["critic/bias_popart"] = _err_norm.mean()
-            target_stats["critic/rmse_popart"] = jnp.sqrt((_err_norm ** 2).mean())
+            target_stats["critic/explained_var"] = 1.0 - _err_norm.var() / (_targets_norm.var() + 1e-8)
+            target_stats["critic/bias"] = _err_norm.mean()
+            target_stats["critic/rmse"] = jnp.sqrt((_err_norm ** 2).mean())
 
             _N = targets.size
             _layer_means, _layer_vars, _layer_counts, _layer_stds_n = [], [], [], []

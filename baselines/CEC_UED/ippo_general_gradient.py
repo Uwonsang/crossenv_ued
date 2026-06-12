@@ -281,6 +281,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
+    layout_id: jnp.ndarray
 
 @struct.dataclass
 class FilteredState:
@@ -401,6 +402,11 @@ def make_train(config, update_step=0):
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
 
+                # layout BEFORE env.step: the layout this transition's action/reward belong to
+                pre_maze_map = env_state.env_state.maze_map
+                layout_id = jax.vmap(_classify_layout_jax)(pre_maze_map[:, 4:13, 4:13, 0])  # (NUM_ENVS,)
+                layout_id = jnp.tile(layout_id, [env.num_agents])  # (NUM_ACTORS,), matches agent_positions
+
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
                 obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
@@ -448,7 +454,8 @@ def make_train(config, update_step=0):
                     log_prob.squeeze(),
                     obs_batch,
                     info,
-                    agent_positions
+                    agent_positions,
+                    layout_id,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
                 return runner_state, (
@@ -513,6 +520,59 @@ def make_train(config, update_step=0):
                 "counter_circuit_9", "forced_coord_9",
             ]
             original_params = train_state.params
+
+            # per-step layout id, classified pre-step inside _env_step, already tiled to actors
+            _actor_layout_full = traj_batch.layout_id  # (NUM_STEPS, NUM_ACTORS)
+            _layout_ids_full = _actor_layout_full[:, :config["NUM_ENVS"]]  # (NUM_STEPS, NUM_ENVS)
+
+            # ── value target / critic quality statistics (raw scale, no PopArt here) ──
+            target_stats = {}
+            target_stats["target_raw/mean"] = targets.mean()
+
+            _err = targets - traj_batch.value
+            target_stats["critic/explained_var"] = 1.0 - _err.var() / (targets.var() + 1e-8)
+            target_stats["critic/bias"] = _err.mean()
+            target_stats["critic/rmse"] = jnp.sqrt((_err ** 2).mean())
+
+            _N = targets.size
+            _layer_means, _layer_vars, _layer_counts = [], [], []
+            for _lid, _name in enumerate(_LAYOUT_NAMES):
+                _mask = (_actor_layout_full == _lid).astype(jnp.float32)
+                _cnt_raw = _mask.sum()
+                _cnt = _cnt_raw + 1e-8
+                _mean_l = (targets * _mask).sum() / _cnt
+                _var_l = ((targets - _mean_l) ** 2 * _mask).sum() / _cnt
+                _layer_means.append(_mean_l)
+                _layer_vars.append(_var_l)
+                _layer_counts.append(_cnt_raw)
+                target_stats[f"target_raw/{_name}/mean"] = _mean_l
+
+                _err_l = _err * _mask
+                _bias_l = _err_l.sum() / _cnt
+                _mse_l = ((_err ** 2) * _mask).sum() / _cnt
+                _resid_var_l = (((_err - _bias_l) ** 2) * _mask).sum() / _cnt
+                target_stats[f"critic/{_name}/explained_var"] = 1.0 - _resid_var_l / (_var_l + 1e-8)
+                target_stats[f"critic/{_name}/bias"] = _bias_l
+                target_stats[f"critic/{_name}/rmse"] = jnp.sqrt(_mse_l)
+
+            # law of total variance: total_var ≈ within_var + between_var
+            _within_var = sum(c * v for c, v in zip(_layer_counts, _layer_vars)) / _N
+            _grand_mean = sum(c * m for c, m in zip(_layer_counts, _layer_means)) / _N
+            _between_var = sum(c * (m - _grand_mean) ** 2 for c, m in zip(_layer_counts, _layer_means)) / _N
+            target_stats["target_variance_decomp/within"] = _within_var
+            target_stats["target_variance_decomp/between"] = _between_var
+            target_stats["target_variance_decomp/between_ratio"] = _between_var / (_within_var + _between_var + 1e-8)
+
+            _layer_stds = jnp.sqrt(jnp.stack(_layer_vars) + 1e-8)
+            target_stats["target_scale/std_max"] = jnp.max(_layer_stds)
+            target_stats["target_scale/std_min"] = jnp.min(_layer_stds)
+            target_stats["target_scale/std_ratio"] = (
+                jnp.max(_layer_stds) / (jnp.min(_layer_stds) + 1e-8)
+            )
+            target_stats["target_scale/std_cv"] = (
+                jnp.std(_layer_stds) / (jnp.mean(_layer_stds) + 1e-8)
+            )
+            # ── end value target / critic quality statistics ───────────────
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
             _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
@@ -768,6 +828,7 @@ def make_train(config, update_step=0):
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
                 **grad_conflict,
+                **target_stats,
             }
             rng = update_state[-1]
 

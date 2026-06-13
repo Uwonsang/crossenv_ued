@@ -1,6 +1,6 @@
 "ENV_NAME": "ToyCoop"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 256
+"NUM_ENVS": 512
 "NUM_SEEDS": 1
 "NUM_STEPS": 100 # Dual Destination horizon
 "FC_DIM_SIZE": 256
@@ -53,11 +53,11 @@
 "FCP_KWARGS":
   "train_oracle": False
   "partner_seeds": [0, 1, 2, 3, 4, 5]
-  "partner_ckpt_ids": [0]
+  "partner_ckpt_ids": ["init", "mid", "final"]
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_dual_destination"
-"WANDB_MODE" : "disabled"
+"WANDB_MODE" : "online"
 "model_name": "FCP"
 "save_frames": False
 "save_frames_interval": 200

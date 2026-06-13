@@ -582,6 +582,8 @@ def make_train(config, update_step=0):
                         # the metrics have an agent dimension, but this is identical
                         # for all agents so index into the 0th item of that dimension.
                         "returns": metric["returns"],
+                        "normalized_returns": metric["normalized_returns"],
+                        "success_rate": metric["success_rate"],
                         "env_step": metric["update_steps"]
                         * config["NUM_ENVS"]
                         * config["NUM_STEPS"],
@@ -600,10 +602,18 @@ def make_train(config, update_step=0):
                             'update_steps': int(metric['update_steps']),
                         }, f)
 
-            returns = metric["returned_episode_returns"][:, :, 0][
-                            metric["returned_episode"][:, :, 0].astype(jnp.int32)
-                        ].mean()
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]
+            episode_done_step = metric["returned_episode"][:, :, 0]
+            done_count = jnp.maximum(episode_done_step.sum(), 1.0)
+            returns = (episode_returns_step * episode_done_step).sum() / done_count
+            success_rate = (
+                ((episode_returns_step > -config["ENV_KWARGS"]["max_steps"]) * episode_done_step).sum()
+                / done_count
+            )
+            normalized_returns = returns / (2.0 * config["ENV_KWARGS"]["max_steps"])
             metric["returns"] = returns
+            metric["normalized_returns"] = normalized_returns
+            metric["success_rate"] = success_rate
             metric["update_steps"] = update_steps
             metric["params"] = train_state.params
 
@@ -653,18 +663,20 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
+    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoop" else config["ENV_KWARGS"]["layout"]
+    run_name_prefix = config.get("model_name", "FCP")
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "FCP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
+        name=f"{run_name_prefix}_{run_env_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/fcp/{save_xpid}"
     config['filepath'] = filepath
 
     #####################
@@ -728,6 +740,7 @@ def main(config):
         for ckpt_seed in seed_list:
             for ckpt_id in ckpt_ids:
                 patterns = [
+                    f"**/seed{ckpt_seed}_{ckpt_id}.pkl",
                     f"**/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}_updates*.pkl",
                     f"**/seed{ckpt_seed}_ckpt{ckpt_id}_improved_updates*.pkl",
                     f"**/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl",

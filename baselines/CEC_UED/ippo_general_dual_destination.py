@@ -360,6 +360,26 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )
+        save_population_ckpts = (
+            config["ENV_NAME"] == "ToyCoop"
+            and not config["ENV_KWARGS"]["random_reset"]
+            and config.get("model_name", "") == "IPPO_baseline"
+        )
+
+        def save_ippo_population_ckpt(params, ckpt_name, returns=None, step=0):
+            os.makedirs(config["filepath"], exist_ok=True)
+            ckpt = {"params": jax.device_get(params), "update_steps": int(step)}
+            if returns is not None:
+                ckpt["returns"] = float(returns)
+            with open(f"{config['filepath']}/seed{config['SEED']}_{ckpt_name}.pkl", "wb") as f:
+                pickle.dump(ckpt, f)
+
+        if save_population_ckpts and model_params is None:
+            jax.experimental.io_callback(
+                lambda params: save_ippo_population_ckpt(params, "init", step=0),
+                None,
+                train_state.params,
+            )
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -611,13 +631,15 @@ def make_train(config, update_step=0):
                 traj_batch.info,
             )
 
-            # 'returned_episode', 'returned_episode_lengths', 'returned_episode_returns'
-            returns = metric["returned_episode_returns"][:, :, 0][
-                metric["returned_episode"][:, :, 0].astype(jnp.int32)
-            ].mean()
-            # Save before reduction for per-layout return logging in callback
             episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
             episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
+            done_count = jnp.maximum(episode_done_step.sum(), 1.0)
+            returns = (episode_returns_step * episode_done_step).sum() / done_count
+            success_rate = (
+                ((episode_returns_step > -config["ENV_KWARGS"]["max_steps"]) * episode_done_step).sum()
+                / done_count
+            )
+            normalized_returns = returns / (2.0 * config["ENV_KWARGS"]["max_steps"])
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
@@ -709,6 +731,8 @@ def make_train(config, update_step=0):
             def callback(metric):
                 log_dict = {
                     "returns": metric["returns"],
+                    "normalized_returns": metric["normalized_returns"],
+                    "success_rate": metric["success_rate"],
                     "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                     **metric["loss"],
                 }
@@ -766,8 +790,25 @@ def make_train(config, update_step=0):
                     arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
                     save_to_hdf5(save_path, state_names, arrays, save_slot, step)
 
+                if save_population_ckpts:
+                    current_return = float(metric["returns"])
+                    params = metric["params"]
+                    if best_return[0] > 100:
+                        distance = abs(current_return - best_return[0] / 2)
+                        if distance < mid_distance[0]:
+                            mid_distance[0] = distance
+                            save_ippo_population_ckpt(params, "mid", current_return, step)
+
+                    if current_return > best_return[0]:
+                        best_return[0] = current_return
+                        mid_distance[0] = float("inf")
+                        save_ippo_population_ckpt(params, "final", current_return, step)
+
             metric["returns"] = returns
+            metric["normalized_returns"] = normalized_returns
+            metric["success_rate"] = success_rate
             metric["update_steps"] = update_steps
+            metric["params"] = train_state.params
 
             callback_metric = {
                 **metric,
@@ -780,6 +821,9 @@ def make_train(config, update_step=0):
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
+
+        best_return = [float('-inf')]
+        mid_distance = [float('inf')]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -830,18 +874,22 @@ def main(config):
         wandb.login(key=private_info["wandb_key"])
     
     layout_name = config["ENV_KWARGS"]["layout"]
+    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoop" else layout_name
+    run_name_prefix = config.get("model_name", "CEC")
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
+        name=f"{run_name_prefix}_{run_env_name}_seed{config['SEED']}"
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
+    ckpt_group = "cec" if config["ENV_KWARGS"]["random_reset"] else "ippo"
+    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{ckpt_group}/{xpid}'
+    config["filepath"] = filepath
     print(f"Working on: \n{filepath}\n")
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

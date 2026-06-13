@@ -172,7 +172,7 @@ cython_debug/
 
 outputs/
 outputs/*
-ckpts/*
+# ckpts/*
 baselines/CEC_UED/VAE/dataset/*
 multirun/*
 private.yaml

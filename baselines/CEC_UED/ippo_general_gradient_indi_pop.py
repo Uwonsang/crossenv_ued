@@ -539,6 +539,80 @@ def make_train(config, update_step=0):
             ]
             original_params = train_state.params
 
+            # ── value target statistics: raw / popart-normalized / between-within decomposition ──
+            _actor_layout_full = traj_batch.layout_id  # (NUM_STEPS, NUM_ACTORS)
+            _targets_norm = (targets - popart_mu[_actor_layout_full]) / popart_sigma[_actor_layout_full]
+
+            target_stats = {}
+            target_stats["target_raw/mean"] = targets.mean()
+            target_stats["target_popart/mean"] = _targets_norm.mean()
+
+            # ── critic quality: how well does the critic fit the targets it's trained on? ──
+            _value_norm = traj_batch.value
+            _err_norm = _targets_norm - _value_norm
+
+            target_stats["critic/explained_var"] = 1.0 - _err_norm.var() / (_targets_norm.var() + 1e-8)
+            target_stats["critic/bias"] = _err_norm.mean()
+            target_stats["critic/rmse"] = jnp.sqrt((_err_norm ** 2).mean())
+
+            _N = targets.size
+            _layer_means, _layer_vars, _layer_counts, _layer_stds_n = [], [], [], []
+            for _lid, _name in enumerate(_LAYOUT_NAMES):
+                _mask = (_actor_layout_full == _lid).astype(jnp.float32)
+                _cnt_raw = _mask.sum()
+                _cnt = _cnt_raw + 1e-8
+                _mean_l = (targets * _mask).sum() / _cnt
+                _var_l = ((targets - _mean_l) ** 2 * _mask).sum() / _cnt
+                _layer_means.append(_mean_l)
+                _layer_vars.append(_var_l)
+                _layer_counts.append(_cnt_raw)
+
+                target_stats[f"target_raw/{_name}/mean"] = _mean_l
+
+                _sum_n = (_targets_norm * _mask).sum()
+                _mean_ln = _sum_n / _cnt
+                _var_ln = ((_targets_norm - _mean_ln) ** 2 * _mask).sum() / _cnt
+                _std_ln = jnp.sqrt(_var_ln)
+                target_stats[f"target_popart/{_name}/mean"] = _mean_ln
+                _layer_stds_n.append(_std_ln)
+
+                _err_l = _err_norm * _mask
+                _bias_l = _err_l.sum() / _cnt
+                _mse_l = ((_err_norm ** 2) * _mask).sum() / _cnt
+                _resid_var_l = (((_err_norm - _bias_l) ** 2) * _mask).sum() / _cnt
+                target_stats[f"critic/{_name}/explained_var"] = 1.0 - _resid_var_l / (_var_ln + 1e-8)
+                target_stats[f"critic/{_name}/bias"] = _bias_l
+                target_stats[f"critic/{_name}/rmse"] = jnp.sqrt(_mse_l)
+
+            # law of total variance: total_var ≈ within_var + between_var
+            _within_var = sum(c * v for c, v in zip(_layer_counts, _layer_vars)) / _N
+            _grand_mean = sum(c * m for c, m in zip(_layer_counts, _layer_means)) / _N
+            _between_var = sum(c * (m - _grand_mean) ** 2 for c, m in zip(_layer_counts, _layer_means)) / _N
+            target_stats["target_variance_decomp/within"] = _within_var
+            target_stats["target_variance_decomp/between"] = _between_var
+            target_stats["target_variance_decomp/between_ratio"] = _between_var / (_within_var + _between_var + 1e-8)
+
+            _layer_stds = jnp.sqrt(jnp.stack(_layer_vars) + 1e-8)
+            target_stats["target_scale/std_max"] = jnp.max(_layer_stds)
+            target_stats["target_scale/std_min"] = jnp.min(_layer_stds)
+            target_stats["target_scale/std_ratio"] = (
+                jnp.max(_layer_stds) / (jnp.min(_layer_stds) + 1e-8)
+            )
+            target_stats["target_scale/std_cv"] = (
+                jnp.std(_layer_stds) / (jnp.mean(_layer_stds) + 1e-8)
+            )
+
+            _layer_stds_n = jnp.stack(_layer_stds_n)
+            target_stats["target_scale_popart/std_max"] = jnp.max(_layer_stds_n)
+            target_stats["target_scale_popart/std_min"] = jnp.min(_layer_stds_n)
+            target_stats["target_scale_popart/std_ratio"] = (
+                jnp.max(_layer_stds_n) / (jnp.min(_layer_stds_n) + 1e-8)
+            )
+            target_stats["target_scale_popart/std_cv"] = (
+                jnp.std(_layer_stds_n) / (jnp.mean(_layer_stds_n) + 1e-8)
+            )
+            # ── end value target statistics ─────────────────────────────────
+
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
             _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
             _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
@@ -846,6 +920,7 @@ def make_train(config, update_step=0):
                 **{f"popart/mu/{_LAYOUT_NAMES[lid]}": popart_mu[lid] for lid in range(5)},
                 **{f"popart/sigma/{_LAYOUT_NAMES[lid]}": popart_sigma[lid] for lid in range(5)},
                 **grad_conflict,
+                **target_stats,
             }
             rng = update_state[-1]
 

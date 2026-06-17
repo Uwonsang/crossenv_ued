@@ -712,40 +712,34 @@ def make_train(config, update_step=0):
                     **metric["loss"],
                 }
                 if "eval_returns" in metric:
-                    if np.isfinite(float(metric["eval_returns"]["mean"])):
-                        log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
-                        for _ln in EVAL_LAYOUTS_9:
-                            log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
-
+                    log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
+                    for _ln in EVAL_LAYOUTS_9:
+                        log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
                 wandb.log(log_dict)
 
             metric["returns"] = returns
             metric["update_steps"] = update_steps
 
-            jax.experimental.io_callback(callback, None, metric)
+            jax.lax.cond(
+                run_eval,
+                lambda _: jax.experimental.io_callback(callback, None, metric),
+                lambda _: None,
+                operand=None,
+            )
 
-            save_interval = config.get("SAVE_CKPT_INTERVAL", 0)
-            if save_interval > 0:
-                def ckpt_callback(params, step):
-                    step = int(step)
-                    mid_ckpt_dir = config["MID_CKPT_DIR"]
-                    os.makedirs(mid_ckpt_dir, exist_ok=True)
-                    mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
-                    with open(mid_ckpt_path, "wb") as f:
-                        pickle.dump({
-                            'params': params,
-                            'final_update_step': step,
-                            'wandb_run_id': wandb.run.id,
-                        }, f)
-                    print(f"[Resume ckpt] step={step} saved → {mid_ckpt_path}")
+            def ckpt_callback(params, step):
+                step = int(step)
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
+                with open(mid_ckpt_path, "wb") as f:
+                    pickle.dump({
+                        'params': params,
+                        'final_update_step': step + 1,
+                        'wandb_run_id': wandb.run.id,
+                    }, f)
 
-                should_save = jnp.logical_and(update_steps > 0, jnp.equal(update_steps % save_interval, 0))
-                jax.lax.cond(
-                    should_save,
-                    lambda _: jax.experimental.io_callback(ckpt_callback, None, train_state.params, update_steps),
-                    lambda _: None,
-                    operand=None,
-                )
+            jax.experimental.io_callback(ckpt_callback, None, train_state.params, update_steps)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric

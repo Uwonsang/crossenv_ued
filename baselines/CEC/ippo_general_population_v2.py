@@ -29,6 +29,9 @@ import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 import time
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from find_mid_ckpt import find_mid_ckpt
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -729,6 +732,9 @@ def main(config):
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step, filepath), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
+
+    print("\nRunning find_mid_ckpt...")
+    find_mid_ckpt(filepath, config["SEED"])
 
 if __name__ == "__main__":
     main()

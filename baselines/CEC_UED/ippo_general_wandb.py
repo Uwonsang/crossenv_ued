@@ -706,16 +706,17 @@ def make_train(config, update_step=0, save_info=None):
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
 
             def callback(metric):
+                step = int(metric["update_steps"])
                 log_dict = {
                     "returns": metric["returns"],
-                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    "env_step": step * config["NUM_ENVS"] * config["NUM_STEPS"],
                     **metric["loss"],
                 }
                 if "eval_returns" in metric:
                     log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
                     for _ln in EVAL_LAYOUTS_9:
                         log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=step)
 
             metric["returns"] = returns
             metric["update_steps"] = update_steps

@@ -301,7 +301,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(config, update_step=0, save_info=None):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     agent_view_size = env.agent_view_size
@@ -352,7 +352,7 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    def train(rng, model_params=None, update_step=0, init_popart_mu=None, init_popart_sigma=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -395,8 +395,8 @@ def make_train(config, update_step=0):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # PopArt running statistics: network predicts normalized values
-        popart_mu = jnp.zeros(())
-        popart_sigma = jnp.ones(())
+        popart_mu = init_popart_mu if init_popart_mu is not None else jnp.zeros(())
+        popart_sigma = init_popart_sigma if init_popart_sigma is not None else jnp.ones(())
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -991,6 +991,47 @@ def make_train(config, update_step=0):
                 "episode_done_step": episode_done_step,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
+
+            def ckpt_callback(params, step, mu, sigma):
+                step = int(step)
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
+                with open(mid_ckpt_path, "wb") as f:
+                    pickle.dump({
+                        'params': params,
+                        'final_update_step': step + 1,
+                        'wandb_run_id': wandb.run.id,
+                        'popart_mu': mu,
+                        'popart_sigma': sigma,
+                    }, f)
+
+            jax.experimental.io_callback(ckpt_callback, None, train_state.params, update_steps, popart_mu, popart_sigma)
+
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+                def final_save_callback(params, step, mu, sigma):
+                    fp = save_info["filepath"]
+                    prefix = save_info["fcp_prefix"]
+                    appendage = save_info["finetune_appendage"]
+                    rng_key = save_info["rng"]
+                    os.makedirs(fp, exist_ok=True)
+                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_updates{num_updates_total}.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total,
+                                     'popart_mu': mu, 'popart_sigma': sigma}, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
+                    print(f"--------------------------------")
+
+                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params, update_steps, popart_mu, popart_sigma),
+                    lambda _: None,
+                    operand=None,
+                )
+
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps, popart_mu, popart_sigma), metric
@@ -1042,21 +1083,45 @@ def main(config):
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-    
-    layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=f"CEC_gradient_pop_pcgrad_value_{layout_name}_seed{config['SEED']}"
-    )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+
+    resume_xpid = config.get("RESUME_XPID", "")
+    active_xpid = resume_xpid if resume_xpid else xpid
+
+    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
+        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+    filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
+
+    config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
+
+    mid_ckpt_path = os.path.join(config['MID_CKPT_DIR'], "resume_ckpt.pkl")
+    _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    wandb_resume_id = None
+    if _has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            _peek = pickle.load(f)
+        wandb_resume_id = _peek.get('wandb_run_id', None)
+
+    layout_name = config["ENV_KWARGS"]["layout"]
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["IPPO", "RNN", "SP"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=f"CEC_gradient_pop_pcgrad_value_{layout_name}_seed{config['SEED']}"
+        )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
@@ -1064,7 +1129,17 @@ def main(config):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    init_popart_mu = None
+    init_popart_sigma = None
+    if _has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = _peek['params']
+        final_update_step = _peek['final_update_step']
+        rng = jax.random.PRNGKey(config["SEED"])
+        init_popart_mu = _peek.get('popart_mu', None)
+        init_popart_sigma = _peek.get('popart_sigma', None)
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
@@ -1096,36 +1171,22 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    popart_mu_final = runner_state[2]
-    popart_sigma_final = runner_state[3]
-
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
+    save_info = {
+        "filepath": filepath,
+        "fcp_prefix": fcp_prefix,
+        "finetune_appendage": finetune_appendage,
+        "rng": rng,
+        "num_updates": num_updates,
+    }
 
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {
-            'key': rng,
-            'params': model_state.params,
-            'update_steps': num_updates,
-            'popart_mu': popart_mu_final,
-            'popart_sigma': popart_sigma_final,
-            }
-        pickle.dump(ckpt, f)
+    print(f"Starting from update step {final_update_step}")
+    train_jit = jax.jit(make_train(config, final_update_step, save_info), device=jax.devices()[0])
+    out = train_jit(rng, model_params, final_update_step, init_popart_mu, init_popart_sigma)
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
-    
     jax.effects_barrier()
     jax.clear_caches()
-    wandb.finish() 
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

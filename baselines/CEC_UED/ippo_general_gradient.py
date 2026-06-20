@@ -546,6 +546,7 @@ def make_train(config, update_step=0, save_info=None):
                 _layer_vars.append(_var_l)
                 _layer_counts.append(_cnt_raw)
                 target_stats[f"target_raw/{_name}/mean"] = _mean_l
+                target_stats[f"target_scale/{_name}/std"] = jnp.sqrt(_var_l + 1e-8)
 
                 _err_l = _err * _mask
                 _bias_l = _err_l.sum() / _cnt
@@ -572,6 +573,9 @@ def make_train(config, update_step=0, save_info=None):
             target_stats["target_scale/std_cv"] = (
                 jnp.std(_layer_stds) / (jnp.mean(_layer_stds) + 1e-8)
             )
+
+            _ev_vals = jnp.stack([target_stats[f"critic/{_n}/explained_var"] for _n in _LAYOUT_NAMES])
+            target_stats["critic/worst_family_ev"] = jnp.min(_ev_vals)
             # ── end value target / critic quality statistics ───────────────
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
@@ -651,6 +655,13 @@ def make_train(config, update_step=0, save_info=None):
                     grad_conflict[f"grad_conflict_{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
                         jnp.sqrt(_s['norms_sq'][_i])
                     )
+                # gradient share p_f, dominance ratio D, norm CV
+                _norms = jnp.stack([jnp.sqrt(_s['norms_sq'][_i]) for _i in range(5)])
+                _norm_sum = _norms.sum() + 1e-8
+                for _i in range(5):
+                    grad_conflict[f"grad_share_{_loss_type}/{_LAYOUT_NAMES[_i]}"] = _norms[_i] / _norm_sum
+                grad_conflict[f"grad_dominance_{_loss_type}"] = jnp.max(_norms) / (jnp.median(_norms) + 1e-8)
+                grad_conflict[f"grad_norm_cv_{_loss_type}"] = jnp.std(_norms) / (jnp.mean(_norms) + 1e-8)
                 # pairwise cosine similarities
                 for _i in range(5):
                     for _j in range(_i + 1, 5):

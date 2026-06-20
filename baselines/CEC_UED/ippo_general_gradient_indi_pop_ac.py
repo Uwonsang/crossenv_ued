@@ -568,12 +568,14 @@ def make_train(config, update_step=0, save_info=None):
                 _layer_counts.append(_cnt_raw)
 
                 target_stats[f"target_raw/{_name}/mean"] = _mean_l
+                target_stats[f"target_scale/{_name}/std"] = jnp.sqrt(_var_l + 1e-8)
 
                 _sum_n = (_targets_norm * _mask).sum()
                 _mean_ln = _sum_n / _cnt
                 _var_ln = ((_targets_norm - _mean_ln) ** 2 * _mask).sum() / _cnt
                 _std_ln = jnp.sqrt(_var_ln)
                 target_stats[f"target_popart/{_name}/mean"] = _mean_ln
+                target_stats[f"target_popart/{_name}/std"] = _std_ln
                 _layer_stds_n.append(_std_ln)
 
                 _err_l = _err_norm * _mask
@@ -611,6 +613,9 @@ def make_train(config, update_step=0, save_info=None):
             target_stats["target_scale_popart/std_cv"] = (
                 jnp.std(_layer_stds_n) / (jnp.mean(_layer_stds_n) + 1e-8)
             )
+
+            _ev_vals = jnp.stack([target_stats[f"critic/{_n}/explained_var"] for _n in _LAYOUT_NAMES])
+            target_stats["critic/worst_family_ev"] = jnp.min(_ev_vals)
             # ── end value target statistics ─────────────────────────────────
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
@@ -698,6 +703,13 @@ def make_train(config, update_step=0, save_info=None):
                     grad_conflict[f"grad_conflict_{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
                         jnp.sqrt(_s['norms_sq'][_i])
                     )
+                # gradient share p_f, dominance ratio D, norm CV
+                _norms = jnp.stack([jnp.sqrt(_s['norms_sq'][_i]) for _i in range(5)])
+                _norm_sum = _norms.sum() + 1e-8
+                for _i in range(5):
+                    grad_conflict[f"grad_share_{_loss_type}/{_LAYOUT_NAMES[_i]}"] = _norms[_i] / _norm_sum
+                grad_conflict[f"grad_dominance_{_loss_type}"] = jnp.max(_norms) / (jnp.median(_norms) + 1e-8)
+                grad_conflict[f"grad_norm_cv_{_loss_type}"] = jnp.std(_norms) / (jnp.mean(_norms) + 1e-8)
                 # pairwise cosine similarities
                 for _i in range(5):
                     for _j in range(_i + 1, 5):
@@ -757,8 +769,9 @@ def make_train(config, update_step=0, save_info=None):
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        # (G_t - mu) / sigma - n_0(S_t): PopArt-normalized return minus normalized baseline
-                        gae = (targets - popart_mu[traj_batch.layout_id]) / popart_sigma[traj_batch.layout_id] - jax.lax.stop_gradient(value)
+                        # Fixed PopArt-normalized advantage: (G_t - mu) / sigma - Ṽ_old(s_t)
+                        # Uses old value (traj_batch.value) as baseline — fixed during PPO epochs
+                        gae = (targets - popart_mu[traj_batch.layout_id]) / popart_sigma[traj_batch.layout_id] - jax.lax.stop_gradient(traj_batch.value)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(

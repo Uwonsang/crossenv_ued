@@ -303,7 +303,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0, save_info=None):
+def make_train(config, update_step=0, save_info=None, opt_state=None):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     agent_view_size = env.agent_view_size
@@ -313,7 +313,9 @@ def make_train(config, update_step=0, save_info=None):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    # If opt_state is restored from a mid-run checkpoint, the optimizer's own step
+    # count already reflects progress, so the manual offset would double-count it.
+    resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -389,6 +391,8 @@ def make_train(config, update_step=0, save_info=None):
             params=flax.core.freeze(network_params),
             tx=tx,
         )
+        if opt_state is not None:
+            train_state = train_state.replace(opt_state=opt_state)
 
         # PopArt running statistics: per-layout (5 heads)
         popart_mu = init_popart_mu if init_popart_mu is not None else jnp.zeros((5,))
@@ -1080,7 +1084,7 @@ def make_train(config, update_step=0, save_info=None):
             }
             jax.experimental.io_callback(callback, None, callback_metric)
 
-            def ckpt_callback(params, step, mu, sigma):
+            def ckpt_callback(params, opt_state_, tx_step, step, mu, sigma):
                 step = int(step)
                 mid_ckpt_dir = config["MID_CKPT_DIR"]
                 os.makedirs(mid_ckpt_dir, exist_ok=True)
@@ -1088,13 +1092,23 @@ def make_train(config, update_step=0, save_info=None):
                 with open(mid_ckpt_path, "wb") as f:
                     pickle.dump({
                         'params': params,
+                        'opt_state': opt_state_,
+                        'tx_step': tx_step,
                         'final_update_step': step + 1,
                         'wandb_run_id': wandb.run.id,
                         'popart_mu': mu,
                         'popart_sigma': sigma,
                     }, f)
 
-            jax.experimental.io_callback(ckpt_callback, None, train_state.params, update_steps, popart_mu, popart_sigma)
+            save_ckpt_interval = int(config.get("SAVE_CKPT_INTERVAL", 5000))
+            if save_ckpt_interval > 0:
+                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                jax.lax.cond(
+                    run_save_ckpt,
+                    lambda _: jax.experimental.io_callback(ckpt_callback, None, train_state.params, train_state.opt_state, train_state.step, update_steps, popart_mu, popart_sigma),
+                    lambda _: None,
+                    operand=None,
+                )
 
             if save_info is not None:
                 num_updates_total = save_info["num_updates"]
@@ -1226,6 +1240,7 @@ def main(config):
     if _has_mid_ckpt:
         print(f"Found mid-run checkpoint: {mid_ckpt_path}")
         model_params = _peek['params']
+        opt_state = _peek.get('opt_state', None)
         final_update_step = _peek['final_update_step']
         init_popart_mu = _peek.get('popart_mu', None)
         init_popart_sigma = _peek.get('popart_sigma', None)
@@ -1236,6 +1251,7 @@ def main(config):
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             final_update_step = previous_ckpt['final_update_step']
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
@@ -1254,12 +1270,14 @@ def main(config):
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
     else:
         model_params = None
+        opt_state = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
@@ -1273,7 +1291,7 @@ def main(config):
     }
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step, save_info), device=jax.devices()[0])
+    train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step, init_popart_mu, init_popart_sigma)
 
     jax.effects_barrier()

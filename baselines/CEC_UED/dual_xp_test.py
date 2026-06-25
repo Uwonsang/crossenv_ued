@@ -37,7 +37,6 @@ def model_patterns(root, model_name, seed, stage=None):
     if model_name == "IPPO":
         return [
             f"{root}/ikFalse/reset_all/ippo/**/seed{seed}_final.pkl",
-            f"{root}/ikFalse/reset_all/ippo/**/seed{seed}_ckpt0_improved_updates*.pkl",
         ]
     if model_name == "IPPO_POP":
         if stage is None:
@@ -52,7 +51,6 @@ def model_patterns(root, model_name, seed, stage=None):
     if model_name == "FCP":
         return [
             f"{root}/ikFalse/reset_all/fcp/**/fcp_seed{seed}_best.pkl",
-            f"{root}/ikFalse/reset_all/fcp/**/seed{seed}_ckpt0_fcp_improved_updates*.pkl",
         ]
     raise ValueError(f"Unknown model_name: {model_name}")
 
@@ -93,6 +91,77 @@ def resolve_path(path):
 
 def safe_name(name):
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(name))
+
+
+ACTION_NAMES = {
+    0: "right",
+    1: "down",
+    2: "left",
+    3: "up",
+    4: "stay",
+}
+
+
+def goal_name(pos, goals):
+    if np.array_equal(pos, goals[0]):
+        return "goal_0"
+    if np.array_equal(pos, goals[1]):
+        return "goal_1"
+    return "none"
+
+
+def goal_orientation(goals, goal_idx):
+    other_idx = 1 - goal_idx
+    if goals[goal_idx][1] < goals[other_idx][1]:
+        return "top"
+    if goals[goal_idx][1] > goals[other_idx][1]:
+        return "bottom"
+    if goals[goal_idx][0] < goals[other_idx][0]:
+        return "left"
+    if goals[goal_idx][0] > goals[other_idx][0]:
+        return "right"
+    return f"goal_{goal_idx}"
+
+
+def summarize_debug_rollout(states_np):
+    final_agent_pos = np.asarray(states_np.agent_pos)[-1]
+    goals = np.asarray(states_np.goal_pos)[-1]
+    agent_0_goal = goal_name(final_agent_pos[0], goals)
+    agent_1_goal = goal_name(final_agent_pos[1], goals)
+
+    def orient(goal):
+        if goal == "goal_0":
+            return goal_orientation(goals, 0)
+        if goal == "goal_1":
+            return goal_orientation(goals, 1)
+        return "none"
+
+    both_on_distinct_goals = (
+        agent_0_goal != "none"
+        and agent_1_goal != "none"
+        and agent_0_goal != agent_1_goal
+    )
+    same_goal = (
+        agent_0_goal != "none"
+        and agent_1_goal != "none"
+        and agent_0_goal == agent_1_goal
+    )
+    return {
+        "agent_0_final_x": int(final_agent_pos[0][0]),
+        "agent_0_final_y": int(final_agent_pos[0][1]),
+        "agent_1_final_x": int(final_agent_pos[1][0]),
+        "agent_1_final_y": int(final_agent_pos[1][1]),
+        "goal_0_x": int(goals[0][0]),
+        "goal_0_y": int(goals[0][1]),
+        "goal_1_x": int(goals[1][0]),
+        "goal_1_y": int(goals[1][1]),
+        "agent_0_final_goal": agent_0_goal,
+        "agent_0_final_goal_orientation": orient(agent_0_goal),
+        "agent_1_final_goal": agent_1_goal,
+        "agent_1_final_goal_orientation": orient(agent_1_goal),
+        "both_on_distinct_goals": bool(both_on_distinct_goals),
+        "same_goal": bool(same_goal),
+    }
 
 
 def get_rollouts(param_1, param_2, config, env, network, seed=0):
@@ -334,11 +403,25 @@ def main(config):
 
                 debug_rewards_np = np.asarray(jax.device_get(debug_rewards))
                 debug_actions_np = np.asarray(jax.device_get(debug_actions))
+                states_np = jax.device_get(states)
+                agent_pos_np = np.asarray(states_np.agent_pos)
+                goal_pos_np = np.asarray(states_np.goal_pos)
+                debug_summary = summarize_debug_rollout(states_np)
                 action_df = pd.DataFrame(
                     {
                         "step": np.arange(len(debug_rewards_np)),
                         "action_agent_0": debug_actions_np[:, 0],
+                        "action_agent_0_name": [ACTION_NAMES[int(a)] for a in debug_actions_np[:, 0]],
                         "action_agent_1": debug_actions_np[:, 1],
+                        "action_agent_1_name": [ACTION_NAMES[int(a)] for a in debug_actions_np[:, 1]],
+                        "agent_0_x": agent_pos_np[:, 0, 0],
+                        "agent_0_y": agent_pos_np[:, 0, 1],
+                        "agent_1_x": agent_pos_np[:, 1, 0],
+                        "agent_1_y": agent_pos_np[:, 1, 1],
+                        "goal_0_x": goal_pos_np[:, 0, 0],
+                        "goal_0_y": goal_pos_np[:, 0, 1],
+                        "goal_1_x": goal_pos_np[:, 1, 0],
+                        "goal_1_y": goal_pos_np[:, 1, 1],
                         "reward": debug_rewards_np,
                         "cumulative_reward": np.cumsum(debug_rewards_np),
                     }
@@ -354,6 +437,7 @@ def main(config):
                     "reward": float(debug_rewards_np.sum()),
                     "gif_path": gif_path,
                     "actions_path": actions_path,
+                    **debug_summary,
                 }
                 debug_records.append(debug_record)
                 print(f"Saved debug GIF for {pair_name}: {gif_path}")

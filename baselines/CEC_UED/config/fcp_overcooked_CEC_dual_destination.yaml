@@ -52,6 +52,9 @@
 "FCP": True
 "FCP_KWARGS":
   "train_oracle": False
+  # True: PPO loss only uses the slot actually controlled by FCP.
+  # False: original FCP behavior, averaging loss over both FCP-sampled slots.
+  "mask_frozen_agent_loss": True
   "partner_seeds": [0, 1, 2, 3, 4, 5]
   "partner_ckpt_ids": ["init", "mid", "final"]
 # WandB Params

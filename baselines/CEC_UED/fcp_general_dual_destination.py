@@ -229,6 +229,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
+    controlled_mask: jnp.ndarray
 
 
 def batchify(x: dict, agent_list, num_actors):
@@ -351,6 +352,14 @@ def make_train(config, update_step=0):
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
                 env_act['agent_0'] = jnp.where(frozen_is_agent_1, env_act['agent_0'], other_env_act['agent_0'])
                 env_act['agent_1'] = jnp.where(frozen_is_agent_1, other_env_act['agent_1'], env_act['agent_1'])
+                controlled_mask = batchify(
+                    {
+                        "agent_0": jnp.full((config["NUM_ENVS"],), frozen_is_agent_1),
+                        "agent_1": jnp.full((config["NUM_ENVS"],), ~frozen_is_agent_1),
+                    },
+                    env.agents,
+                    config["NUM_ACTORS"],
+                ).squeeze()
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -373,7 +382,8 @@ def make_train(config, update_step=0):
                     log_prob.squeeze(),
                     obs_batch,
                     info,
-                    agent_positions
+                    agent_positions,
+                    controlled_mask,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, frozen_param, other_hstate, frozen_is_agent_1)
                 return runner_state, transition
@@ -448,6 +458,12 @@ def make_train(config, update_step=0):
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
+                        mask_frozen_agent_loss = config["FCP_KWARGS"].get("mask_frozen_agent_loss", True)
+                        controlled_mask = traj_batch.controlled_mask.astype(jnp.float32)
+
+                        def masked_mean(x):
+                            denom = jnp.maximum(controlled_mask.sum(), 1.0)
+                            return (x * controlled_mask).sum() / denom
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -455,14 +471,23 @@ def make_train(config, update_step=0):
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
+                        value_loss_raw = jnp.maximum(value_losses, value_losses_clipped)
+                        if mask_frozen_agent_loss:
+                            value_loss = 0.5 * masked_mean(value_loss_raw)
+                        else:
+                            # Original FCP behavior: train on both slots, including the frozen partner slot.
+                            value_loss = 0.5 * value_loss_raw.mean()
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        if mask_frozen_agent_loss:
+                            gae_mean = masked_mean(gae)
+                            gae_var = masked_mean(jnp.square(gae - gae_mean))
+                            gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
+                        else:
+                            # Original FCP behavior: normalize advantages over both controlled and frozen slots.
+                            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -473,8 +498,13 @@ def make_train(config, update_step=0):
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
+                        if mask_frozen_agent_loss:
+                            loss_actor = masked_mean(loss_actor)
+                            entropy = masked_mean(pi.entropy())
+                        else:
+                            # Original FCP behavior: average PPO terms over both agent slots.
+                            loss_actor = loss_actor.mean()
+                            entropy = pi.entropy().mean()
 
                         # debug
                         approx_kl = ((ratio - 1) - logratio).mean()

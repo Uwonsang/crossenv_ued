@@ -5,6 +5,7 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
+import glob
 import pickle
 import jax
 import jax.numpy as jnp
@@ -372,6 +373,19 @@ def make_train(config, update_step=0):
             if returns is not None:
                 ckpt["returns"] = float(returns)
             with open(f"{config['filepath']}/seed{config['SEED']}_{ckpt_name}.pkl", "wb") as f:
+                pickle.dump(ckpt, f)
+
+        def save_ippo_population_candidate(params, candidate_idx, returns, step):
+            os.makedirs(config["filepath"], exist_ok=True)
+            ckpt = {
+                "params": jax.device_get(params),
+                "returns": float(returns),
+                "update_steps": int(step),
+            }
+            with open(
+                f"{config['filepath']}/seed{config['SEED']}_population_ckpt_{candidate_idx}.pkl",
+                "wb",
+            ) as f:
                 pickle.dump(ckpt, f)
 
         if save_population_ckpts and model_params is None:
@@ -793,15 +807,19 @@ def make_train(config, update_step=0):
                 if save_population_ckpts:
                     current_return = float(metric["returns"])
                     params = metric["params"]
-                    if best_return[0] > 100:
-                        distance = abs(current_return - best_return[0] / 2)
-                        if distance < mid_distance[0]:
-                            mid_distance[0] = distance
-                            save_ippo_population_ckpt(params, "mid", current_return, step)
+                    current_threshold = int(current_return // 10) * 10
+                    if current_threshold > last_saved_threshold[0]:
+                        last_saved_threshold[0] = current_threshold
+                        save_ippo_population_candidate(
+                            params,
+                            candidate_count[0],
+                            current_return,
+                            step,
+                        )
+                        candidate_count[0] += 1
 
                     if current_return > best_return[0]:
                         best_return[0] = current_return
-                        mid_distance[0] = float("inf")
                         save_ippo_population_ckpt(params, "final", current_return, step)
 
             metric["returns"] = returns
@@ -823,7 +841,8 @@ def make_train(config, update_step=0):
             return (runner_state, update_steps), metric
 
         best_return = [float('-inf')]
-        mid_distance = [float('inf')]
+        last_saved_threshold = [-10]
+        candidate_count = [0]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -840,6 +859,50 @@ def make_train(config, update_step=0):
         return {"runner_state": runner_state}
 
     return train
+
+
+def finalize_ippo_population_ckpts(filepath, seed):
+    final_path = os.path.join(filepath, f"seed{seed}_final.pkl")
+    if not os.path.exists(final_path):
+        print(f"Skipping IPPO population mid selection: missing {final_path}")
+        return
+
+    with open(final_path, "rb") as f:
+        final_ckpt = pickle.load(f)
+    if "returns" not in final_ckpt:
+        print("Skipping IPPO population mid selection: final checkpoint has no returns")
+        return
+
+    candidate_paths = sorted(
+        glob.glob(os.path.join(filepath, f"seed{seed}_population_ckpt_*.pkl"))
+    )
+    candidates = []
+    for candidate_path in candidate_paths:
+        with open(candidate_path, "rb") as f:
+            candidate_ckpt = pickle.load(f)
+        if "returns" in candidate_ckpt:
+            candidates.append((candidate_path, candidate_ckpt))
+
+    if not candidates:
+        print("Skipping IPPO population mid selection: no population candidates found")
+        return
+
+    target_return = final_ckpt["returns"] / 2.0
+    mid_path, mid_ckpt = min(
+        candidates,
+        key=lambda path_ckpt: abs(path_ckpt[1]["returns"] - target_return),
+    )
+    out_path = os.path.join(filepath, f"seed{seed}_mid.pkl")
+    with open(out_path, "wb") as f:
+        pickle.dump(mid_ckpt, f)
+
+    print(
+        "Selected IPPO population mid checkpoint: "
+        f"target={target_return:.2f}, "
+        f"mid_return={mid_ckpt['returns']:.2f}, "
+        f"source={os.path.basename(mid_path)}, "
+        f"out={out_path}"
+    )
 
 
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_dual_destination")
@@ -933,6 +996,13 @@ def main(config):
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
+    jax.effects_barrier()
+    if (
+        config["ENV_NAME"] == "ToyCoop"
+        and not config["ENV_KWARGS"]["random_reset"]
+        and config.get("model_name", "") == "IPPO_baseline"
+    ):
+        finalize_ippo_population_ckpts(filepath, config["SEED"])
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]

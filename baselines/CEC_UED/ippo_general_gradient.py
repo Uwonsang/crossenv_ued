@@ -505,18 +505,18 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
-                    return (gae, value), gae
+                    return (gae, value), (gae, delta)
 
-                _, advantages = jax.lax.scan(
+                _, (advantages, td_errors) = jax.lax.scan(
                     _get_advantages,
                     (jnp.zeros_like(last_val), last_val),
                     traj_batch,
                     reverse=True,
                     unroll=16,
                 )
-                return advantages, advantages + traj_batch.value
+                return advantages, advantages + traj_batch.value, td_errors
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+            advantages, targets, td_errors = _calculate_gae(traj_batch, last_val)
 
             # ── per-layout gradient conflict ──────────────────────────────
             _LAYOUT_NAMES = [
@@ -537,6 +537,9 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             target_stats["critic/explained_var"] = 1.0 - _err.var() / (targets.var() + 1e-8)
             target_stats["critic/bias"] = _err.mean()
             target_stats["critic/rmse"] = jnp.sqrt((_err ** 2).mean())
+
+            target_stats["td_error/mean_abs"] = jnp.abs(td_errors).mean()
+            target_stats["td_error/rmse"] = jnp.sqrt((td_errors ** 2).mean())
 
             _N = targets.size
             _layer_means, _layer_vars, _layer_counts = [], [], []
@@ -559,6 +562,10 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 target_stats[f"critic/{_name}/explained_var"] = 1.0 - _resid_var_l / (_var_l + 1e-8)
                 target_stats[f"critic/{_name}/bias"] = _bias_l
                 target_stats[f"critic/{_name}/rmse"] = jnp.sqrt(_mse_l)
+
+                _td_l = td_errors * _mask
+                target_stats[f"td_error/{_name}/mean_abs"] = jnp.abs(_td_l).sum() / _cnt
+                target_stats[f"td_error/{_name}/rmse"] = jnp.sqrt((_td_l ** 2).sum() / _cnt)
 
             # law of total variance: total_var ≈ within_var + between_var
             _within_var = sum(c * v for c, v in zip(_layer_counts, _layer_vars)) / _N
@@ -588,14 +595,9 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             _gc_adv  = advantages[:_GC_STEPS]
             _gc_tgt  = targets[:_GC_STEPS]
 
-            # classify each (step, env) from maze_map → (_GC_STEPS, NUM_ENVS)
-            _n_se = _GC_STEPS * config["NUM_ENVS"]
-            _active_flat = train_filtered_state.maze_map[:_GC_STEPS, :, 4:13, 4:13, 0].reshape(_n_se, 9, 9)
-            _layout_ids = jax.vmap(_classify_layout_jax)(_active_flat).reshape(
-                _GC_STEPS, config["NUM_ENVS"]
-            )
-            # tile to actors: [agent0_envs..., agent1_envs...] → (_GC_STEPS, NUM_ACTORS)
-            _actor_layout = jnp.tile(_layout_ids, [1, env.num_agents])
+            # reuse full-trajectory classification for the gradient-conflict subsample
+            _layout_ids = _layout_ids_full[:_GC_STEPS]
+            _actor_layout = _actor_layout_full[:_GC_STEPS]
 
             def _tdot(g1, g2):
                 return sum(
@@ -613,9 +615,11 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 'value': {'norms_sq': [], 'dots': {}, 'prev': []},
             }
 
+            _sample_counts = []
             for _lid in range(5):
                 _mask = (_actor_layout == _lid).astype(jnp.float32)  # (_GC_STEPS, NUM_ACTORS)
                 _cnt = _mask.sum() + 1e-8
+                _sample_counts.append(_mask.sum())
 
                 # Single forward pass per layout; 2 backward passes via vjp cotangents.
                 def _fwd(p, mask=_mask, cnt=_cnt):
@@ -653,6 +657,11 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                     _s['prev'].append(_g)
 
             grad_conflict = {}
+            _sample_counts_arr = jnp.stack(_sample_counts)
+            _sample_total = _sample_counts_arr.sum() + 1e-8
+            for _i in range(5):
+                grad_conflict[f"sample_share/{_LAYOUT_NAMES[_i]}"] = _sample_counts_arr[_i] / _sample_total
+
             for _loss_type, _s in _gc_state.items():
                 # per-layout gradient norms
                 for _i in range(5):
@@ -666,6 +675,16 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                     grad_conflict[f"grad_share_{_loss_type}/{_LAYOUT_NAMES[_i]}"] = _norms[_i] / _norm_sum
                 grad_conflict[f"grad_dominance_{_loss_type}"] = jnp.max(_norms) / (jnp.median(_norms) + 1e-8)
                 grad_conflict[f"grad_norm_cv_{_loss_type}"] = jnp.std(_norms) / (jnp.mean(_norms) + 1e-8)
+
+                # sample-weighted gradient share: weights each layout's (per-sample-mean) norm
+                # by its actual sample count, approximating its contribution to the real,
+                # unmasked combined gradient (which averages over all samples, not per layout).
+                _weighted_norms = _norms * _sample_counts_arr
+                _weighted_norm_sum = _weighted_norms.sum() + 1e-8
+                for _i in range(5):
+                    grad_conflict[f"grad_share_weighted_{_loss_type}/{_LAYOUT_NAMES[_i]}"] = (
+                        _weighted_norms[_i] / _weighted_norm_sum
+                    )
                 # pairwise cosine similarities
                 for _i in range(5):
                     for _j in range(_i + 1, 5):
@@ -675,6 +694,11 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         grad_conflict[
                             f"grad_conflict_{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
                         ] = cos
+                        # neg_dot_ij = max(0, -g_i · g_j): magnitude of conflict, 0 when aligned
+                        neg_dot = jnp.maximum(0.0, -_s['dots'][(_i, _j)])
+                        grad_conflict[
+                            f"grad_neg_dot_{_loss_type}/{_LAYOUT_NAMES[_i]}_vs_{_LAYOUT_NAMES[_j]}"
+                        ] = neg_dot
                 # joint update alignment: cos(g_i, g_all) where g_all = sum of all 5 layout gradients
                 # measures how much each layout's update aligns with the combined training direction
                 _g_all = jax.tree_map(lambda *gs: sum(gs), *_s['prev'])
@@ -944,12 +968,12 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 
                     ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
                     ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
+                    layout_ids = np.array(metric["layout_ids"])  # (NUM_STEPS, NUM_ENVS), pre-step layout
                     layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
                     for t in range(ep_done.shape[0]):
                         for e in range(ep_done.shape[1]):
                             if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
+                                label = EVAL_LAYOUTS_9[int(layout_ids[t, e])]
                                 layout_returns[label].append(float(ep_rets[t, e]))
                     for name in EVAL_LAYOUTS_9:
                         returns_for_layout = layout_returns[name]
@@ -987,6 +1011,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 "env_state": env_state,
                 "episode_returns_step": episode_returns_step,
                 "episode_done_step": episode_done_step,
+                "layout_ids": _layout_ids_full,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
 

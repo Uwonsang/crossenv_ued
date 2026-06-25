@@ -660,7 +660,7 @@ def main(config):
         mode=config["WANDB_MODE"],
         name=f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
     )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath = f"ckpts/fcp/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"

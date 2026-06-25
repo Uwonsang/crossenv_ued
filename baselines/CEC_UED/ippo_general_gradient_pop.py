@@ -30,11 +30,9 @@ from jax_tqdm import scan_tqdm
 import time
 import yaml
 from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
-from flax import struct
 import flax.core
-import chex
 import imageio
-from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
+from algo_utils import init_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -282,12 +280,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
-
-@struct.dataclass
-class FilteredState:
-    agent_dir_idx: chex.Array
-    agent_inv: chex.Array
-    maze_map: chex.Array
+    layout_id: jnp.ndarray
 
 
 def batchify(x: dict, agent_list, num_actors):
@@ -300,7 +293,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(config, update_step=0, save_info=None, opt_state=None):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     agent_view_size = env.agent_view_size
@@ -310,7 +303,9 @@ def make_train(config, update_step=0):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    # If opt_state is restored from a mid-run checkpoint, the optimizer's own step
+    # count already reflects progress, so the manual offset would double-count it.
+    resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -327,17 +322,6 @@ def make_train(config, update_step=0):
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
-    if config["save_env_state"]:
-        state_names  = ["agent_dir_idx", "agent_inv", "maze_map"]
-        state_shapes = {k: getattr(state, k).shape for k in state_names}
-        state_dtypes = {k: getattr(state, k).dtype for k in state_names}
-        save_every = int(config["save_env_state_interval"])
-        data_len = (int(config["NUM_UPDATES"]) + save_every - 1) // save_every
-
-        save_path = f"/app/baselines/CEC_UED/dataset/train_env_states.h5"
-        init_hdf5(save_path, state_names, state_shapes, state_dtypes, int(data_len), config["NUM_ENVS"])
-
-
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
     eval_envs = make_eval_envs_overcooked(config)
@@ -351,7 +335,7 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    def train(rng, model_params=None, update_step=0, init_popart_mu=None, init_popart_sigma=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -386,6 +370,8 @@ def make_train(config, update_step=0):
             params=flax.core.freeze(network_params),
             tx=tx,
         )
+        if opt_state is not None:
+            train_state = train_state.replace(opt_state=opt_state)
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -394,8 +380,8 @@ def make_train(config, update_step=0):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # PopArt running statistics: network predicts normalized values
-        popart_mu = jnp.zeros(())
-        popart_sigma = jnp.ones(())
+        popart_mu = init_popart_mu if init_popart_mu is not None else jnp.zeros(())
+        popart_sigma = init_popart_sigma if init_popart_sigma is not None else jnp.ones(())
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -405,6 +391,11 @@ def make_train(config, update_step=0):
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
+
+                # layout BEFORE env.step: the layout this transition's action/reward belong to
+                pre_maze_map = env_state.env_state.maze_map
+                layout_id = jax.vmap(_classify_layout_jax)(pre_maze_map[:, 4:13, 4:13, 0])  # (NUM_ENVS,)
+                layout_id = jnp.tile(layout_id, [env.num_agents])  # (NUM_ACTORS,), matches agent_positions
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -437,11 +428,6 @@ def make_train(config, update_step=0):
                 # remove shaped rewards
                 del info['shaped_reward']
 
-                filtered_state = {
-                    "agent_dir_idx": env_state.env_state.agent_dir_idx,
-                    "agent_inv": env_state.env_state.agent_inv,
-                    "maze_map": env_state.env_state.maze_map}
-
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
@@ -453,22 +439,16 @@ def make_train(config, update_step=0):
                     log_prob.squeeze(),
                     obs_batch,
                     info,
-                    agent_positions
+                    agent_positions,
+                    layout_id,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
-                return runner_state, (
-                    transition,
-                    FilteredState(
-                        filtered_state["agent_dir_idx"],
-                        filtered_state["agent_inv"],
-                        filtered_state["maze_map"],
-                    ),
-                )
+                return runner_state, transition
 
             initial_hstate = runner_state[-2]
             (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
-            runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
+            runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
@@ -525,6 +505,89 @@ def make_train(config, update_step=0):
             ]
             original_params = train_state.params
 
+            # per-step layout id, classified pre-step inside _env_step, already tiled to actors
+            _actor_layout_full = traj_batch.layout_id  # (NUM_STEPS, NUM_ACTORS)
+            _layout_ids_full = _actor_layout_full[:, :config["NUM_ENVS"]]  # (NUM_STEPS, NUM_ENVS)
+
+            # ── value target statistics: raw / popart-normalized / between-within decomposition ──
+            _targets_norm = (targets - popart_mu) / popart_sigma
+
+            target_stats = {}
+            target_stats["target_raw/mean"] = targets.mean()
+            target_stats["target_popart/mean"] = _targets_norm.mean()
+
+            # ── critic quality: how well does the critic fit the targets it's trained on? ──
+            _value_norm = traj_batch.value
+            _err_norm = _targets_norm - _value_norm
+
+            target_stats["critic/explained_var"] = 1.0 - _err_norm.var() / (_targets_norm.var() + 1e-8)
+            target_stats["critic/bias"] = _err_norm.mean()
+            target_stats["critic/rmse"] = jnp.sqrt((_err_norm ** 2).mean())
+
+            _N = targets.size
+            _layer_means, _layer_vars, _layer_counts, _layer_stds_n = [], [], [], []
+            for _lid, _name in enumerate(_LAYOUT_NAMES):
+                _mask = (_actor_layout_full == _lid).astype(jnp.float32)
+                _cnt_raw = _mask.sum()
+                _cnt = _cnt_raw + 1e-8
+                _mean_l = (targets * _mask).sum() / _cnt
+                _var_l = ((targets - _mean_l) ** 2 * _mask).sum() / _cnt
+                _layer_means.append(_mean_l)
+                _layer_vars.append(_var_l)
+                _layer_counts.append(_cnt_raw)
+
+                _masked = jnp.where(_mask.astype(bool), targets, jnp.nan)
+                target_stats[f"target_raw/{_name}/mean"] = _mean_l
+                target_stats[f"target_scale/{_name}/std"] = jnp.sqrt(_var_l + 1e-8)
+
+                _sum_n = (_targets_norm * _mask).sum()
+                _mean_ln = _sum_n / _cnt
+                _var_ln = ((_targets_norm - _mean_ln) ** 2 * _mask).sum() / _cnt
+                _std_ln = jnp.sqrt(_var_ln)
+                target_stats[f"target_popart/{_name}/mean"] = _mean_ln
+                target_stats[f"target_popart/{_name}/std"] = _std_ln
+                _layer_stds_n.append(_std_ln)
+
+                _err_l = _err_norm * _mask
+                _bias_l = _err_l.sum() / _cnt
+                _mse_l = ((_err_norm ** 2) * _mask).sum() / _cnt
+                _resid_var_l = (((_err_norm - _bias_l) ** 2) * _mask).sum() / _cnt
+                target_stats[f"critic/{_name}/explained_var"] = 1.0 - _resid_var_l / (_var_ln + 1e-8)
+                target_stats[f"critic/{_name}/bias"] = _bias_l
+                target_stats[f"critic/{_name}/rmse"] = jnp.sqrt(_mse_l)
+
+            # law of total variance: total_var ≈ within_var + between_var
+            _within_var = sum(c * v for c, v in zip(_layer_counts, _layer_vars)) / _N
+            _grand_mean = sum(c * m for c, m in zip(_layer_counts, _layer_means)) / _N
+            _between_var = sum(c * (m - _grand_mean) ** 2 for c, m in zip(_layer_counts, _layer_means)) / _N
+            target_stats["target_variance_decomp/within"] = _within_var
+            target_stats["target_variance_decomp/between"] = _between_var
+            target_stats["target_variance_decomp/between_ratio"] = _between_var / (_within_var + _between_var + 1e-8)
+
+            _layer_stds = jnp.sqrt(jnp.stack(_layer_vars) + 1e-8)
+            target_stats["target_scale/std_max"] = jnp.max(_layer_stds)
+            target_stats["target_scale/std_min"] = jnp.min(_layer_stds)
+            target_stats["target_scale/std_ratio"] = (
+                jnp.max(_layer_stds) / (jnp.min(_layer_stds) + 1e-8)
+            )
+            target_stats["target_scale/std_cv"] = (
+                jnp.std(_layer_stds) / (jnp.mean(_layer_stds) + 1e-8)
+            )
+
+            _layer_stds_n = jnp.stack(_layer_stds_n)
+            target_stats["target_scale_popart/std_max"] = jnp.max(_layer_stds_n)
+            target_stats["target_scale_popart/std_min"] = jnp.min(_layer_stds_n)
+            target_stats["target_scale_popart/std_ratio"] = (
+                jnp.max(_layer_stds_n) / (jnp.min(_layer_stds_n) + 1e-8)
+            )
+            target_stats["target_scale_popart/std_cv"] = (
+                jnp.std(_layer_stds_n) / (jnp.mean(_layer_stds_n) + 1e-8)
+            )
+
+            _ev_vals = jnp.stack([target_stats[f"critic/{_n}/explained_var"] for _n in _LAYOUT_NAMES])
+            target_stats["critic/worst_family_ev"] = jnp.min(_ev_vals)
+            # ── end value target statistics ─────────────────────────────────
+
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
             _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
             _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
@@ -532,14 +595,9 @@ def make_train(config, update_step=0):
             # targets are real-scale; normalize for value loss in _fwd (network outputs normalized)
             _gc_tgt  = (targets[:_GC_STEPS] - popart_mu) / popart_sigma
 
-            # classify each (step, env) from maze_map → (_GC_STEPS, NUM_ENVS)
-            _n_se = _GC_STEPS * config["NUM_ENVS"]
-            _active_flat = train_filtered_state.maze_map[:_GC_STEPS, :, 4:13, 4:13, 0].reshape(_n_se, 9, 9)
-            _layout_ids = jax.vmap(_classify_layout_jax)(_active_flat).reshape(
-                _GC_STEPS, config["NUM_ENVS"]
-            )
-            # tile to actors: [agent0_envs..., agent1_envs...] → (_GC_STEPS, NUM_ACTORS)
-            _actor_layout = jnp.tile(_layout_ids, [1, env.num_agents])
+            # reuse full-trajectory classification for the gradient-conflict subsample
+            _layout_ids = _layout_ids_full[:_GC_STEPS]
+            _actor_layout = _actor_layout_full[:_GC_STEPS]
 
             def _tdot(g1, g2):
                 return sum(
@@ -610,6 +668,13 @@ def make_train(config, update_step=0):
                     grad_conflict[f"grad_conflict_{_loss_type}/norm/{_LAYOUT_NAMES[_i]}"] = (
                         jnp.sqrt(_s['norms_sq'][_i])
                     )
+                # gradient share p_f, dominance ratio D, norm CV
+                _norms = jnp.stack([jnp.sqrt(_s['norms_sq'][_i]) for _i in range(5)])
+                _norm_sum = _norms.sum() + 1e-8
+                for _i in range(5):
+                    grad_conflict[f"grad_share_{_loss_type}/{_LAYOUT_NAMES[_i]}"] = _norms[_i] / _norm_sum
+                grad_conflict[f"grad_dominance_{_loss_type}"] = jnp.max(_norms) / (jnp.median(_norms) + 1e-8)
+                grad_conflict[f"grad_norm_cv_{_loss_type}"] = jnp.std(_norms) / (jnp.mean(_norms) + 1e-8)
                 # pairwise cosine similarities
                 for _i in range(5):
                     for _j in range(_i + 1, 5):
@@ -815,6 +880,7 @@ def make_train(config, update_step=0):
                 "popart/mu": popart_mu,
                 "popart/sigma": popart_sigma,
                 **grad_conflict,
+                **target_stats,
             }
             rng = update_state[-1]
 
@@ -902,25 +968,14 @@ def make_train(config, update_step=0):
                             log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
 
                 if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
-
                     ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
                     ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
+                    layout_ids = np.array(metric["layout_ids"])  # (NUM_STEPS, NUM_ENVS), pre-step layout
                     layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
                     for t in range(ep_done.shape[0]):
                         for e in range(ep_done.shape[1]):
                             if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
+                                label = EVAL_LAYOUTS_9[int(layout_ids[t, e])]
                                 layout_returns[label].append(float(ep_rets[t, e]))
                     for name in EVAL_LAYOUTS_9:
                         returns_for_layout = layout_returns[name]
@@ -930,36 +985,67 @@ def make_train(config, update_step=0):
                             else float("nan")
                         )
                 wandb.log(log_dict)
-                
-                step = int(metric["update_steps"])
-                def save_frames(filtered_state, step, file_path):
-                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
-                        for step in range(config["NUM_STEPS"])]
-                    
-                    os.makedirs(file_path, exist_ok=True)
-                    filename = f"step_{step:03}_animation.gif"
-                    save_path = os.path.join(file_path, filename)
-                    imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
-            
-                if config["save_frames"] and (step % config["save_frames_interval"] == 0):
-                    save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                
-                if config["save_env_state"] and (step % config["save_env_state_interval"] == 0):
-                    save_slot = step // int(config["save_env_state_interval"])
-                    arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
-                    save_to_hdf5(save_path, state_names, arrays, save_slot, step)
-
             metric["returns"] = returns
             metric["update_steps"] = update_steps
 
             callback_metric = {
                 **metric,
-                "train_filtered_state": train_filtered_state,
-                "env_state": env_state,
                 "episode_returns_step": episode_returns_step,
                 "episode_done_step": episode_done_step,
+                "layout_ids": _layout_ids_full,
             }
             jax.experimental.io_callback(callback, None, callback_metric)
+
+            def ckpt_callback(params, opt_state_, tx_step, step, mu, sigma):
+                step = int(step)
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
+                with open(mid_ckpt_path, "wb") as f:
+                    pickle.dump({
+                        'params': params,
+                        'opt_state': opt_state_,
+                        'tx_step': tx_step,
+                        'final_update_step': step + 1,
+                        'wandb_run_id': wandb.run.id,
+                        'popart_mu': mu,
+                        'popart_sigma': sigma,
+                    }, f)
+
+            save_ckpt_interval = int(config.get("SAVE_CKPT_INTERVAL", 5000))
+            if save_ckpt_interval > 0:
+                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                jax.lax.cond(
+                    run_save_ckpt,
+                    lambda _: jax.experimental.io_callback(ckpt_callback, None, train_state.params, train_state.opt_state, train_state.step, update_steps, popart_mu, popart_sigma),
+                    lambda _: None,
+                    operand=None,
+                )
+
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+                def final_save_callback(params, step, mu, sigma):
+                    fp = save_info["filepath"]
+                    prefix = save_info["fcp_prefix"]
+                    appendage = save_info["finetune_appendage"]
+                    rng_key = save_info["rng"]
+                    os.makedirs(fp, exist_ok=True)
+                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_pop_updates{num_updates_total}.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total,
+                                     'popart_mu': mu, 'popart_sigma': sigma}, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
+                    print(f"--------------------------------")
+
+                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params, update_steps, popart_mu, popart_sigma),
+                    lambda _: None,
+                    operand=None,
+                )
+
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps, popart_mu, popart_sigma), metric
@@ -1011,21 +1097,45 @@ def main(config):
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-    
-    layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=f"CEC_gradient_pop_{layout_name}_seed{config['SEED']}"
-    )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+
+    resume_xpid = config.get("RESUME_XPID", "")
+    active_xpid = resume_xpid if resume_xpid else xpid
+
+    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
+        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+    filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
+
+    config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
+
+    mid_ckpt_path = os.path.join(config['MID_CKPT_DIR'], "resume_ckpt.pkl")
+    _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    wandb_resume_id = None
+    if _has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            _peek = pickle.load(f)
+        wandb_resume_id = _peek.get('wandb_run_id', None)
+
+    layout_name = config["ENV_KWARGS"]["layout"]
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["IPPO", "RNN", "SP"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=f"CEC_gradient_pop_{layout_name}_seed{config['SEED']}"
+        )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
@@ -1033,11 +1143,23 @@ def main(config):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    init_popart_mu = None
+    init_popart_sigma = None
+    if _has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = _peek['params']
+        opt_state = _peek.get('opt_state', None)
+        final_update_step = _peek['final_update_step']
+        rng = jax.random.PRNGKey(config["SEED"])
+        init_popart_mu = _peek.get('popart_mu', None)
+        init_popart_sigma = _peek.get('popart_sigma', None)
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             final_update_step = previous_ckpt['final_update_step']
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
@@ -1056,46 +1178,33 @@ def main(config):
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
     else:
         model_params = None
+        opt_state = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    final_rng = train_state[-1]
-    popart_mu_final = runner_state[2]
-    popart_sigma_final = runner_state[3]
-
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
+    save_info = {
+        "filepath": filepath,
+        "fcp_prefix": fcp_prefix,
+        "finetune_appendage": finetune_appendage,
+        "rng": rng,
+        "num_updates": num_updates,
+    }
 
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {
-            'key': final_rng,
-            'params': model_state.params,
-            'update_steps': num_updates,
-            'popart_mu': popart_mu_final,
-            'popart_sigma': popart_sigma_final,
-        }
-        pickle.dump(ckpt, f)
+    print(f"Starting from update step {final_update_step}")
+    train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
+    out = train_jit(rng, model_params, final_update_step, init_popart_mu, init_popart_sigma)
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_pop_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
-    
     jax.effects_barrier()
     jax.clear_caches()
-    wandb.finish() 
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

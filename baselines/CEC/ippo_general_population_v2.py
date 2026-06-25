@@ -29,6 +29,9 @@ import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 import time
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from find_mid_ckpt import find_mid_ckpt
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -86,16 +89,17 @@ def initialize_environment(config):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos)
+            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
             carry = (i+1,)
             return carry, res
         
         carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
-        ho_agent_pos, ho_goal_pos = res
+        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
         
         # Set the held-out states in the environment
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
+        env.held_out_other_goal_pos = ho_other_goal_pos
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
@@ -136,22 +140,22 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
+        batch_size, num_envs, flattened_obs_dim = obs.shape
         if self.config["CONV_NET"]:
-            batch_size, num_envs, flattened_obs_dim = obs.shape
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
+                features=64,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             embedding = nn.Conv(
-                features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
+                features=32,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
@@ -166,39 +170,27 @@ class ActorCriticRNN(nn.Module):
             self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
-        # embedding = nn.Dense(
-        #     self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        # )(embedding)
-        # embedding = nn.relu(embedding)
+
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            # self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
+            self.config["FC_DIM_SIZE"] * 2,
+            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
 
-        rnn_in = (embedding, dones)
-        hidden, embedding = ScannedRNN()(hidden, rnn_in)
-
-        #########
-        # Model of other agent (patner_prediction module-> 7,8,9 index in original e3t paper)
-        #########
-        prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(embedding)
-        prediction_other = nn.leaky_relu(prediction_other)
-        prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(prediction_other)
-        prediction_other = nn.leaky_relu(prediction_other)
-        prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(prediction_other)
-        prediction_other = nn.leaky_relu(prediction_other)
-        prediction_other = nn.Dense(64, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(prediction_other)
-        prediction_other = nn.tanh(prediction_other)
-        prediction_other = nn.Dense(self.action_dim, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0))(prediction_other)
-        prediction_other = prediction_other / jnp.sqrt(jnp.sum(prediction_other**2, axis=-1, keepdims=True) + 1e-10)  # L2 normalization
-        other_pi = distrax.Categorical(logits=prediction_other)
+        if self.config["LSTM"]:
+            rnn_in = (embedding, dones)
+            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        else:
+            embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
+            embedding = nn.relu(embedding)
+        embedding = embedding.reshape((batch_size, num_envs, -1))
 
         #########
         # Actor
         #########
-        actor_embedding = jnp.concatenate([embedding, prediction_other], axis=-1)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] , kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            actor_embedding
+            embedding
         )
         actor_mean = nn.relu(actor_mean)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
@@ -245,7 +237,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1), other_pi
+        return hidden, pi, jnp.squeeze(critic, axis=-1)
 
 
 class Transition(NamedTuple):
@@ -258,7 +250,7 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
-    other_action: jnp.ndarray
+
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -270,7 +262,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(config, update_step=0, filepath=""):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     
@@ -294,7 +286,6 @@ def make_train(config, update_step=0):
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
@@ -355,7 +346,7 @@ def make_train(config, update_step=0):
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step, beta_agent = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -367,25 +358,13 @@ def make_train(config, update_step=0):
                     last_done[np.newaxis, :],
                     agent_positions[np.newaxis, :],
                 )
-                hstate, pi, value, other_pi = network.apply(train_state.params, hstate, ac_in)
-
-                unbatched_logits = unbatchify(pi.logits, env.agents, config["NUM_ENVS"], env.num_agents)
-                # agent 0 mask is 1 if beta_agent is 0, 0 otherwise
-                agent_0_mask = jnp.where(beta_agent == 0, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
-                agent_1_mask = jnp.where(beta_agent == 1, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
-                multiply_row = lambda x, y: x * y
-                unbatched_logits['agent_0'] = jax.vmap(multiply_row)(unbatched_logits['agent_0'], agent_0_mask)
-                unbatched_logits['agent_1'] = jax.vmap(multiply_row)(unbatched_logits['agent_1'], agent_1_mask)
-                batched_logits = batchify(unbatched_logits, env.agents, config["NUM_ACTORS"])
-                pi = distrax.Categorical(logits=batched_logits)
+                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 env_act = unbatchify(
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
-                other_env_act = {'agent_0': env_act['agent_1'], 'agent_1': env_act['agent_0']}  # get other agent's action
-                other_action = batchify(other_env_act, env.agents, config["NUM_ACTORS"])
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -411,24 +390,20 @@ def make_train(config, update_step=0):
                     log_prob.squeeze(),
                     obs_batch,
                     info,
-                    agent_positions,
-                    other_action.squeeze()
+                    agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, beta_agent)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
                 return runner_state, transition
 
             initial_hstate = runner_state[-2]
             (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
-            # sample which agent we'll increase beta to
-            beta_agent = jax.random.choice(rng, jnp.arange(env.num_agents), shape=(config["NUM_ENVS"],))
-            rng, _rng = jax.random.split(rng)
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps, beta_agent)
+            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
             runner_state, traj_batch = jax.lax.scan(
                 _env_step, runner_state, None, config["NUM_STEPS"]
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps, beta_agent = runner_state
+            train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
@@ -438,7 +413,7 @@ def make_train(config, update_step=0):
                 last_done[np.newaxis, :],
                 agent_positions[np.newaxis, :],
             )
-            _, _, last_val, _ = network.apply(train_state.params, hstate, ac_in)
+            _, _, last_val = network.apply(train_state.params, hstate, ac_in)
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
@@ -474,14 +449,12 @@ def make_train(config, update_step=0):
 
                     def _loss_fn(params, init_hstate, traj_batch, gae, targets):
                         # RERUN NETWORK
-                        _, pi, value, other_pi = network.apply(
+                        _, pi, value = network.apply(
                             params,
                             jax.tree_map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
-                        other_log_prob = other_pi.log_prob(traj_batch.other_action)
-                        moa_nll_loss = -jnp.mean(other_log_prob)
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -516,7 +489,6 @@ def make_train(config, update_step=0):
 
                         total_loss = (
                             loss_actor
-                            + config["MOA_COEF"] * moa_nll_loss
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
                         )
@@ -597,6 +569,12 @@ def make_train(config, update_step=0):
                 ),
                 traj_batch.info,
             )
+
+            returns = metric["returned_episode_returns"][:, :, 0][
+                metric["returned_episode"][:, :, 0].astype(jnp.int32)
+            ].mean()
+            metric = jax.tree_map(lambda x: x.mean(), metric)
+
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
             loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
@@ -612,42 +590,44 @@ def make_train(config, update_step=0):
             rng = update_state[-1]
 
             def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                        **metric["loss"],
-                    }
-                )
+                wandb.log({
+                    "returns": metric["returns"],
+                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    **metric["loss"],
+                })
+                step = int(metric["update_steps"])
+                params = jax.device_get(metric["params"])
                 current_return = float(metric["returns"])
+
+                # Save checkpoint at each new 10-unit return milestone
+                current_threshold = int(current_return // 10) * 10
+                if current_threshold > last_saved_threshold[0]:
+                    last_saved_threshold[0] = current_threshold
+                    os.makedirs(filepath, exist_ok=True)
+                    with open(f"{filepath}/seed{config['SEED']}_ckpt_{ckpt_count[0]}.pkl", "wb") as f:
+                        pickle.dump({'params': params, 'returns': current_return, 'update_steps': step}, f)
+                    ckpt_count[0] += 1
+
+                # Save best return checkpoint
                 if current_return > best_return[0]:
                     best_return[0] = current_return
-                    os.makedirs(config['filepath'], exist_ok=True)
-                    ckpt_path = f"{config['filepath']}/{config['fcp_prefix']}seed{config['SEED']}_best_e3t.pkl"
-                    with open(ckpt_path, "wb") as f:
-                        pickle.dump({
-                            'params': metric["params"],
-                            'returns': current_return,
-                            'update_steps': int(metric['update_steps']),
-                        }, f)
+                    os.makedirs(filepath, exist_ok=True)
+                    with open(f"{filepath}/seed{config['SEED']}_best.pkl", "wb") as f:
+                        pickle.dump({'params': params, 'returns': current_return, 'update_steps': step}, f)
 
-            returns = metric["returned_episode_returns"][:, :, 0][
-                            metric["returned_episode"][:, :, 0].astype(jnp.int32)
-                        ].mean()
             metric["returns"] = returns
             metric["update_steps"] = update_steps
             metric["params"] = train_state.params
+            metric["rng"] = rng
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
 
         best_return = [float('-inf')]
-        
+        last_saved_threshold = [-10]
+        ckpt_count = [0]
+
         rng, _rng = jax.random.split(rng)
         runner_state = (
             train_state,
@@ -657,7 +637,7 @@ def make_train(config, update_step=0):
             init_hstate,
             _rng,
         )
-        runner_state, metric = jax.lax.scan(
+        runner_state, _ = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
         )
         return {"runner_state": runner_state}
@@ -665,40 +645,50 @@ def make_train(config, update_step=0):
     return train
 
 
-@hydra.main(version_base=None, config_path="repro_config", config_name="e3t_final_baseline")
+@hydra.main(version_base=None, config_path="repro_config", config_name="ippo_final_baseline")
 def main(config):
-    save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
-        finetune_appendage = "_e3t_finetune"
-        fcp_prefix = "fcp_"
+        finetune_appendage = "_improved_finetune"
+        if config['FCP']:
+            fcp_prefix = "fcp_"
+        else:
+            fcp_prefix = ""
     elif config['ENV_NAME'] == 'overcooked':
         fcp_prefix = ""
-        finetune_appendage = "_e3t"
+        finetune_appendage = "_improved"
     else:
         fcp_prefix = ""
-        finetune_appendage = "_e3t"
-
+        finetune_appendage = "_improved"
+    
+    if config['ENV_KWARGS']['partial_obs']:
+        finetune_appendage += "_partial_obs"
+    if not config['LSTM']:
+        finetune_appendage += "_no_lstm"
+    if config['ENV_KWARGS']['incentivize_strat'] != 2:
+        finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
+    
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-
+    
+    layout_name = config["ENV_KWARGS"]["layout"]
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
+        name=f"IPPO_{layout_name}_seed{config['SEED']}"
     )
-    filepath = f"ckpts/e3t/{config['ENV_NAME']}"
+    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
-    config['filepath'] = filepath
-    config['fcp_prefix'] = fcp_prefix
+    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
     print(f"Working on: \n{filepath}\n")
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -717,13 +707,17 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/e3t/{config['ENV_NAME']}"
+        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/{config['ENV_KWARGS']['layout']}"
-        finetune_filepath = f"{finetune_filepath}/ikFalse"
-        fcp_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
-        print("Loading fcp checkpoint for finetuning")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_e3t_ckpt{fcp_ckpt_num}.pkl", "rb") as f:  # need to resume from last checkpoint
+            finetune_filepath += f"/cramped_room_9"
+        if config['FCP']:
+            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
+            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
+        else:
+            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
+            finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
+        print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
+        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             # final_update_step = previous_ckpt['final_update_step']
@@ -736,24 +730,11 @@ def main(config):
         rng = jax.random.PRNGKey(config["SEED"])
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
+    train_jit = jax.jit(make_train(config, final_update_step, filepath), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    rng = runner_state[-1]
-    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
-    
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
-        pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
-    
+    print("\nRunning find_mid_ckpt...")
+    find_mid_ckpt(filepath, config["SEED"])
 
 if __name__ == "__main__":
     main()

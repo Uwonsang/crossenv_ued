@@ -1,6 +1,6 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 256
+"NUM_ENVS": 64
 "NUM_SEEDS": 1
 "NUM_STEPS": 256 #checked
 "FC_DIM_SIZE": 256
@@ -33,9 +33,11 @@
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
+"SAVE_CKPT_INTERVAL": 5000  # save resume checkpoint every N update steps (0 = disabled)
+"RESUME_XPID": ""  # set to xpid string (e.g. "lr-20240608-143022") to resume that run
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
-  "overwrite_ckpt": True # if true, will overwrite ckpt_id
+  "overwrite_ckpt": False # if true, will overwrite ckpt_id and ignore mid-run checkpoint
   "finetune": False # if true, load from opposing paradigm and cut learning rate by 10x
   "e3t_beta": 0.55  # how much randomness to add to probabilities of one partner. If 0 then it's completely uniform, if 1 then it's same as original, if higher than 1 we're magnifying the extremes
 "TEST_KWARGS":

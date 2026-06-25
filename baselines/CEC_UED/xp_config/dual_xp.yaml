@@ -1,0 +1,46 @@
+"ENV_NAME": "ToyCoop"
+"NUM_STEPS": 100
+"FC_DIM_SIZE": 256
+"GRU_HIDDEN_DIM": 256
+"ACTIVATION": "relu"
+"CONV_NET": True
+"LSTM": True
+
+"ENV_KWARGS":
+  "random_reset": False
+  "max_steps": 100
+  "check_held_out": False
+  "debug": False
+  "partial_obs": False
+  "incentivize_strat": 2
+  "shuffle_inv_and_pot": True
+  "layout": "cramped_room_9"
+  "random_reset_fn": "reset_all"
+
+"TEST_KWARGS":
+  "beta": 1.0
+  "argmax": False
+  "num_trajs": 100
+
+"DEBUG_GIFS":
+  "enabled": False
+  "max_pairs": 4
+  "pairs": []
+  "only_cross_play": True
+  "traj_seed": 0
+  "fps": 4
+  "upload_wandb": True
+  "out_dir": "baselines/CEC_UED/results/dual_xp/debug_gifs"
+
+"MODEL_ROOT": "ckpts/ippo/ToyCoop"
+"SAVE_PATH": "baselines/CEC_UED/results/dual_xp"
+"OUTPUT_FILE": null
+"SEEDS": [0, 1, 2, 3, 4, 5]
+"PARTNER_SEEDS": [0, 1, 2, 3, 4, 5]
+"IPPO_POP_STAGES": ["init", "mid", "final"]
+"model_name": "IPPO" # IPPO, FCP, CEC, IPPO_POP
+"partner_model_name": null # null means same as model_name
+
+"ENTITY": "overcooked_ai"
+"PROJECT": "crossenv_ued_dual_destination"
+"WANDB_MODE": "online" # disabled, online, offline

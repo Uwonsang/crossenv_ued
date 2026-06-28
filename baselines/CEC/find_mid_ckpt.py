@@ -65,9 +65,8 @@ def find_mid_ckpt(ckpt_dir: str, seed: int):
 
     # --- save to <ckpt_dir>/fcp_pool/seed{seed}/ ---
     out_dir = os.path.join(ckpt_dir, "fcp_pool")
-    seed_dir = os.path.join(out_dir, f"seed{seed}")
     for name, ckpt in [("init", init_ckpt), ("mid", mid_ckpt), ("final", final_ckpt)]:
-        out_path = os.path.join(seed_dir, f"seed{seed}_{name}.pkl")
+        out_path = os.path.join(out_dir, f"seed{seed}_{name}.pkl")
         save_pkl(out_path, ckpt)
         print(f"Saved {name} -> {out_path}")
 

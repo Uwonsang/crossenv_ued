@@ -756,6 +756,8 @@ def main(config):
                     path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"
                 elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"):
                     path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"
+                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"):
+                    path_to_open = f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"
                 else:
                     continue
                 with open(path_to_open, "rb") as f:

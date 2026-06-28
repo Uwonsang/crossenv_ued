@@ -54,8 +54,8 @@
   "train_oracle": False
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_baseline"
+"PROJECT": "crossenv_baseline_v2"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "FCP"
 # FCP_Paths
-"FCP_filepath": "/app/nas/models/new_baselines_model/IPPO/"
+"FCP_filepath": "/app/nas/models/aaai/IPPO/"

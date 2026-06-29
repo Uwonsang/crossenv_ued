@@ -57,20 +57,20 @@ echo "  wandb cache dir: $WANDB_CACHE_DIR"
 echo "  wandb data dir: $WANDB_DATA_DIR"
 
 echo
-echo "===== 1/2 Train fixed-task IPPO population ====="
-for seed in $SEEDS; do
-  echo
-  echo "----- IPPO seed ${seed} -----"
-  python3 baselines/CEC_UED/ippo_general_dual_destination.py \
-    SEED="$seed" \
-    model_name=IPPO_baseline \
-    ENV_KWARGS.random_reset=false \
-    ENV_KWARGS.check_held_out=false \
-    TOTAL_TIMESTEPS="$IPPO_TIMESTEPS" \
-    MAX_TRAIN_STEPS="$IPPO_TIMESTEPS" \
-    WANDB_MODE="$WANDB_MODE" \
-    "${WANDB_OVERRIDES[@]}"
-done
+# echo "===== 1/2 Train fixed-task IPPO population ====="
+# for seed in $SEEDS; do
+#   echo
+#   echo "----- IPPO seed ${seed} -----"
+#   python3 baselines/CEC_UED/ippo_general_dual_destination.py \
+#     SEED="$seed" \
+#     model_name=IPPO_baseline \
+#     ENV_KWARGS.random_reset=false \
+#     ENV_KWARGS.check_held_out=false \
+#     TOTAL_TIMESTEPS="$IPPO_TIMESTEPS" \
+#     MAX_TRAIN_STEPS="$IPPO_TIMESTEPS" \
+#     WANDB_MODE="$WANDB_MODE" \
+#     "${WANDB_OVERRIDES[@]}"
+# done
 
 # Uncomment this block when fresh CEC checkpoints are needed.
 #

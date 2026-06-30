@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax import lax
 from functools import partial
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from jaxmarl.environments.overcooked.common import OBJECT_TO_INDEX, COLOR_TO_INDEX, COLORS
 import pdb
@@ -198,7 +199,7 @@ def render_tile(obj, highlight, agent_dir_idx, agent_inv, tile_size=TILE_PIXELS)
             plate_fn = point_in_circle(0.5, 0.5, 0.2)
             img = fill_coords(img, plate_fn, color)
             onion_fn = point_in_circle(0.5, 0.5, 0.13)
-            img = fill_coords(img, onion_fn, color)
+            img = fill_coords(img, onion_fn, COLORS["orange"])
             return img
         def render_pot(img):
             img = rendering_pot(obj, img)
@@ -375,5 +376,14 @@ def render_state(state, highlight=False, tile_size=TILE_PIXELS, agent_view_size=
         state.agent_dir_idx,
         state.agent_inv,
     )
-    
+
     return img
+
+
+def overlay_score_text(img, score, position=(10, 10), color=(255, 255, 255)):
+    img = np.array(img, dtype=np.uint8)
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default()
+    draw.text(position, f"Score: {int(score)}", fill=color, font=font)
+    return np.array(pil_img)

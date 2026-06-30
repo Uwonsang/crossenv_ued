@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from jax import lax
 from functools import partial
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 from jaxmarl.environments.overcooked.common import OBJECT_TO_INDEX, COLOR_TO_INDEX, COLORS
 import pdb
@@ -375,5 +376,14 @@ def render_state(state, highlight=False, tile_size=TILE_PIXELS, agent_view_size=
         state.agent_dir_idx,
         state.agent_inv,
     )
-    
+
     return img
+
+
+def overlay_score_text(img, score, position=(10, 10), color=(255, 255, 255)):
+    img = np.array(img, dtype=np.uint8)
+    pil_img = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil_img)
+    font = ImageFont.load_default()
+    draw.text(position, f"Score: {int(score)}", fill=color, font=font)
+    return np.array(pil_img)

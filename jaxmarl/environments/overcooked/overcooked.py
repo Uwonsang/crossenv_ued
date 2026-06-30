@@ -242,8 +242,55 @@ class Overcooked(MultiAgentEnv):
         random_cramped_room = _single_layout_reset(make_cramped_room_9x9)
         random_asymm_advantages = _single_layout_reset(make_asymm_advantages_9x9)
 
+        @jax.jit
+        def random_og_5_weighted(key):
+            # layout order: [asymm=0, coord_ring=1, counter_circuit=2, forced_coord=3, cramped_room=4]
+            # params['layout_weights'] must be provided as a normalized JAX array of shape (5,)
+            weights = params['layout_weights']
+
+            def reset_one(key, fn):
+                key, subkey = jax.random.split(key)
+                layout_dict = fn(subkey, ik=True)
+                obs, state = self.custom_reset(key, layout=layout_dict, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
+                return obs, state
+
+            layout_fns = [make_asymm_advantages_9x9, make_coord_ring_9x9, make_counter_circuit_9x9, make_forced_coord_9x9, make_cramped_room_9x9]
+            key, *subkeys = jax.random.split(key, len(layout_fns) + 1)
+            all_resets = [reset_one(sk, fn) for sk, fn in zip(subkeys, layout_fns)]
+            stacked = jax.tree_map(lambda *x: jnp.stack(x), *all_resets)
+            key, subkey = jax.random.split(key)
+            index = jax.random.choice(subkey, len(layout_fns), p=weights)
+            return jax.tree_map(lambda x: x[index], stacked)
+
+        _MAX_WALL_IDX_LEN = 81
+
+        def _pad_wall_idx(layout):
+            w = layout["wall_idx"]
+            padded = jnp.pad(w, (0, _MAX_WALL_IDX_LEN - w.shape[0]), mode="edge")
+            return layout.copy({"wall_idx": padded})
+
+        @jax.jit
+        def random_og_5_padded(key):
+            layout_fns = (
+                make_asymm_advantages_9x9,
+                make_coord_ring_9x9,
+                make_counter_circuit_9x9,
+                make_forced_coord_9x9,
+                make_cramped_room_9x9,
+            )
+            branches = tuple(
+                (lambda fn: lambda k: _pad_wall_idx(fn(k, ik=True)))(fn)
+                for fn in layout_fns
+            )
+            key, subkey = jax.random.split(key)
+            index = jax.random.randint(subkey, (), 0, 5)
+            layout = jax.lax.switch(index, branches, subkey)
+            return self.custom_reset(key, layout=layout, random_reset=False, shuffle_inv_and_pot=self.shuffle_inv_and_pot)
+
         _fn_map = {
             'reset_all': random_og_5,
+            'reset_all_padded': random_og_5_padded,
+            'reset_all_weighted': random_og_5_weighted,
             'reset_counter_circuit': random_counter_circuit,
             'reset_coord_ring': random_coord_ring,
             'reset_forced_coord': random_forced_coord,

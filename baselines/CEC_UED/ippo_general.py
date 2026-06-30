@@ -33,7 +33,7 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -272,7 +272,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(config, update_step=0, save_info=None, opt_state=None):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     agent_view_size = env.agent_view_size
@@ -282,7 +282,9 @@ def make_train(config, update_step=0):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    # If opt_state is restored from a mid-run checkpoint, the optimizer's own step
+    # count already reflects progress, so the manual offset would double-count it.
+    resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -299,7 +301,20 @@ def make_train(config, update_step=0):
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    if config["save_env_state"]:
+        state_names  = ["agent_dir_idx", "agent_inv", "maze_map"]
+        state_shapes = {k: getattr(state, k).shape for k in state_names}
+        state_dtypes = {k: getattr(state, k).dtype for k in state_names}
+        save_every = int(config["save_env_state_interval"])
+        data_len = (int(config["NUM_UPDATES"]) + save_every - 1) // save_every
+
+        save_path = f"/app/baselines/CEC_UED/dataset/train_env_states.h5"
+        init_hdf5(save_path, state_names, state_shapes, state_dtypes, int(data_len), config["NUM_ENVS"])
+
+
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+
+    eval_envs = make_eval_envs_overcooked(config)
 
     def linear_schedule(count):
         frac = (
@@ -310,7 +325,9 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
+
+    def train(rng, model_params=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -345,6 +362,8 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )
+        if opt_state is not None:
+            train_state = train_state.replace(opt_state=opt_state)
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -353,7 +372,7 @@ def make_train(config, update_step=0):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
@@ -393,9 +412,9 @@ def make_train(config, update_step=0):
                 del info['shaped_reward']
 
                 filtered_state = {
-                    "agent_dir_idx": env_state.env_state.agent_dir_idx[0],
-                    "agent_inv": env_state.env_state.agent_inv[0],
-                    "maze_map": env_state.env_state.maze_map[0]}
+                    "agent_dir_idx": env_state.env_state.agent_dir_idx,
+                    "agent_inv": env_state.env_state.agent_inv,
+                    "maze_map": env_state.env_state.maze_map}
 
                 info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
@@ -599,6 +618,9 @@ def make_train(config, update_step=0):
             returns = metric["returned_episode_returns"][:, :, 0][
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
+            # Save before reduction for per-layout return logging in callback
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
+            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
             metric = jax.tree_map(lambda x: x.mean(), metric)
             
@@ -616,18 +638,92 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
-                        **metric["loss"],
-                    }
-                )
-                step = int(metric["update_steps"])
+            def eval_layout(eval_env, params, eval_rng):
+                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+                num_actors_eval = eval_env.num_agents * num_eval_envs 
 
+                eval_rng, reset_rng = jax.random.split(eval_rng)
+                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+                init_hstate = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
+                init_done = jnp.zeros((num_actors_eval,), dtype=bool)
+                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+                runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+                def _eval_step(carry, _):
+                    env_state_e, obs_e, done_e, hstate_e, returns_e, rng_e = carry
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    obs_batch = batchify(obs_e, eval_env.agents, num_actors_eval)
+                    agent_positions = {'agent_0': env_state_e.env_state.agent_pos, 'agent_1': env_state_e.env_state.agent_pos}
+                    agent_positions = batchify(agent_positions, eval_env.agents, num_actors_eval)
+                    ac_in = (
+                        obs_batch[np.newaxis, :],
+                        done_e[np.newaxis, :],
+                        agent_positions[np.newaxis, :],
+                    )
+                    hstate_next, pi, _ = network.apply(params, hstate_e, ac_in)
+                    pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
+                    sampled_action = pi.sample(seed=_rng_e)[0]
+                    greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
+                    action = jnp.where(config["EVAL_KWARGS"]["argmax"], greedy_action, sampled_action)
+
+                    env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
+                    env_act = {k: v.squeeze() for k, v in env_act.items()} #TODO: check
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                    obs_next, state_next, reward, done, _info = jax.vmap(
+                        eval_env.step, in_axes=(0, 0, 0)
+                    )(rng_step_e, env_state_e, env_act)
+
+                    done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
+                    returns_next = returns_e + reward["agent_0"]
+
+                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), None
+                
+                runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
+                state, obs, done, h_state, returns, rng = runner_state
+
+                return returns.mean()
+
+            run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
+
+            if config["ENV_NAME"] == "overcooked" and len(eval_envs) > 0:
+                def _do_eval(_):
+                    out = {}
+                    base = jax.random.fold_in(rng, update_steps)
+                    for i, layout_name in enumerate(EVAL_LAYOUTS_9):
+                        out[layout_name] = eval_layout(
+                            eval_envs[layout_name],
+                            train_state.params,
+                            jax.random.fold_in(base, i),
+                        )
+                    out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
+                    return out
+
+                def _skip_eval(_):
+                    out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
+                    out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                    return out
+
+                metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
+
+            def callback(metric):
+                log_dict = {
+                    "returns": metric["returns"],
+                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    **metric["loss"],
+                }
+                if "eval_returns" in metric:
+                    if np.isfinite(float(metric["eval_returns"]["mean"])):
+                        log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
+                        for _ln in EVAL_LAYOUTS_9:
+                            log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
+
+                wandb.log(log_dict)
+                
+                step = int(metric["update_steps"])
                 def save_frames(filtered_state, step, file_path):
                     frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
                         for step in range(config["NUM_STEPS"])]
@@ -637,18 +733,74 @@ def make_train(config, update_step=0):
                     save_path = os.path.join(file_path, filename)
                     imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
             
-                if config["save_frames"]:
+                if config["save_frames"] and (step % config["save_frames_interval"] == 0):
                     save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
                 
+                if config["save_env_state"] and (step % config["save_env_state_interval"] == 0):
+                    save_slot = step // int(config["save_env_state_interval"])
+                    arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
+                    save_to_hdf5(save_path, state_names, arrays, save_slot, step)
+
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            
+
             callback_metric = {
                 **metric,
                 "train_filtered_state": train_filtered_state,
+                "env_state": env_state,
+                "episode_returns_step": episode_returns_step,
+                "episode_done_step": episode_done_step,
             }
-            
             jax.experimental.io_callback(callback, None, callback_metric)
+
+            def ckpt_callback(params, opt_state_, tx_step, step):
+                step = int(step)
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
+                with open(mid_ckpt_path, "wb") as f:
+                    pickle.dump({
+                        'params': params,
+                        'opt_state': opt_state_,
+                        'tx_step': tx_step,
+                        'final_update_step': step + 1,
+                        'wandb_run_id': wandb.run.id,
+                    }, f)
+
+            save_ckpt_interval = int(config.get("SAVE_CKPT_INTERVAL", 5000))
+            if save_ckpt_interval > 0:
+                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                jax.lax.cond(
+                    run_save_ckpt,
+                    lambda _: jax.experimental.io_callback(ckpt_callback, None, train_state.params, train_state.opt_state, train_state.step, update_steps),
+                    lambda _: None,
+                    operand=None,
+                )
+
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+                def final_save_callback(params, step):
+                    fp = save_info["filepath"]
+                    prefix = save_info["fcp_prefix"]
+                    appendage = save_info["finetune_appendage"]
+                    rng_key = save_info["rng"]
+                    os.makedirs(fp, exist_ok=True)
+                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_updates{num_updates_total}.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total}, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
+                    print(f"--------------------------------")
+
+                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params, update_steps),
+                    lambda _: None,
+                    operand=None,
+                )
+
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
@@ -663,7 +815,7 @@ def make_train(config, update_step=0):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step), jnp.arange(remaining_updates), remaining_updates
         )
         return {"runner_state": runner_state}
 
@@ -700,21 +852,47 @@ def main(config):
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-    
-    layout_name = config["ENV_KWARGS"]["layout"]
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=f"CEC_{layout_name}_seed{config['SEED']}"
-    )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+
+    # filepath: RESUME_XPID가 있으면 그 xpid 재사용, 없으면 새 xpid 생성
+    resume_xpid = config.get("RESUME_XPID", "")
+    active_xpid = resume_xpid if resume_xpid else xpid
+
+    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{xpid}'
+        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+    filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
+
+    # Mid-run checkpoint dir: xpid 폴더 안에 위치
+    config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
+
+    mid_ckpt_path = os.path.join(config['MID_CKPT_DIR'], "resume_ckpt.pkl")
+    _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    wandb_resume_id = None
+    if _has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            _peek = pickle.load(f)
+        wandb_resume_id = _peek.get('wandb_run_id', None)
+
+    layout_name = config["ENV_KWARGS"]["layout"]
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["IPPO", "RNN", "SP"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=f"CEC_{layout_name}_seed{config['SEED']}"
+        )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
@@ -722,11 +900,20 @@ def main(config):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    # Auto-resume from mid-run checkpoint if available
+    if _has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = _peek['params']
+        opt_state = _peek.get('opt_state', None)
+        final_update_step = _peek['final_update_step']
+        rng = jax.random.PRNGKey(config["SEED"])
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             final_update_step = previous_ckpt['final_update_step']
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
@@ -745,33 +932,33 @@ def main(config):
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            opt_state = None
             # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
     else:
         model_params = None
+        opt_state = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
+    save_info = {
+        "filepath": filepath,
+        "fcp_prefix": fcp_prefix,
+        "finetune_appendage": finetune_appendage,
+        "rng": rng,
+        "num_updates": num_updates,
+    }
 
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
-        pickle.dump(ckpt, f)
+    print(f"Starting from update step {final_update_step}")
+    train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
+    out = train_jit(rng, model_params)
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
+    jax.effects_barrier()
+    jax.clear_caches()
+    wandb.finish()
 
 if __name__ == "__main__":
     main()

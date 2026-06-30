@@ -5,19 +5,14 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
+import glob as glob_module
 import pickle
 import jax
 import jax.numpy as jnp
-import flax.linen as nn
 import numpy as np
-import optax
-from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
-from flax.training.train_state import TrainState
 import distrax
 import hydra
 from omegaconf import OmegaConf
-import gc
 # from sklearn.manifold import TSNE
 
 import jaxmarl
@@ -29,13 +24,12 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 import imageio
 import matplotlib.pyplot as plt
 
-import wandb
-import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import pandas as pd
 from tqdm import tqdm
+from jax_tqdm import scan_tqdm
 # import tsnex
+from actor_networks import ScannedRNN, ActorCriticE3T, ActorCriticRNN
 
 
 def initialize_environment(config):
@@ -110,142 +104,6 @@ def initialize_environment(config):
         config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
-
-class ScannedRNN(nn.Module):
-    @functools.partial(
-        nn.scan,
-        variable_broadcast="params",
-        in_axes=0,
-        out_axes=0,
-        split_rngs={"params": False},
-    )
-    @nn.compact
-    def __call__(self, carry, x):
-        """Applies the module."""
-        lstm_state = carry
-        ins, resets = x
-        
-        # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
-            lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
-            lstm_state
-        )
-        
-        new_lstm_state, y = nn.OptimizedLSTMCell(features=ins.shape[-1])(lstm_state, ins)
-        return new_lstm_state, y
-
-    @staticmethod
-    def initialize_carry(batch_size, hidden_size):
-        return nn.OptimizedLSTMCell(features=hidden_size).initialize_carry(
-            jax.random.PRNGKey(0), (batch_size, hidden_size)
-        )
-
-
-class ActorCriticRNN(nn.Module):
-    action_dim: Sequence[int]
-    config: Dict
-
-    @nn.compact
-    def __call__(self, hidden, x):
-        obs, dones, agent_positions = x
-        if self.config["GRAPH_NET"]:
-            batch_size, num_envs, flattened_obs_dim = obs.shape
-            if self.config["ENV_NAME"] == "overcooked":
-                reshaped_obs = obs.reshape(-1, 7,7,26)
-            else:
-                reshaped_obs = obs.reshape(-1, 5,5,4)
-
-            embedding = nn.Conv(
-                features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
-                kernel_size=(2, 2),
-                kernel_init=orthogonal(np.sqrt(2)),
-                bias_init=constant(0.0),
-            )(reshaped_obs)
-            embedding = nn.relu(embedding)
-            embedding = nn.Conv(
-                features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
-                kernel_size=(2, 2),
-                kernel_init=orthogonal(np.sqrt(2)),
-                bias_init=constant(0.0),
-            )(embedding)
-            embedding = nn.relu(embedding)
-
-            embedding = embedding.reshape((batch_size, num_envs, -1))
-        else:
-            embedding = obs
-
-        embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(embedding)
-        embedding = nn.relu(embedding)
-
-        embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
-        )(embedding)
-        embedding = nn.relu(embedding)
-
-        if self.config["LSTM"]:
-            rnn_in = (embedding, dones)
-            hidden, embedding = ScannedRNN()(hidden, rnn_in)
-        else:
-            # embedding = embedding.reshape((batch_size, num_envs, -1))
-            embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
-            embedding = nn.relu(embedding)
-
-        #########
-        # Actor
-        #########
-        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] , kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
-        actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            actor_mean
-        )
-        actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(
-            self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
-        )(actor_mean)
-        actor_mean = nn.relu(actor_mean)
-        if self.config["ENV_NAME"] == "overcooked":
-            actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                actor_mean
-            )
-            actor_mean = nn.relu(actor_mean)  # extra layer 1
-
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)        
-
-        pi = distrax.Categorical(logits=actor_mean)
-
-        #########
-        # Critic
-        #########
-        critic = nn.Dense(self.config["FC_DIM_SIZE"]*2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
-        critic = nn.relu(critic)
-        critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            critic
-        )
-        critic = nn.relu(critic)
-        if self.config["ENV_NAME"] == "overcooked":
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 1
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 2
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
-
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
-
-
 def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
     
     def _step(carry, unused):
@@ -261,9 +119,15 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
             last_done[np.newaxis, :],
             agent_positions[np.newaxis, :]
         )
-        hstate_1, pi_1, value_1 = network.apply(train_state_params_1, hstate_1, ac_in)
+        if config["model_name"] == "E3T":
+            hstate_1, pi_1, value_1, _ = network.apply(train_state_params_1, hstate_1, ac_in)
+        else:
+            hstate_1, pi_1, value_1 = network.apply(train_state_params_1, hstate_1, ac_in)
         pi_1 = distrax.Categorical(logits=pi_1.logits * config["TEST_KWARGS"]["beta"])
-        hstate_2, pi_2, value_2 = network.apply(train_state_params_2, hstate_2, ac_in)
+        if config["model_name"] == "E3T":
+            hstate_2, pi_2, value_2, _ = network.apply(train_state_params_2, hstate_2, ac_in)
+        else:
+            hstate_2, pi_2, value_2 = network.apply(train_state_params_2, hstate_2, ac_in)
         pi_2 = distrax.Categorical(logits=pi_2.logits * config["TEST_KWARGS"]["beta"])
 
         action_1 = pi_1.sample(seed=_rng)[0]
@@ -306,69 +170,68 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
     return (trajectories, init_env_states, init_obsvs)
 
 
-@hydra.main(version_base=None, config_path="config", config_name="ippo_final")
+@hydra.main(version_base=None, config_path="repro_config", config_name="test_general")
 def main(config):
     config = OmegaConf.to_container(config)
-    if config["FCP"]:
-        fcp_str = "fcp_"
-    else:
-        fcp_str = ""
-    if config["TRAIN_KWARGS"]["finetune"]:
-        finetune_appendage = "_improved_finetune"
-    else:
-        finetune_appendage = "_improved"
 
-    if config['ENV_KWARGS']['partial_obs']:
-        finetune_appendage += "_partial_obs"
-    if not config['LSTM']:
-        finetune_appendage += "_no_lstm"
+    ##################
+    # Load all models for current ckpt id
+    ##################
 
     if config['ENV_NAME'] == "overcooked":
         from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    config["ENV_KWARGS"]["shuffle_inv_and_pot"] = False
-    config["ENV_KWARGS"]["check_held_out"] = False
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-        filepath = f'{filepath}/ik{config["TEST_KWARGS"]["ik"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
-    else:
-        filepath = f'{filepath}/ik{config["TEST_KWARGS"]["ik"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/graph{config["GRAPH_NET"]}'
-    # make path if it doesn't exist
-    os.makedirs(filepath, exist_ok=True)
+    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"])
+    config['SAVE_PATH_FINAL'] = save_path_final
+    os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
 
-    if config['FCP_KWARGS']['train_oracle'] and config['FCP'] and config['ENV_KWARGS']['incentivize_strat'] == 2:
-        finetune_appendage += '_oracle'
-    if config['ENV_KWARGS']['incentivize_strat'] != 2:
-        finetune_appendage += f"_incentivize_strat_{config['ENV_KWARGS']['incentivize_strat']}"
-
-    ##################
-    # Load all models for current ckpt id
-    ##################
     param_list = []
     seed_list = []
+    iter_range = range(config['NUM_MODELS'])
+    def find_model_path(seed):
+        if config["model_name"] == "CEC":
+            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_updates58593.pkl"] 
+        elif config["model_name"] == "FCP":
+            patterns = [
+                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/fcp_seed{seed}_best.pkl",
+            ]
+        elif config["model_name"] == "E3T":
+            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_best_e3t.pkl"]
+        elif config["model_name"] == "IPPO":
+            patterns = [
+                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"]
+        elif config["model_name"] == "CEC_POP_ART":
+            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"]
+        elif config["model_name"] == "CEC_POP_ART_TEST":
+            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART_TEST/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29.pkl"]
+        for pat in patterns:
+            matches = sorted(glob_module.glob(pat))
+            if matches:
+                return matches[-1]
+        return None
 
-    iter_range = range(6)
     for seed in iter_range:
-        # try:
-        if config["TEST_KWARGS"]["ik"] and config["ENV_NAME"] == "overcooked":  # want to load from ik model if we're testing ik model on overcooked
-            load_path = f"ckpts/ippo/{config['ENV_NAME']}/cramped_room_9/ik{config['TEST_KWARGS']['ik']}/{config['ENV_KWARGS']['random_reset_fn']}/graph{config['GRAPH_NET']}"
-        else:
-            load_path = filepath
         try:
-            with open(f"{load_path}/{fcp_str}seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl", "rb") as f:
+            filepath = find_model_path(seed)
+            with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
+                if config["model_name"] in ("CEC_POP_ART", "CEC_POP_ART_TEST"):
+                    import flax.core
+                    p = flax.core.unfreeze(model_params)
+                    if 'critic_output' in p.get('params', {}):
+                        p['params']['Dense_11'] = p['params'].pop('critic_output')
+                    model_params = flax.core.freeze(p)
                 param_list.append(model_params)
                 seed_list.append(seed)
                 del previous_ckpt
         except:
             continue
+    
     if len(param_list) == 0:
         print(f"No models found")
-        print(f"Loading from {load_path}/{fcp_str}seed{seed}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl")
         exit(0)
     seed_list = jnp.array(seed_list)
 
@@ -377,14 +240,17 @@ def main(config):
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
     seed_pairs = seed_pairs.reshape((2, -1)).T
-
+    
     ##################
     # Initialize environment and network
     ##################
+    layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
-
+    if config["model_name"] in ("CEC", "FCP", "IPPO", "CEC_POP_ART", "CEC_POP_ART_TEST"):
+        network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
+    elif config["model_name"] == "E3T":
+        network = ActorCriticE3T(env.action_space("agent_0").n, config=config)
     
     ##################
     # Evaluate pairs
@@ -402,6 +268,7 @@ def main(config):
         return (true_seed_1, true_seed_2, rewards, trajectories, init_env_states)
     
     if not config['TEST_KWARGS']['plot']:
+        print("Evaluating pairs saved to csv")
         eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None)))
         eval_pair_res = eval_pair_fn(seed_pairs, seed_list, param_stack)
         true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
@@ -417,10 +284,12 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        df.to_csv(f"{filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv", index=False)
-        print(f"Saved data to {filepath}/{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.csv")
+        savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results.csv"
+        df.to_csv(savefile, index=False)
+        print(f"Saved data to {savefile}")
     else:
         # iterate over all self play pairs
+        print("Evaluating self play pairs saved to gif")
         for sp_seeds in tqdm(range(len(seed_pairs))):
             seed_val = seed_pairs[sp_seeds]
             seed_0, seed_1 = seed_val[0], seed_val[1]
@@ -511,13 +380,15 @@ def main(config):
                     plt.close()
 
                 # Save as gif with explicit loop parameter and duration
+
+                gif_path = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
                 imageio.mimsave(
-                    f"{filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif",
+                    gif_path,
                     frames,
                     fps=10,
                     loop=0  # 0 means loop forever
                 )
-                print(f"Saved gif to {filepath}/{fcp_str}seed{seed_0}x{seed_1}_{fcp_str}eval_on_ik{config['ENV_KWARGS']['random_reset']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_traj{traj_num}.gif")
+                print(f"Saved gif to {gif_path}")
 
 if __name__ == "__main__":
     main()

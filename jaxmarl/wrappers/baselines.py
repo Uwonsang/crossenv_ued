@@ -15,6 +15,7 @@ from jaxmarl.environments.multi_agent_env import MultiAgentEnv, State
 
 from safetensors.flax import save_file, load_file
 from flax.traverse_util import flatten_dict, unflatten_dict
+from baselines.CEC_UED.minimax import sample_layout_reset_all, check_heldout_match_overcooked
 
 def save_params(params: Dict, filename: Union[str, os.PathLike]) -> None:
     flattened_dict = flatten_dict(params, sep=',')
@@ -137,6 +138,191 @@ class LogWrapper(JaxMARLWrapper):
         )
         if self.replace_info:
             info = {}
+        info["returned_episode_returns"] = state.returned_episode_returns
+        info["returned_episode_lengths"] = state.returned_episode_lengths
+        info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
+        return obs, state, reward, done, info
+
+@struct.dataclass
+class CurriculumLogEnvState:
+    env_state: State
+    episode_returns: float
+    episode_lengths: int
+    returned_episode_returns: float
+    returned_episode_lengths: int
+    total_env_steps: int
+    layout_weights: jnp.ndarray
+
+
+class CurriculumLogWrapper(JaxMARLWrapper):
+    """LogWrapper with annealed layout sampling.
+
+    anneal_config keys:
+      start_weights  – list of 5 floats: [asymm, coord_ring, counter_circuit, forced_coord, cramped_room]
+      end_weights    – list of 5 floats (target after anneal_steps)
+      anneal_steps   – total env steps over which to interpolate
+    """
+
+    def __init__(self, env: MultiAgentEnv, replace_info: bool = False,
+                 env_params: Dict = None, anneal_config: Dict = None):
+        super().__init__(env)
+        self.replace_info = replace_info
+        self.env_params = env_params
+        self.anneal_config = anneal_config
+
+    def _compute_weights(self, total_env_steps):
+        start = jnp.array(self.anneal_config['start_weights'])
+        end   = jnp.array(self.anneal_config['end_weights'])
+        anneal_steps = float(self.anneal_config['anneal_steps'])
+        frac = jnp.minimum(1.0, total_env_steps / anneal_steps)
+        weights = start + (end - start) * frac
+        return weights / weights.sum()
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset(self, key: chex.PRNGKey, params: Optional[Dict] = None) -> Tuple[chex.Array, State]:
+        weights = jnp.ones(5) / 5
+        merged_params = {**self.env_params, 'layout_weights': weights, **(params or {})}
+        obs, env_state = self._env.reset(key, params=merged_params)
+        state = CurriculumLogEnvState(
+            env_state=env_state,
+            episode_returns=jnp.zeros((self._env.num_agents,)),
+            episode_lengths=jnp.zeros((self._env.num_agents,)),
+            returned_episode_returns=jnp.zeros((self._env.num_agents,)),
+            returned_episode_lengths=jnp.zeros((self._env.num_agents,)),
+            total_env_steps=jnp.zeros((), dtype=jnp.int32),
+            layout_weights=jnp.ones(5) / 5,
+        )
+        return obs, state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, key: chex.PRNGKey, state: CurriculumLogEnvState, action: Union[int, float]):
+        key, key_reset = jax.random.split(key)
+        obs_st, env_state_st, reward, done, info = self._env.step_env(key, state.env_state, action)
+        ep_done = done["__all__"]
+
+        weights = self._compute_weights(state.total_env_steps)
+        reset_params = {**self.env_params, 'layout_weights': weights}
+        obs_re, reset_env_state = self._env.reset(key_reset, params=reset_params)
+
+        env_state = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            reset_env_state, env_state_st,
+        )
+        obs = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            obs_re, obs_st,
+        )
+
+        new_episode_return = state.episode_returns + self._batchify_floats(reward)
+        new_episode_length = state.episode_lengths + 1
+        state = CurriculumLogEnvState(
+            env_state=env_state,
+            episode_returns=new_episode_return * (1 - ep_done),
+            episode_lengths=new_episode_length * (1 - ep_done),
+            returned_episode_returns=state.returned_episode_returns * (1 - ep_done) + new_episode_return * ep_done,
+            returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done) + new_episode_length * ep_done,
+            total_env_steps=state.total_env_steps + 1,
+            layout_weights=weights,
+        )
+        if self.replace_info:
+            info = {}
+        info["returned_episode_returns"] = state.returned_episode_returns
+        info["returned_episode_lengths"] = state.returned_episode_lengths
+        info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)
+        return obs, state, reward, done, info
+
+
+class PLRLogWrapper(JaxMARLWrapper):
+    """
+    LogWrapper variant that resets from a provided layout on episode boundary.
+    This is needed so rollouts collected under PLR do not "drift" to random resets
+    mid-rollout when an episode ends.
+    """
+
+    def __init__(self, env, env_params):
+        super().__init__(env)
+        if sample_layout_reset_all is None or check_heldout_match_overcooked is None:
+            raise ModuleNotFoundError(
+                "PLRLogWrapper requires minimax utilities. "
+                "Import `baselines.CEC_UED.minimax` or add `minimax` to PYTHONPATH."
+            )
+        self.env_params = env_params
+
+    @partial(jax.jit, static_argnums=(0,))
+    def reset_from_layout(self, key):
+        layout = sample_layout_reset_all(key)
+
+        obs, env_state = self._env.custom_reset(
+            key,
+            random_reset=False,
+            shuffle_inv_and_pot=False,
+            layout=layout,
+        )
+
+        if (
+            self._env.held_out_goal is not None
+            and self._env.held_out_wall is not None
+            and self._env.held_out_pot is not None
+        ):
+            key, key_reset = jax.random.split(key)
+            is_match = check_heldout_match_overcooked(
+                env_state,
+                self._env.held_out_goal,
+                self._env.held_out_wall,
+                self._env.held_out_pot,
+            )
+
+            def _resample(k):
+                new_layout = sample_layout_reset_all(k)
+                return self._env.custom_reset(
+                    k,
+                    random_reset=False,
+                    shuffle_inv_and_pot=False,
+                    layout=new_layout,
+                )
+
+            obs, env_state = jax.lax.cond(is_match, _resample, lambda k: (obs, env_state), key_reset)
+
+        state = LogEnvState(
+            env_state,
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+            jnp.zeros((self._env.num_agents,)),
+        )
+        return obs, state
+
+    @partial(jax.jit, static_argnums=(0,))
+    def step(self, key, state, action):
+        key, key_reset = jax.random.split(key)
+        obs_st, env_state_st, reward, done, info = self._env.step_env(
+            key, state.env_state, action
+        )
+        ep_done = done["__all__"]
+
+        obs_re, reset_state = self.reset_from_layout(key_reset)
+        env_state = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            reset_state.env_state,
+            env_state_st,
+        )
+        obs = jax.tree_map(
+            lambda x, y: jax.lax.select(ep_done, x, y),
+            obs_re,
+            obs_st,
+        )
+
+        new_episode_return = state.episode_returns + self._batchify_floats(reward)
+        new_episode_length = state.episode_lengths + 1
+        state = LogEnvState(
+            env_state=env_state,
+            episode_returns=new_episode_return * (1 - ep_done),
+            episode_lengths=new_episode_length * (1 - ep_done),
+            returned_episode_returns=state.returned_episode_returns * (1 - ep_done)
+            + new_episode_return * ep_done,
+            returned_episode_lengths=state.returned_episode_lengths * (1 - ep_done)
+            + new_episode_length * ep_done,
+        )
         info["returned_episode_returns"] = state.returned_episode_returns
         info["returned_episode_lengths"] = state.returned_episode_lengths
         info["returned_episode"] = jnp.full((self._env.num_agents,), ep_done)

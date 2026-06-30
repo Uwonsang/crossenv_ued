@@ -263,6 +263,10 @@ def make_train(config, update_step=0):
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
+    partners_per_update = int(config["FCP_KWARGS"].get("partners_per_update", 1))
+    if config["NUM_ENVS"] % partners_per_update != 0:
+        raise ValueError("NUM_ENVS must be divisible by FCP_KWARGS.partners_per_update")
+    partner_envs_per_group = config["NUM_ENVS"] // partners_per_update
 
     def linear_schedule(count):
         frac = (
@@ -340,12 +344,42 @@ def make_train(config, update_step=0):
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
 
-                # Get other agent actions
-                other_hstate, other_pi, other_value = network.apply(frozen_param, other_hstate, ac_in)
-                other_action = other_pi.sample(seed=_rng)
-                other_log_prob = other_pi.log_prob(other_action)
+                # Get frozen partner actions. To reduce partner-collapse, each update can
+                # mix multiple partners across disjoint environment groups.
+                other_action_flat = jnp.zeros_like(action.squeeze())
+
+                def _partner_group_step(group_idx, carry):
+                    other_hstate_acc, other_action_acc, group_rng = carry
+                    start = group_idx * partner_envs_per_group
+                    env_idx = jnp.arange(partner_envs_per_group) + start
+                    actor_idx = jnp.concatenate([env_idx, env_idx + config["NUM_ENVS"]])
+                    frozen_param_group = jax.tree_map(lambda x: x[group_idx], frozen_param)
+                    other_hstate_group = jax.tree_map(lambda x: x[actor_idx], other_hstate_acc)
+                    ac_in_group = (
+                        obs_batch[actor_idx][np.newaxis, :],
+                        last_done[actor_idx][np.newaxis, :],
+                        agent_positions[actor_idx][np.newaxis, :],
+                    )
+                    other_hstate_group, other_pi, _ = network.apply(
+                        frozen_param_group, other_hstate_group, ac_in_group
+                    )
+                    group_rng, action_rng = jax.random.split(group_rng)
+                    other_action_group = other_pi.sample(seed=action_rng).squeeze()
+                    other_hstate_acc = jax.tree_map(
+                        lambda full, update: full.at[actor_idx].set(update),
+                        other_hstate_acc,
+                        other_hstate_group,
+                    )
+                    other_action_acc = other_action_acc.at[actor_idx].set(other_action_group)
+                    return other_hstate_acc, other_action_acc, group_rng
+
+                rng, _rng = jax.random.split(rng)
+                group_carry = (other_hstate, other_action_flat, _rng)
+                for group_idx in range(partners_per_update):
+                    group_carry = _partner_group_step(group_idx, group_carry)
+                other_hstate, other_action_flat, _ = group_carry
                 other_env_act = unbatchify(
-                    other_action, env.agents, config["NUM_ENVS"], env.num_agents
+                    other_action_flat, env.agents, config["NUM_ENVS"], env.num_agents
                 )
                 other_env_act = {k: v.squeeze() for k, v in other_env_act.items()}
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
@@ -383,11 +417,15 @@ def make_train(config, update_step=0):
             # init_other_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
             train_state, env_state, last_obs, last_done, hstate, rng = runner_state
-            # sample param from 3 * 6 possible params
-            seed = jax.random.randint(rng, (1,), minval=0, maxval=num_stacked_params)[0]
-            frozen_param = jax.tree_map(lambda x: x[seed], frozen_param_stack)
+            # sample frozen partner params from the 3 * 6 partner population
             rng, _rng = jax.random.split(rng)
-            frozen_is_agent_1 = jax.random.bernoulli(_rng, 0.5)
+            partner_indices = jax.random.randint(
+                _rng, (partners_per_update,), minval=0, maxval=num_stacked_params
+            )
+            frozen_param = jax.tree_map(lambda x: x[partner_indices], frozen_param_stack)
+            rng, _rng = jax.random.split(rng)
+            frozen_is_agent_1_group = jax.random.bernoulli(_rng, 0.5, (partners_per_update,))
+            frozen_is_agent_1 = jnp.repeat(frozen_is_agent_1_group, partner_envs_per_group)
 
             rollout_runner_state = train_state, env_state, last_obs, last_done, hstate, rng, frozen_param, init_other_hstate, frozen_is_agent_1
             rollout_runner_state, traj_batch = jax.lax.scan(
@@ -401,10 +439,7 @@ def make_train(config, update_step=0):
             # corresponds to what was actually executed in the env.
             agent_0_is_trained = frozen_is_agent_1.astype(jnp.float32)
             agent_1_is_trained = 1.0 - agent_0_is_trained
-            actor_mask = jnp.concatenate([
-                jnp.full((config["NUM_ENVS"],), agent_0_is_trained),
-                jnp.full((config["NUM_ENVS"],), agent_1_is_trained),
-            ])
+            actor_mask = jnp.concatenate([agent_0_is_trained, agent_1_is_trained])
             actor_mask = jnp.broadcast_to(
                 actor_mask[None, :], (config["NUM_STEPS"], config["NUM_ACTORS"])
             )

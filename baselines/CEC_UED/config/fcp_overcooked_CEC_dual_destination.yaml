@@ -1,12 +1,12 @@
 "ENV_NAME": "ToyCoop"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
-"NUM_ENVS": 512
+"NUM_ENVS": 256
 "NUM_SEEDS": 1
 "NUM_STEPS": 100 # Dual Destination horizon
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e8 # Dual Destination experiments use 300M steps
-"MAX_TRAIN_STEPS": 3e8 #checked
+"TOTAL_TIMESTEPS": 2e8 # Dual Destination experiments use 300M steps
+"MAX_TRAIN_STEPS": 2e8 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
@@ -55,6 +55,9 @@
   # True: PPO loss only uses the slot actually controlled by FCP.
   # False: original FCP behavior, averaging loss over both FCP-sampled slots.
   "mask_frozen_agent_loss": True
+  # Number of frozen IPPO partners mixed into each PPO update.
+  # NUM_ENVS must be divisible by this value.
+  "partners_per_update": 8
   "partner_seeds": [0, 1, 2, 3, 4, 5]
   "partner_ckpt_ids": ["init", "mid", "final"]
 # WandB Params

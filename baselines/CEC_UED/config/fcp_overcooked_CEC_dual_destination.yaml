@@ -5,8 +5,8 @@
 "NUM_STEPS": 100 # Dual Destination horizon
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 2e8 # Dual Destination experiments use 300M steps
-"MAX_TRAIN_STEPS": 2e8 #checked
+"TOTAL_TIMESTEPS": 3e8 # Dual Destination experiments use 300M steps
+"MAX_TRAIN_STEPS": 3e8 #checked
 "UPDATE_EPOCHS": 4 #checked
 "NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked

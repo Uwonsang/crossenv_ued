@@ -198,7 +198,7 @@ def render_tile(obj, highlight, agent_dir_idx, agent_inv, tile_size=TILE_PIXELS)
             plate_fn = point_in_circle(0.5, 0.5, 0.2)
             img = fill_coords(img, plate_fn, color)
             onion_fn = point_in_circle(0.5, 0.5, 0.13)
-            img = fill_coords(img, onion_fn, color)
+            img = fill_coords(img, onion_fn, COLORS["orange"])
             return img
         def render_pot(img):
             img = rendering_pot(obj, img)

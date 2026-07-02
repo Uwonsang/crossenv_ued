@@ -61,10 +61,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -127,7 +127,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -383,11 +383,11 @@ def main(config):
     else:
         rewards, trajectories, init_env_states = eval_sp(model_params)
         for traj_num in tqdm(range(config['TEST_KWARGS']['num_trajs']), desc="trajectories"): 
-            traj = jax.tree_map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
-            env_states = [jax.tree_map(lambda x: x[traj_num], init_env_states)]
+            traj = jax.tree.map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
+            env_states = [jax.tree.map(lambda x: x[traj_num], init_env_states)]
             traj_rewards = [0]
             for timepoint in tqdm(range(config['NUM_STEPS']), desc="num_steps"):
-                timestep = jax.tree_map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
+                timestep = jax.tree.map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
 
                 env_state = timestep[0]
                 traj_rewards.append(timestep[4]['agent_0'])

@@ -145,7 +145,7 @@ def load_frozen_params(layout: str, ckpt_root: str) -> tuple:
             f"Expected files like: seed<s>/seed<s>_ckpt<c>_update<u>.pkl"
         )
 
-    frozen_param_stack = jax.tree_map(lambda *x: jnp.stack(x), *frozen_params)
+    frozen_param_stack = jax.tree.map(lambda *x: jnp.stack(x), *frozen_params)
     return frozen_param_stack, len(frozen_params)
 
 

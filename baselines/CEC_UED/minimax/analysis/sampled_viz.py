@@ -15,7 +15,7 @@ import os
 def load_pickle(file_path: str):
     with open(file_path, "rb") as f:
         data = pickle.load(f)
-    plr_buffer = jax.device_put(jax.tree_map(jnp.array, data))
+    plr_buffer = jax.device_put(jax.tree.map(jnp.array, data))
     return plr_buffer
 
 def slice_levels(buffer, n=100):

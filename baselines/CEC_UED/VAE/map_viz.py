@@ -57,7 +57,7 @@ def layout_render(env_state_obs, config, save_dir):
         state = filtered_state(env_state_obs)
 
     frame = [
-        viz.custom_get_frame(jax.tree_map(lambda x: x[step], state), agent_view_size)
+        viz.custom_get_frame(jax.tree.map(lambda x: x[step], state), agent_view_size)
         for step in tqdm(range(config["VIZ_STEPS"]))
     ]
 

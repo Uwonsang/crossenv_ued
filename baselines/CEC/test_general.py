@@ -54,10 +54,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -235,7 +235,7 @@ def main(config):
         exit(0)
     seed_list = jnp.array(seed_list)
 
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)      # stack params
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)      # stack params
 
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
@@ -258,8 +258,8 @@ def main(config):
     @jax.jit
     def eval_pair(seed_pair, seed_list, param_stack, config=config, env=env, network=network):
         seed_1, seed_2 = seed_pair[0], seed_pair[1]
-        param_1 = jax.tree_map(lambda x: x[seed_1], param_stack)
-        param_2 = jax.tree_map(lambda x: x[seed_2], param_stack)
+        param_1 = jax.tree.map(lambda x: x[seed_1], param_stack)
+        param_2 = jax.tree.map(lambda x: x[seed_2], param_stack)
 
         (trajectories, init_env_states, init_obsvs) = get_rollouts(param_1, param_2, config, env, network)
         rewards = trajectories[4]['agent_0'].sum(axis=1)  # axis 1 is originally each timestep in a single trajectory, want cumulative reward by end
@@ -298,8 +298,8 @@ def main(config):
             all_freq_counts = []
             all_coordinate_embeddings = []
             for traj_num in tqdm(range(config['TEST_KWARGS']['num_trajs'])): 
-                traj = jax.tree_map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
-                env_states = [jax.tree_map(lambda x: x[traj_num], init_env_states)]
+                traj = jax.tree.map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
+                env_states = [jax.tree.map(lambda x: x[traj_num], init_env_states)]
                 traj_rewards = [0]
                 action_probs_0 = []
                 action_probs_1 = []
@@ -308,7 +308,7 @@ def main(config):
                 coordinate_embeddings = []
                 freq_count = None
                 for timepoint in range(config['NUM_STEPS']):
-                    timestep = jax.tree_map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
+                    timestep = jax.tree.map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
 
                     action_dict = timestep[3]
                     action_0.append(action_dict[env.agents[0]])

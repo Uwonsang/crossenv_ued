@@ -96,7 +96,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -361,7 +361,7 @@ def make_train(config, update_step=0):
                 # remove shaped rewards
                 del info['shaped_reward']
 
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -378,13 +378,13 @@ def make_train(config, update_step=0):
                 return runner_state, transition
 
             initial_hstate = runner_state[-2]
-            init_other_hstate = jax.tree_map(lambda x: jnp.zeros_like(x), initial_hstate)
+            init_other_hstate = jax.tree.map(lambda x: jnp.zeros_like(x), initial_hstate)
             # init_other_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
             train_state, env_state, last_obs, last_done, hstate, rng = runner_state
             # sample param from 3 * 6 possible params
             seed = jax.random.randint(rng, (1,), minval=0, maxval=num_stacked_params)[0]
-            frozen_param = jax.tree_map(lambda x: x[seed], frozen_param_stack)
+            frozen_param = jax.tree.map(lambda x: x[seed], frozen_param_stack)
             rng, _rng = jax.random.split(rng)
             frozen_is_agent_1 = jax.random.bernoulli(_rng, 0.5)
 
@@ -454,7 +454,7 @@ def make_train(config, update_step=0):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
-                            jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -518,7 +518,7 @@ def make_train(config, update_step=0):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_map(lambda x: jnp.reshape(x, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                init_hstate = jax.tree.map(lambda x: jnp.reshape(x, (1, config["NUM_ACTORS"], -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
@@ -550,7 +550,7 @@ def make_train(config, update_step=0):
                 )
                 update_state = (
                     train_state,
-                    jax.tree_map(lambda x: x.squeeze(), init_hstate),
+                    jax.tree.map(lambda x: x.squeeze(), init_hstate),
                     traj_batch,
                     advantages,
                     targets,
@@ -573,14 +573,14 @@ def make_train(config, update_step=0):
             )
             train_state = update_state[0]
             metric = traj_batch.info
-            metric = jax.tree_map(
+            metric = jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], env.num_agents)
                 ),
                 traj_batch.info,
             )
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
@@ -764,7 +764,7 @@ def main(config):
                     frozen_ckpt= pickle.load(f)
                     frozen_param_stack.append(frozen_ckpt['params'])
     num_stacked_params = len(frozen_param_stack)
-    frozen_param_stack = jax.tree_map(lambda *x: jnp.stack(x), *frozen_param_stack)
+    frozen_param_stack = jax.tree.map(lambda *x: jnp.stack(x), *frozen_param_stack)
     
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, frozen_param_stack, model_params, final_update_step, num_stacked_params)

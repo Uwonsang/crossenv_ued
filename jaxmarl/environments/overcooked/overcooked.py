@@ -257,10 +257,10 @@ class Overcooked(MultiAgentEnv):
             layout_fns = [make_asymm_advantages_9x9, make_coord_ring_9x9, make_counter_circuit_9x9, make_forced_coord_9x9, make_cramped_room_9x9]
             key, *subkeys = jax.random.split(key, len(layout_fns) + 1)
             all_resets = [reset_one(sk, fn) for sk, fn in zip(subkeys, layout_fns)]
-            stacked = jax.tree_map(lambda *x: jnp.stack(x), *all_resets)
+            stacked = jax.tree.map(lambda *x: jnp.stack(x), *all_resets)
             key, subkey = jax.random.split(key)
             index = jax.random.choice(subkey, len(layout_fns), p=weights)
-            return jax.tree_map(lambda x: x[index], stacked)
+            return jax.tree.map(lambda x: x[index], stacked)
 
         _MAX_WALL_IDX_LEN = 81
 

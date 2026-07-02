@@ -306,6 +306,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
     # If opt_state is restored from a mid-run checkpoint, the optimizer's own step
     # count already reflects progress, so the manual offset would double-count it.
     resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -335,7 +336,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0, init_popart_mu=None, init_popart_sigma=None):
+    def train(rng, model_params=None, init_popart_mu=None, init_popart_sigma=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -380,11 +381,11 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # PopArt running statistics: network predicts normalized values
-        popart_mu = init_popart_mu if init_popart_mu is not None else jnp.zeros(())
-        popart_sigma = init_popart_sigma if init_popart_sigma is not None else jnp.ones(())
+        popart_mu = init_popart_mu
+        popart_sigma = init_popart_sigma
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps, popart_mu, popart_sigma = update_runner_state
@@ -1087,7 +1088,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(remaining_updates), remaining_updates
         )
         return {"runner_state": runner_state}
 
@@ -1225,9 +1226,14 @@ def main(config):
         "num_updates": num_updates,
     }
 
+    if init_popart_mu is None:
+        init_popart_mu = jnp.zeros(())
+    if init_popart_sigma is None:
+        init_popart_sigma = jnp.ones(())
+
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step, init_popart_mu, init_popart_sigma)
+    out = train_jit(rng, model_params, init_popart_mu, init_popart_sigma)
 
     jax.effects_barrier()
     jax.clear_caches()

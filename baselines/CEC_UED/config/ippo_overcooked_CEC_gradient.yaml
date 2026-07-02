@@ -75,3 +75,4 @@
 # for gradient conflict
 "GRAD_CONFLICT_STEPS": 32
 "POPART_ALPHA": 0.01
+"RESUME_XPID": ""  # set to xpid string (e.g. "lr-20240608-143022") to resume that run

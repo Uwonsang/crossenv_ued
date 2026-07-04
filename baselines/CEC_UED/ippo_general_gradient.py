@@ -353,7 +353,9 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
+
+    def train(rng, model_params=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -398,7 +400,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
@@ -1076,7 +1078,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step), jnp.arange(remaining_updates), remaining_updates
         )
         return {"runner_state": runner_state}
 
@@ -1212,7 +1214,7 @@ def main(config):
 
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
+    out = train_jit(rng, model_params)
 
     jax.effects_barrier()
     jax.clear_caches()

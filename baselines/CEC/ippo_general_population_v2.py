@@ -676,14 +676,21 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
     
-    layout_name = config["ENV_KWARGS"]["layout"]
+    if config["ENV_NAME"] == "ToyCoop":
+        run_name = (
+            f"IPPO_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
+            f"_seed{config['SEED']}"
+        )
+    else:
+        layout_name = config["ENV_KWARGS"]["layout"]
+        run_name = f"IPPO_{layout_name}_seed{config['SEED']}"
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"IPPO_{layout_name}_seed{config['SEED']}"
+        name=run_name
     )
     filepath = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

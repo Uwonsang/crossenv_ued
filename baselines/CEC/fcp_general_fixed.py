@@ -670,13 +670,20 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
+    if config["ENV_NAME"] == "ToyCoop":
+        run_name = (
+            f"FCP_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
+            f"_seed{config['SEED']}"
+        )
+    else:
+        run_name = f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
         tags=["IPPO", "RNN", "FCP"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
+        name=run_name
     )
     filepath = f"ckpts/fcp/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":

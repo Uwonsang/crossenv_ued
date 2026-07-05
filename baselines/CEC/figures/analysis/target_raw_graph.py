@@ -58,7 +58,7 @@ def fetch_history(entity: str, project: str, run_id: str):
     # used to compute env_step at logging time (see ippo_general_gradient*.py callbacks)
     steps_per_update = run.config["NUM_ENVS"] * run.config["NUM_STEPS"]
     history["update_step"] = history["env_step"] / steps_per_update
-    return run.name, history
+    return run.name, run.config.get("model_name", "unknown"), history
 
 
 # ──────────────────────────────────────────────
@@ -90,8 +90,8 @@ def plot_target_raw(history, run_name: str, x_axis: str, smooth_window: int, out
 def main():
     args = parse_args()
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    run_name, history = fetch_history(args.entity, args.project, args.run_id)
-    out_path = SAVE_DIR / f"target_raw_{args.run_id}_{args.x_axis}.png"
+    run_name, model_name, history = fetch_history(args.entity, args.project, args.run_id)
+    out_path = SAVE_DIR / f"target_raw_{model_name}_{args.run_id}_{args.x_axis}.png"
     plot_target_raw(history, run_name, args.x_axis, args.smooth_window, out_path)
 
 

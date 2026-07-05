@@ -21,15 +21,17 @@ Some scripts add an extra flag for selecting which logged variant to plot:
 | `share_gradient_graph.py` | `--loss-type` | `actor`, `value` |
 | `grad_norm_graph.py` | `--loss-type` | `actor`, `value` |
 
-Output filenames encode the flags used, e.g. `grad_norm_value_5rwobcx9_env_step.png`.
+Output filenames encode the flags used plus the run's `model_name` (from wandb config),
+e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
 
 ## Scripts
 
-- **`td_error_graph.py`** — TD error (`td_error/{metric}`), per layout + overall.
+- **`td_error_graph.py`** — TD error (`td_error/{metric}`), per layout.
 - **`share_gradient_graph.py`** — weighted gradient share (`grad_share_weighted_{loss_type}/...`), stacked area per layout.
 - **`grad_norm_graph.py`** — gradient norm (`grad_conflict_{loss_type}/norm/...`), per layout.
-- **`target_raw_graph.py`** — raw value target (`target_raw/...`), per layout + overall.
-- **`train_returns_graph.py`** — training return (`train_returns/...`), per layout + overall.
+- **`target_raw_graph.py`** — raw value target (`target_raw/...`), per layout.
+- **`train_returns_graph.py`** — training return (`train_returns/...`), per layout.
+- **`eval_graph.py`** — eval return (`eval/...`), per layout.
 
 ## Examples
 
@@ -39,6 +41,7 @@ python3 share_gradient_graph.py --run-id 5rwobcx9 --loss-type actor
 python3 grad_norm_graph.py --run-id 5rwobcx9 --loss-type value --x-axis update_step
 python3 target_raw_graph.py --run-id 5rwobcx9
 python3 train_returns_graph.py --run-id 5rwobcx9 --smooth-window 20
+python3 eval_graph.py --run-id 5rwobcx9
 ```
 
 Run `python3 <script>.py --help` for the full flag list.

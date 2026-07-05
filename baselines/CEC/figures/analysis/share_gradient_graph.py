@@ -60,7 +60,7 @@ def fetch_history(entity: str, project: str, run_id: str, loss_type: str):
     # used to compute env_step at logging time (see ippo_general_gradient*.py callbacks)
     steps_per_update = run.config["NUM_ENVS"] * run.config["NUM_STEPS"]
     history["update_step"] = history["env_step"] / steps_per_update
-    return run.name, history
+    return run.name, run.config.get("model_name", "unknown"), history
 
 
 # ──────────────────────────────────────────────
@@ -95,8 +95,8 @@ def plot_share(history, run_name: str, loss_type: str, x_axis: str, smooth_windo
 def main():
     args = parse_args()
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
-    run_name, history = fetch_history(args.entity, args.project, args.run_id, args.loss_type)
-    out_path = SAVE_DIR / f"grad_share_weighted_{args.loss_type}_{args.run_id}_{args.x_axis}.png"
+    run_name, model_name, history = fetch_history(args.entity, args.project, args.run_id, args.loss_type)
+    out_path = SAVE_DIR / f"grad_share_weighted_{args.loss_type}_{model_name}_{args.run_id}_{args.x_axis}.png"
     plot_share(history, run_name, args.loss_type, args.x_axis, args.smooth_window, out_path)
 
 

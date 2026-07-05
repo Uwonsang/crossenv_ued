@@ -51,9 +51,11 @@
 "LSTM": True
 "FCP": False
 "FCP_KWARGS":
-  "train_oracle": True
+  "train_oracle": False
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_toycoop"
 "WANDB_MODE" : "disabled" # disabled, online, offline
-"model_name": "IPPO"
+"model_name": "FCP"
+# FCP_Paths
+"FCP_filepath": "/app/nas/models/aaai/IPPO/"

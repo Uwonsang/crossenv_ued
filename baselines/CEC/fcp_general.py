@@ -726,7 +726,10 @@ def main(config):
             ckpt_id_list = [1, 2, 3]
         seed_list = range(6)
         CKPT_ROOT = Path(__file__).resolve().parents[2] / config['FCP_filepath']
-        custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'])
+        if config["ENV_NAME"] == "ToyCoop":
+            custom_path = str(CKPT_ROOT)
+        else:
+            custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'])
         for ckpt_id in ckpt_id_list:
             for ckpt_seed in seed_list:
                 print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl")

@@ -51,7 +51,7 @@
 "LSTM": True
 "FCP": False
 "FCP_KWARGS":
-  "train_oracle": True
+  "train_oracle": false
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_toycoop"

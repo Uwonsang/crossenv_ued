@@ -281,8 +281,8 @@ class Overcooked_VAE(MultiAgentEnv):
         tie = jax.random.uniform(_rng, (z.shape[0],))
         idx = jnp.argmax(jnp.where(bucket_mask, tie, -jnp.inf))
 
-        obs = jax.tree_map(lambda x: x[idx], obsv)
-        state = jax.tree_map(lambda x: x[idx], statev)
+        obs = jax.tree.map(lambda x: x[idx], obsv)
+        state = jax.tree.map(lambda x: x[idx], statev)
         state = state.replace(selected_z_idx=idx.astype(jnp.int32))
 
         return obs, state

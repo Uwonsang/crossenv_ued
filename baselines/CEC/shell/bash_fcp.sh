@@ -17,7 +17,9 @@ for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES=2 python baselines/CEC/fcp_general.py \
       ENV_KWARGS.layout=asymm_advantages_9 \
       SEED=$seed \
-      WANDB_MODE=online
+      WANDB_MODE=online \
+      PROJECT=crossenv_baseline_v2 \
+      NUM_ENVS=64
 done
 
 SEEDS=(0 1 2 3 4 5)
@@ -25,7 +27,9 @@ for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES=2 python baselines/CEC/fcp_general.py \
       ENV_KWARGS.layout=coord_ring_9 \
       SEED=$seed \
-      WANDB_MODE=online
+      WANDB_MODE=online \
+      PROJECT=crossenv_baseline_v2 \
+      NUM_ENVS=64
 done
 
 SEEDS=(0 1 2 3 4 5)
@@ -33,5 +37,7 @@ for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES=2 python baselines/CEC/fcp_general.py \
       ENV_KWARGS.layout=forced_coord_9 \
       SEED=$seed \
-      WANDB_MODE=online
+      WANDB_MODE=online \
+      PROJECT=crossenv_baseline_v2 \
+      NUM_ENVS=64
 done

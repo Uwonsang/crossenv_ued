@@ -66,8 +66,8 @@ class PLRManager:
 
         self.n_devices = n_devices
 
-        example_level = jax.tree_map(lambda x: jnp.array(x), example_level)
-        self.levels = jax.tree_map(
+        example_level = jax.tree.map(lambda x: jnp.array(x), example_level)
+        self.levels = jax.tree.map(
             lambda x: (
                 jnp.tile(jnp.zeros_like(x), (buffer_size,) + (1,)*(len(x.shape)-1))).reshape(buffer_size, *x.shape),
             example_level)
@@ -146,7 +146,7 @@ class PLRManager:
                 plr_buffer.scores, ages, plr_buffer.filled)
             replay_idx = jax.random.choice(subrng, np.arange(
                 self.buffer_size), shape=(), p=replay_dist)
-            replay_level = jax.tree_map(lambda x: x.take(
+            replay_level = jax.tree.map(lambda x: x.take(
                 replay_idx, axis=0), plr_buffer.levels)
 
             ages = ((ages + 1)*(plr_buffer.filled)).at[replay_idx].set(0)
@@ -171,7 +171,7 @@ class PLRManager:
         p = p / jnp.maximum(p.sum(), 1.0)
         rand_idxs = jax.random.choice(
             rng, self.buffer_size, shape=(n,), replace=True, p=p)
-        levels = jax.tree_map(lambda x: x[rand_idxs], plr_buffer.levels)
+        levels = jax.tree.map(lambda x: x[rand_idxs], plr_buffer.levels)
 
         return levels, rand_idxs, plr_buffer
 
@@ -315,12 +315,12 @@ class PLRManager:
                 plr_buffer.max_returns
             )
 
-            updated_level = jax.tree_map(
+            updated_level = jax.tree.map(
                 lambda x, y: jax.lax.select(should_insert, x, y),
                 level,
-                jax.tree_map(lambda x: x.at[insert_idx].get(), levels)
+                jax.tree.map(lambda x: x.at[insert_idx].get(), levels)
             )
-            next_levels = jax.tree_map(
+            next_levels = jax.tree.map(
                 lambda x, y: x.at[insert_idx].set(y), levels, updated_level)
 
             next_scores = jnp.where(

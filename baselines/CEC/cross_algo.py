@@ -45,10 +45,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -167,7 +167,7 @@ def load_ik_models(config):
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 def load_ik_finetune_models(config):
@@ -183,7 +183,7 @@ def load_ik_finetune_models(config):
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 def load_sk_models(config): #ippo
@@ -199,7 +199,7 @@ def load_sk_models(config): #ippo
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 def load_e3t_models(config):
@@ -215,7 +215,7 @@ def load_e3t_models(config):
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 def load_fcp_models(config):
@@ -231,7 +231,7 @@ def load_fcp_models(config):
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 def load_ik_models_pop_art(config):
@@ -252,7 +252,7 @@ def load_ik_models_pop_art(config):
                 seed_list.append(seed)
         except:
             continue
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
     return param_stack, jnp.array(seed_list)
 
 
@@ -321,8 +321,8 @@ def main(config):
             ##################
             def eval_pair(seed_pair, seed_list_1, seed_list_2, param_stack_1, param_stack_2, network_1=algo_1_network, network_2=algo_2_network, config=config, env=env):
                 seed_1, seed_2 = seed_pair[0], seed_pair[1]
-                param_1 = jax.tree_map(lambda x: x[seed_1], param_stack_1)
-                param_2 = jax.tree_map(lambda x: x[seed_2], param_stack_2)
+                param_1 = jax.tree.map(lambda x: x[seed_1], param_stack_1)
+                param_2 = jax.tree.map(lambda x: x[seed_2], param_stack_2)
 
                 (trajectories, init_env_states, init_obsvs) = get_rollouts(param_1, param_2, config, env, network_1, network_2)
                 rewards = trajectories[4]['agent_0'].sum(axis=1)  # axis 1 is originally each timestep in a single trajectory, want cumulative reward by end

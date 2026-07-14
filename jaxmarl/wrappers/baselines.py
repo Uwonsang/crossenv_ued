@@ -90,12 +90,12 @@ class LogWrapper(JaxMARLWrapper):
         ep_done = done["__all__"]
         
         obs_re, reset_state = self.reset(key_reset)
-        env_state = jax.tree_map(
+        env_state = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             reset_state.env_state,
             env_state_st,
         )
-        obs = jax.tree_map(
+        obs = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             obs_re,
             obs_st,
@@ -204,11 +204,11 @@ class CurriculumLogWrapper(JaxMARLWrapper):
         reset_params = {**self.env_params, 'layout_weights': weights}
         obs_re, reset_env_state = self._env.reset(key_reset, params=reset_params)
 
-        env_state = jax.tree_map(
+        env_state = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             reset_env_state, env_state_st,
         )
-        obs = jax.tree_map(
+        obs = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             obs_re, obs_st,
         )
@@ -301,12 +301,12 @@ class PLRLogWrapper(JaxMARLWrapper):
         ep_done = done["__all__"]
 
         obs_re, reset_state = self.reset_from_layout(key_reset)
-        env_state = jax.tree_map(
+        env_state = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             reset_state.env_state,
             env_state_st,
         )
-        obs = jax.tree_map(
+        obs = jax.tree.map(
             lambda x, y: jax.lax.select(ep_done, x, y),
             obs_re,
             obs_st,
@@ -342,7 +342,7 @@ class MPELogWrapper(LogWrapper):
         obs, env_state, reward, done, info = self._env.step(
             key, state.env_state, action
         )
-        rewardlog = jax.tree_map(lambda x: x*self._env.num_agents, reward)  # As per on-policy codebase
+        rewardlog = jax.tree.map(lambda x: x*self._env.num_agents, reward)  # As per on-policy codebase
         ep_done = done["__all__"]
         new_episode_return = state.episode_returns + self._batchify_floats(rewardlog)
         new_episode_length = state.episode_lengths + 1

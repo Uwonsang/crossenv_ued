@@ -262,7 +262,7 @@ def make_train(config, team_model_list=None):
                 reward['agent_1'] += (annealed_shaped_reward_bob * 0)  # actually don't use shaped reward
                 count += 1.0  # NEED THIS FOR ANNEALING REWARD
                 del info['shaped_rewards']
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 transition = Transition(
                     batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                     action,
@@ -691,8 +691,8 @@ def main(config):
             
             # save models across seeds and teams
             for i in range(num_seeds):
-                train_state = jax.tree_map(lambda x: x[i], out["runner_state"][0])  # agent 0, team i
-                train_key = jax.tree_map(lambda x: x[i], out["runner_state"][4])
+                train_state = jax.tree.map(lambda x: x[i], out["runner_state"][0])  # agent 0, team i
+                train_key = jax.tree.map(lambda x: x[i], out["runner_state"][4])
                 with open(f'{checkpoint_dir}/{filename}_team{i}_params_{i}.pkl', 'wb') as f:
                     model_params = {'params': train_state.params, 'train_key': train_key}
                     pickle.dump(model_params, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -701,7 +701,7 @@ def main(config):
                     model_params = {'params': train_state.params, 'train_key': train_key}
                     pickle.dump(model_params, f, protocol=pickle.HIGHEST_PROTOCOL)
 
-                train_state_other = jax.tree_map(lambda x: x[i], out["runner_state"][1])  # agent 1, team i, should be garbage if sharing weights
+                train_state_other = jax.tree.map(lambda x: x[i], out["runner_state"][1])  # agent 1, team i, should be garbage if sharing weights
                 with open(f'{checkpoint_dir}/{filename}_other_team{i}_params_{i}.pkl', 'wb') as f:
                     model_params = {'params': train_state_other.params, 'train_key': train_key}
                     pickle.dump(model_params, f, protocol=pickle.HIGHEST_PROTOCOL)

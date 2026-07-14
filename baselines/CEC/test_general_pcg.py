@@ -67,12 +67,12 @@ def initialize_environment(config):
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             layout_dicts = [asymm_layout_dict, coord_ring_layout_dict, counter_circuit_layout_dict, forced_coord_layout_dict, cramped_room_layout_dict]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
-            stacked_layout_dicts = jax.tree_map(lambda *x: jnp.stack(x), *layout_dicts)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_dicts = jax.tree.map(lambda *x: jnp.stack(x), *layout_dicts)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
-            sampled_layout_dict = jax.tree_map(lambda x: x[index], stacked_layout_dicts)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
+            sampled_layout_dict = jax.tree.map(lambda x: x[index], stacked_layout_dicts)
             return sampled_reset, sampled_layout_dict
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -98,7 +98,7 @@ def initialize_environment(config):
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
         # Build held-out layout dict as: {held_out_idx: single_layout_dict}
         eval_held_out_layouts = [
-            jax.tree_map(lambda x, i=i: x[i], res[3]) for i in range(res[3]["agent_idx"].shape[0])
+            jax.tree.map(lambda x, i=i: x[i], res[3]) for i in range(res[3]["agent_idx"].shape[0])
         ]
         config["eval_held_out_layouts"] = eval_held_out_layouts
     if config["ENV_NAME"] == "ToyCoop":
@@ -140,7 +140,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -384,7 +384,7 @@ def main(config):
         exit(0)
     seed_list = jnp.array(seed_list)
 
-    param_stack = jax.tree_map(lambda *x: jnp.stack(x), *param_list)      # stack params
+    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)      # stack params
 
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
@@ -407,8 +407,8 @@ def main(config):
     @jax.jit
     def eval_pair(seed_pair, seed_list, param_stack, reset_layout, config=config, env=env, network=network):
         seed_1, seed_2 = seed_pair[0], seed_pair[1]
-        param_1 = jax.tree_map(lambda x: x[seed_1], param_stack)
-        param_2 = jax.tree_map(lambda x: x[seed_2], param_stack)
+        param_1 = jax.tree.map(lambda x: x[seed_1], param_stack)
+        param_2 = jax.tree.map(lambda x: x[seed_2], param_stack)
 
         (trajectories, init_env_states, init_obsvs) = get_rollouts(
             param_1, param_2, config, env, network, reset_layout=reset_layout
@@ -453,8 +453,8 @@ def main(config):
             all_freq_counts = []
             all_coordinate_embeddings = []
             for traj_num in tqdm(range(config['TEST_KWARGS']['num_trajs'])): 
-                traj = jax.tree_map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
-                env_states = [jax.tree_map(lambda x: x[traj_num], init_env_states)]
+                traj = jax.tree.map(lambda x: x[traj_num], trajectories)  # get current trajectory from (num_trajs, num_timesteps, ...) output
+                env_states = [jax.tree.map(lambda x: x[traj_num], init_env_states)]
                 traj_rewards = [0]
                 action_probs_0 = []
                 action_probs_1 = []
@@ -463,7 +463,7 @@ def main(config):
                 coordinate_embeddings = []
                 freq_count = None
                 for timepoint in range(config['NUM_STEPS']):
-                    timestep = jax.tree_map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
+                    timestep = jax.tree.map(lambda x: x[timepoint], traj)  # get the current timestep from trajectories
 
                     action_dict = timestep[3]
                     action_0.append(action_dict[env.agents[0]])

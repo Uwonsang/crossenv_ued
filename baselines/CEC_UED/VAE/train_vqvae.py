@@ -92,7 +92,7 @@ def make_train(config, train_data, test_data):
                         restored_gt = restore_from_obs_batch(restored_gt_26)
                         test_states = FilteredState(**restored_gt)
                         test_frame = [
-                            viz.custom_get_frame(jax.tree_map(lambda x: x[step], test_states), agent_view_size)
+                            viz.custom_get_frame(jax.tree.map(lambda x: x[step], test_states), agent_view_size)
                             for step in range(config["n_render_samples"])]
                         
                         # VAE_render
@@ -104,7 +104,7 @@ def make_train(config, train_data, test_data):
                         test_states_pred = FilteredState(**restored_pred)
                         
                         vae_frame = [
-                            viz.custom_get_frame(jax.tree_map(lambda x: x[step], test_states_pred), agent_view_size)
+                            viz.custom_get_frame(jax.tree.map(lambda x: x[step], test_states_pred), agent_view_size)
                             for step in range(config["n_render_samples"])]
 
                         combined = concat_images_with_labels([test_frame, vae_frame])

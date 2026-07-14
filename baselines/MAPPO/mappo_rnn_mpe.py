@@ -282,7 +282,7 @@ def make_train(config):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -433,7 +433,7 @@ def make_train(config):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstates = jax.tree_map(lambda x: jnp.reshape(
+                init_hstates = jax.tree.map(lambda x: jnp.reshape(
                     x, (1, config["NUM_ACTORS"], -1)
                 ), init_hstates)
                 
@@ -468,7 +468,7 @@ def make_train(config):
                 )
                 update_state = (
                     train_states,
-                    jax.tree_map(lambda x: x.squeeze(), init_hstates),
+                    jax.tree.map(lambda x: x.squeeze(), init_hstates),
                     traj_batch,
                     advantages,
                     targets,
@@ -488,7 +488,7 @@ def make_train(config):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             loss_info["ratio_0"] = loss_info["ratio"].at[0,0].get()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             
             train_states = update_state[0]
             metric = traj_batch.info

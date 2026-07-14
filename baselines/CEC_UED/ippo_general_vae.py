@@ -57,10 +57,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -120,7 +120,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -420,7 +420,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
+                reward = jax.tree.map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
                 
                 # remove shaped rewards
                 del info['shaped_reward']
@@ -455,7 +455,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                     _reset_if_done, in_axes=(0, 0, 0, 0, 0, 0, None), out_axes=(0, 0, 0, 0)
                 )(done_all, rng_reset, obsv, env_state, z_new, z_old, adversary_state)
 
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -536,7 +536,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
-                            jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -596,7 +596,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                init_hstate = jax.tree.map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
@@ -627,7 +627,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 )
                 update_state = (
                     train_state,
-                    jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                    jax.tree.map(lambda h: h.squeeze(), init_hstate),
                     traj_batch,
                     advantages,
                     targets,
@@ -648,7 +648,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             )
             train_state = update_state[0]
             metric = traj_batch.info
-            metric = jax.tree_map(
+            metric = jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], env.num_agents)
                 ),
@@ -660,10 +660,10 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 metric["returned_episode"][:, :, 0].astype(jnp.int32)
             ].mean()
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
-            metric = jax.tree_map(lambda x: x.mean(), metric)
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
@@ -704,7 +704,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 )(rng_step, env_state_eval, env_act_eval)
                 shaped_reward_eval = info_eval['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward_eval = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward_eval, shaped_reward_eval)
+                reward_eval = jax.tree.map(lambda x, y: x + y * reward_shaping_frac, reward_eval, shaped_reward_eval)
 
                 done_batch_next = batchify(done_next, env.agents, config["NUM_ACTORS"]).squeeze()
 
@@ -784,7 +784,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                     z_gen.save(metric["adversary_params"], step)
 
                 def save_frames(filtered_state, step, file_path):
-                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
+                    frames = [viz.custom_get_frame(jax.tree.map(lambda x: x[step], filtered_state), agent_view_size)
                         for step in range(config["NUM_STEPS"])]
                     
                     os.makedirs(file_path, exist_ok=True)

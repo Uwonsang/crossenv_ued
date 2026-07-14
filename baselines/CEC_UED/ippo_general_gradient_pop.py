@@ -56,10 +56,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -146,7 +146,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -306,6 +306,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
     # If opt_state is restored from a mid-run checkpoint, the optimizer's own step
     # count already reflects progress, so the manual offset would double-count it.
     resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -335,7 +336,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0, init_popart_mu=None, init_popart_sigma=None):
+    def train(rng, model_params=None, init_popart_mu=None, init_popart_sigma=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
@@ -380,11 +381,11 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
 
         # PopArt running statistics: network predicts normalized values
-        popart_mu = init_popart_mu if init_popart_mu is not None else jnp.zeros(())
-        popart_sigma = init_popart_sigma if init_popart_sigma is not None else jnp.ones(())
+        popart_mu = init_popart_mu
+        popart_sigma = init_popart_sigma
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps, popart_mu, popart_sigma = update_runner_state
@@ -423,12 +424,12 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
+                reward = jax.tree.map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
                 
                 # remove shaped rewards
                 del info['shaped_reward']
 
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -597,7 +598,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
             _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
-            _gc_traj = jax.tree_map(lambda x: x[:_GC_STEPS], traj_batch)
+            _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
             _gc_adv  = advantages[:_GC_STEPS]
             # targets are real-scale; normalize for value loss in _fwd (network outputs normalized)
             _gc_tgt  = (targets[:_GC_STEPS] - popart_mu) / popart_sigma
@@ -713,14 +714,14 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         ] = neg_dot
                 # joint update alignment: cos(g_i, g_all) where g_all = sum of all 5 layout gradients
                 # measures how much each layout's update aligns with the combined training direction
-                _g_all = jax.tree_map(lambda *gs: sum(gs), *_s['prev'])
+                _g_all = jax.tree.map(lambda *gs: sum(gs), *_s['prev'])
                 _norm_all_sq = _tnorm2(_g_all)
                 for _i in range(5):
                     _dot_i_all = _tdot(_s['prev'][_i], _g_all)
                     _align = _dot_i_all / (jnp.sqrt(_s['norms_sq'][_i] * _norm_all_sq) + 1e-8)
                     grad_conflict[f"grad_conflict_{_loss_type}/alignment/{_LAYOUT_NAMES[_i]}"] = _align
                     # leave-one-out: cos(g_i, g_all - g_i) — removes self-contribution
-                    _g_others = jax.tree_map(lambda ga, gi: ga - gi, _g_all, _s['prev'][_i])
+                    _g_others = jax.tree.map(lambda ga, gi: ga - gi, _g_all, _s['prev'][_i])
                     _norm_others_sq = _tnorm2(_g_others)
                     _dot_i_others = _tdot(_s['prev'][_i], _g_others)
                     _align_loo = _dot_i_others / (
@@ -738,7 +739,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
-                            jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -799,7 +800,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                init_hstate = jax.tree.map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
@@ -830,7 +831,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                 )
                 update_state = (
                     train_state,
-                    jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                    jax.tree.map(lambda h: h.squeeze(), init_hstate),
                     traj_batch,
                     advantages,
                     targets,
@@ -876,7 +877,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             # ── end PopArt ────────────────────────────────────────────────
 
             metric = traj_batch.info
-            metric = jax.tree_map(
+            metric = jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], env.num_agents)
                 ),
@@ -891,10 +892,10 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
             episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
-            metric = jax.tree_map(lambda x: x.mean(), metric)
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
@@ -1087,7 +1088,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(remaining_updates), remaining_updates
         )
         return {"runner_state": runner_state}
 
@@ -1097,6 +1098,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
+    config['model_name'] = "CEC_POP"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1225,9 +1227,14 @@ def main(config):
         "num_updates": num_updates,
     }
 
+    if init_popart_mu is None:
+        init_popart_mu = jnp.zeros(())
+    if init_popart_sigma is None:
+        init_popart_sigma = jnp.ones(())
+
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step, init_popart_mu, init_popart_sigma)
+    out = train_jit(rng, model_params, init_popart_mu, init_popart_sigma)
 
     jax.effects_barrier()
     jax.clear_caches()

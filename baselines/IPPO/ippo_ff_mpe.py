@@ -140,7 +140,7 @@ def make_train(config):
                     rng_step, env_state, env_act,
                 )
 
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 transition = Transition(
                     batchify(done, env.agents, config["NUM_ACTORS"]).squeeze(),
                     action,
@@ -288,8 +288,8 @@ def make_train(config):
 
             r0 = {"ratio0": loss_info["ratio"][0,0].mean()}
             jax.debug.print('ratio0 {x}', x=r0["ratio0"])
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
-            metric = jax.tree_map(lambda x: x.mean(), metric)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             metric = {**metric, **loss_info, **r0}
             jax.experimental.io_callback(callback, None, metric)
             runner_state = (train_state, env_state, last_obs, rng)

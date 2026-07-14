@@ -44,7 +44,7 @@ def check_decoder(config):
         restored = restore_from_obs_batch(recons_26)
         states = FilteredState(**restored)
         
-        frame = viz.custom_get_frame(jax.tree_map(lambda x: x[i], states), agent_view_size)
+        frame = viz.custom_get_frame(jax.tree.map(lambda x: x[i], states), agent_view_size)
         frames.append(frame)
 
     save_dir = f"/app/baselines/CEC_UED/VAE/img_check_decoder"

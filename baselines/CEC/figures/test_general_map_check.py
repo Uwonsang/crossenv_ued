@@ -54,12 +54,12 @@ def initialize_environment(config):
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             layout_dicts = [asymm_layout_dict, coord_ring_layout_dict, counter_circuit_layout_dict, forced_coord_layout_dict, cramped_room_layout_dict]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
-            stacked_layout_dicts = jax.tree_map(lambda *x: jnp.stack(x), *layout_dicts)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_dicts = jax.tree.map(lambda *x: jnp.stack(x), *layout_dicts)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
-            sampled_layout_dict = jax.tree_map(lambda x: x[index], stacked_layout_dicts)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
+            sampled_layout_dict = jax.tree.map(lambda x: x[index], stacked_layout_dicts)
             return sampled_reset, sampled_layout_dict
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -85,7 +85,7 @@ def initialize_environment(config):
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
         # Build held-out layout dict as: {held_out_idx: single_layout_dict}
         eval_held_out_layouts = [
-            jax.tree_map(lambda x, i=i: x[i], res[3]) for i in range(res[3]["agent_idx"].shape[0])
+            jax.tree.map(lambda x, i=i: x[i], res[3]) for i in range(res[3]["agent_idx"].shape[0])
         ]
         config["eval_held_out_layouts"] = eval_held_out_layouts
     if config["ENV_NAME"] == "ToyCoop":

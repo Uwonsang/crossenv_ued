@@ -40,9 +40,9 @@ def initialize_environment(config):
             forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):

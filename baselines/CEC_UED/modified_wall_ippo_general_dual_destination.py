@@ -20,6 +20,7 @@ from omegaconf import OmegaConf
 
 import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.environments.toy_coop.modified_wall_toy_coop import ModifiedWallToyCoop
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
@@ -35,12 +36,27 @@ import chex
 import imageio
 from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
 
+def get_wall_map_name(config):
+    return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
+
+def make_modified_wall_env(config):
+    env_kwargs = dict(config["ENV_KWARGS"])
+    env_kwargs["map_name"] = get_wall_map_name(config)
+    config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
+    return ModifiedWallToyCoop(**env_kwargs)
+
+def toy_ckpt_root(config):
+    return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_name(config)}"
+
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config['layout_name'] = layout_name
     if config["ENV_NAME"] == "overcooked":
         config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
-    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    if config["ENV_NAME"] == "ToyCoop":
+        env = make_modified_wall_env(config)
+    else:
+        env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
     if config["ENV_NAME"] == "overcooked":
         def reset_env(key):
@@ -58,10 +74,10 @@ def initialize_environment(config):
             cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
             layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
             # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
+            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
             # sample an index from 0 to 4
             index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
+            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
             return sampled_reset
         @scan_tqdm(100)
         def gen_held_out(runner_state, unused):
@@ -121,7 +137,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -422,7 +438,7 @@ def make_train(config, update_step=0):
                 )(rng_step, env_state, env_act)
                 shaped_reward = info['shaped_reward']
                 reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
+                reward = jax.tree.map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
                 
                 # remove shaped rewards
                 del info['shaped_reward']
@@ -440,7 +456,7 @@ def make_train(config, update_step=0):
                         env_state.env_state.other_goal_pos,
                     )
 
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -512,7 +528,7 @@ def make_train(config, update_step=0):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
-                            jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -572,7 +588,7 @@ def make_train(config, update_step=0):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                init_hstate = jax.tree.map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
@@ -603,7 +619,7 @@ def make_train(config, update_step=0):
                 )
                 update_state = (
                     train_state,
-                    jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                    jax.tree.map(lambda h: h.squeeze(), init_hstate),
                     traj_batch,
                     advantages,
                     targets,
@@ -624,7 +640,7 @@ def make_train(config, update_step=0):
             )
             train_state = update_state[0]
             metric = traj_batch.info
-            metric = jax.tree_map(
+            metric = jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], env.num_agents)
                 ),
@@ -641,10 +657,10 @@ def make_train(config, update_step=0):
             )
             normalized_returns = returns / (2.0 * config["ENV_KWARGS"]["max_steps"])
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
-            metric = jax.tree_map(lambda x: x.mean(), metric)
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
@@ -774,7 +790,7 @@ def make_train(config, update_step=0):
                 
                 step = int(metric["update_steps"])
                 def save_frames(filtered_state, step, file_path):
-                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
+                    frames = [viz.custom_get_frame(jax.tree.map(lambda x: x[step], filtered_state), agent_view_size)
                         for step in range(config["NUM_STEPS"])]
                     
                     os.makedirs(file_path, exist_ok=True)
@@ -875,7 +891,7 @@ def main(config):
         wandb.login(key=private_info["wandb_key"])
     
     layout_name = config["ENV_KWARGS"]["layout"]
-    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoop" else layout_name
+    run_env_name = f"modified_wall_{get_wall_map_name(config)}" if config["ENV_NAME"] == "ToyCoop" else layout_name
     run_name_prefix = config.get("model_name", "CEC")
     wandb.init(
         entity=config["ENTITY"],
@@ -885,7 +901,7 @@ def main(config):
         mode=config["WANDB_MODE"],
         name=f"{run_name_prefix}_{run_env_name}_seed{config['SEED']}"
     )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     ckpt_group = "cec" if config["ENV_KWARGS"]["random_reset"] else "ippo"
@@ -909,7 +925,7 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
+        finetune_filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             finetune_filepath += f"/cramped_room_9"
         if config['FCP']:

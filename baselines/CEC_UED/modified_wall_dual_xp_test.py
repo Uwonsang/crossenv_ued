@@ -19,9 +19,9 @@ from hydra.utils import get_original_cwd
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from ippo_general_dual_destination import ActorCriticRNN, ScannedRNN, initialize_environment
+from modified_wall_ippo_general_dual_destination import ActorCriticRNN, ScannedRNN, initialize_environment
 from jaxmarl.wrappers.baselines import LogWrapper
-from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
+from jaxmarl.viz.modified_wall_toy_coop_jitted_visualizer import render_fn
 
 
 def latest_match(patterns):
@@ -79,7 +79,7 @@ def load_params(root, model_name, seeds, stages=None):
         print(f"Loaded {model_name} {label}: {path}")
     if not params:
         raise FileNotFoundError(f"No {model_name} checkpoints found under {root}")
-    return jax.tree_map(lambda *x: jnp.stack(x), *params), labels, paths
+    return jax.tree.map(lambda *x: jnp.stack(x), *params), labels, paths
 
 
 def resolve_path(path):
@@ -91,6 +91,18 @@ def resolve_path(path):
 
 def safe_name(name):
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(name))
+
+
+def get_wall_map_name(config):
+    return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
+
+
+def resolve_model_root(config):
+    root = Path(config["MODEL_ROOT"])
+    map_name = get_wall_map_name(config)
+    if config["ENV_NAME"] == "ToyCoop" and root.name == "ToyCoop":
+        root = root / "modified_wall" / map_name
+    return resolve_path(str(root))
 
 
 ACTION_NAMES = {
@@ -265,10 +277,12 @@ def save_debug_gif(path, initial_state, states, fps):
 @hydra.main(version_base=None, config_path="xp_config", config_name="dual_xp")
 def main(config):
     config = OmegaConf.to_container(config, resolve=True)
+    config["ENV_KWARGS"]["map_name"] = get_wall_map_name(config)
     model_name = config["model_name"]
     partner_model_name = config.get("partner_model_name") or model_name
     split = "procedural" if config["ENV_KWARGS"]["random_reset"] else "fixed"
-    run_name = f"XP_{model_name}_{split}" if model_name == partner_model_name else f"XP_{model_name}_x_{partner_model_name}_{split}"
+    map_name = get_wall_map_name(config)
+    run_name = f"XP_{model_name}_{map_name}_{split}" if model_name == partner_model_name else f"XP_{model_name}_x_{partner_model_name}_{map_name}_{split}"
     wandb_run = None
     if config["WANDB_MODE"] != "disabled":
         import wandb
@@ -289,7 +303,7 @@ def main(config):
     seeds = [int(s) for s in config["SEEDS"]]
     partner_seeds = [int(s) for s in config.get("PARTNER_SEEDS", config["SEEDS"])]
     ippo_pop_stages = list(config.get("IPPO_POP_STAGES", ["progress_33", "progress_67", "progress_100"]))
-    model_root = resolve_path(config["MODEL_ROOT"])
+    model_root = resolve_model_root(config)
     param_stack_1, label_list_1, path_list_1 = load_params(model_root, model_name, seeds, ippo_pop_stages)
     if model_name == partner_model_name and seeds == partner_seeds:
         param_stack_2, label_list_2, path_list_2 = param_stack_1, label_list_1, path_list_1
@@ -336,8 +350,8 @@ def main(config):
             path_2 = path_list_2[j]
             is_self_pair = model_name == partner_model_name and label_1 == label_2
             pair_name = f"{label_1}x{label_2}"
-            param_1 = jax.tree_map(lambda x: x[i], param_stack_1)
-            param_2 = jax.tree_map(lambda x: x[j], param_stack_2)
+            param_1 = jax.tree.map(lambda x: x[i], param_stack_1)
+            param_2 = jax.tree.map(lambda x: x[j], param_stack_2)
             rewards = get_rollouts(
                 param_1,
                 param_2,
@@ -471,7 +485,7 @@ def main(config):
     out = config.get("OUTPUT_FILE")
     if out is None:
         out_prefix = model_name if model_name == partner_model_name else f"{model_name}_x_{partner_model_name}"
-        out = f"{config['SAVE_PATH']}/{out_prefix}_{split}_XP_results.csv"
+        out = f"{config['SAVE_PATH']}/modified_wall/{map_name}/{out_prefix}_{split}_XP_results.csv"
     out = resolve_path(out)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)

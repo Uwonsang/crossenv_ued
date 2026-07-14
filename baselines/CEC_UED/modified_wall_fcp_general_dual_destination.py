@@ -20,50 +20,42 @@ from omegaconf import OmegaConf
 
 import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
+from jaxmarl.environments.toy_coop.modified_wall_toy_coop import ModifiedWallToyCoop
 from jaxmarl.environments.overcooked import overcooked_layouts
-from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
 import wandb
 import functools
 import pdb
 from jax_tqdm import scan_tqdm
-import time
 import yaml
-from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
-from flax import struct
-import chex
-import imageio
-from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
+from pathlib import Path
+import time
+
+def get_wall_map_name(config):
+    return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
+
+def make_modified_wall_env(config):
+    env_kwargs = dict(config["ENV_KWARGS"])
+    env_kwargs["map_name"] = get_wall_map_name(config)
+    config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
+    return ModifiedWallToyCoop(**env_kwargs)
+
+def toy_ckpt_root(config):
+    return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_name(config)}"
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config['layout_name'] = layout_name
     if config["ENV_NAME"] == "overcooked":
         config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
-    env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    if config["ENV_NAME"] == "ToyCoop":
+        env = make_modified_wall_env(config)
+    else:
+        env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
     if config["ENV_NAME"] == "overcooked":
-        def reset_env(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-                
-            asymm_reset, key = reset_sub_dict(key, make_asymm_advantages_9x9)
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
-            layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
-            # stack all layouts
-            stacked_layout_reset = jax.tree_map(lambda *x: jnp.stack(x), *layout_resets)
-            # sample an index from 0 to 4
-            index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree_map(lambda x: x[index], stacked_layout_reset)
-            return sampled_reset
-        @scan_tqdm(100)
+        temp_reset = lambda key: env.custom_reset(key, random_reset=True, shuffle_inv_and_pot=False, layout=env.layout)
+        reset_env = jax.jit(temp_reset)
         def gen_held_out(runner_state, unused):
             (i,) = runner_state
             _, ho_state = reset_env(jax.random.key(i))
@@ -72,9 +64,9 @@ def initialize_environment(config):
             return carry, res
         carry, res = jax.lax.scan(gen_held_out, (0,), jnp.arange(100), 100)
         ho_goal, ho_wall, ho_pot = [], [], []
-        for layout_name, layout_dict in overcooked_layouts.items():  # add hand crafted ones to heldout set
-            if "9" in layout_name:
-                _, ho_state = env.custom_reset(jax.random.PRNGKey(0), random_reset=False, shuffle_inv_and_pot=False, layout=layout_dict)
+        for layout_name, padded_layout in overcooked_layouts.items():  # add hand crafted ones to heldout set
+            if "padded" in layout_name:
+                _, ho_state = env.custom_reset(jax.random.PRNGKey(0), random_reset=False, shuffle_inv_and_pot=False, layout=padded_layout)
                 ho_goal.append(ho_state.goal_pos)
                 ho_wall.append(ho_state.wall_map)
                 ho_pot.append(ho_state.pot_pos)
@@ -121,7 +113,7 @@ class ScannedRNN(nn.Module):
         ins, resets = x
         
         # Reset LSTM state on episode boundaries
-        lstm_state = jax.tree_map(
+        lstm_state = jax.tree.map(
             lambda x: jnp.where(resets[:, np.newaxis], jnp.zeros_like(x), x),
             lstm_state
         )
@@ -143,24 +135,22 @@ class ActorCriticRNN(nn.Module):
     @nn.compact
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
-        batch_size, num_envs, flattened_obs_dim = obs.shape
         if self.config["CONV_NET"]:
+            batch_size, num_envs, flattened_obs_dim = obs.shape
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                # features=64 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked")else 2 * self.config["FC_DIM_SIZE"],
-                features=64,
+                features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             embedding = nn.Conv(
-                # features=32 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked") else self.config["FC_DIM_SIZE"],
-                features=32,
+                features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
@@ -177,9 +167,9 @@ class ActorCriticRNN(nn.Module):
         embedding = nn.relu(embedding)
 
         embedding = nn.Dense(
-            # self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
-            self.config["FC_DIM_SIZE"] * 2,
-            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
 
@@ -187,9 +177,9 @@ class ActorCriticRNN(nn.Module):
             rnn_in = (embedding, dones)
             hidden, embedding = ScannedRNN()(hidden, rnn_in)
         else:
+            # embedding = embedding.reshape((batch_size, num_envs, -1))
             embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
             embedding = nn.relu(embedding)
-        embedding = embedding.reshape((batch_size, num_envs, -1))
 
         #########
         # Actor
@@ -256,12 +246,6 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
 
-@struct.dataclass
-class FilteredState:
-    agent_dir_idx: chex.Array
-    agent_inv: chex.Array
-    maze_map: chex.Array
-
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -276,9 +260,6 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
-    is_overcooked = config["ENV_NAME"] == "overcooked"
-    agent_view_size = env.agent_view_size if is_overcooked else None
-    viz = OvercookedVisualizer() if is_overcooked else None
     
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -288,7 +269,6 @@ def make_train(config, update_step=0):
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    config["NUM_REWARD_SHAPING_STEPS"] = config["MAX_TRAIN_UPDATES"] // 2  # used for annealing reward shaping
     config["MINIBATCH_SIZE"] = (
         config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
     )
@@ -298,23 +278,11 @@ def make_train(config, update_step=0):
         else config["CLIP_EPS"]
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
-
-    obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-
-    if is_overcooked and config["save_env_state"]:
-        state_names  = ["agent_dir_idx", "agent_inv", "maze_map"]
-        state_shapes = {k: getattr(state, k).shape for k in state_names}
-        state_dtypes = {k: getattr(state, k).dtype for k in state_names}
-        save_every = int(config["save_env_state_interval"])
-        data_len = (int(config["NUM_UPDATES"]) + save_every - 1) // save_every
-
-        save_path = f"/app/baselines/CEC_UED/dataset/train_env_states.h5"
-        init_hdf5(save_path, state_names, state_shapes, state_dtypes, int(data_len), config["NUM_ENVS"])
-
-
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-
-    eval_envs = make_eval_envs_overcooked(config) if is_overcooked else {}
+    partners_per_update = int(config["FCP_KWARGS"].get("partners_per_update", 1))
+    if config["NUM_ENVS"] % partners_per_update != 0:
+        raise ValueError("NUM_ENVS must be divisible by FCP_KWARGS.partners_per_update")
+    partner_envs_per_group = config["NUM_ENVS"] // partners_per_update
 
     def linear_schedule(count):
         frac = (
@@ -325,8 +293,7 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
-        save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    def train(rng, frozen_param_stack, model_params=None, update_step=0, num_stacked_params=1):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         rng, _rng = jax.random.split(rng)
@@ -360,26 +327,6 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )
-        save_population_ckpts = (
-            config["ENV_NAME"] == "ToyCoop"
-            and not config["ENV_KWARGS"]["random_reset"]
-            and config.get("model_name", "") == "IPPO_baseline"
-        )
-
-        def save_ippo_population_ckpt(params, ckpt_name, returns=None, step=0):
-            os.makedirs(config["filepath"], exist_ok=True)
-            ckpt = {"params": jax.device_get(params), "update_steps": int(step)}
-            if returns is not None:
-                ckpt["returns"] = float(returns)
-            with open(f"{config['filepath']}/seed{config['SEED']}_{ckpt_name}.pkl", "wb") as f:
-                pickle.dump(ckpt, f)
-
-        num_updates_for_progress = int(config["NUM_UPDATES"])
-        progress_ckpt_specs = [
-            ("progress_33", max(1, int(np.ceil(num_updates_for_progress / 3.0)))),
-            ("progress_67", max(1, int(np.ceil(2.0 * num_updates_for_progress / 3.0)))),
-            ("progress_100", num_updates_for_progress),
-        ]
 
         # INIT ENV
         rng, _rng = jax.random.split(rng)
@@ -389,12 +336,12 @@ def make_train(config, update_step=0):
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
-        def _update_step(update_runner_state, unused):
+        def _update_step(update_runner_state, unused, frozen_param_stack=frozen_param_stack, num_stacked_params=num_stacked_params):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
-                train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
+                train_state, env_state, last_obs, last_done, hstate, rng, frozen_param, other_hstate, frozen_is_agent_1 = runner_state
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -412,7 +359,48 @@ def make_train(config, update_step=0):
                 env_act = unbatchify(
                     action, env.agents, config["NUM_ENVS"], env.num_agents
                 )
+
+                # Get frozen partner actions. To reduce partner-collapse, each update can
+                # mix multiple partners across disjoint environment groups.
+                other_action_flat = jnp.zeros_like(action.squeeze())
+
+                def _partner_group_step(group_idx, carry):
+                    other_hstate_acc, other_action_acc, group_rng = carry
+                    start = group_idx * partner_envs_per_group
+                    env_idx = jnp.arange(partner_envs_per_group) + start
+                    actor_idx = jnp.concatenate([env_idx, env_idx + config["NUM_ENVS"]])
+                    frozen_param_group = jax.tree.map(lambda x: x[group_idx], frozen_param)
+                    other_hstate_group = jax.tree.map(lambda x: x[actor_idx], other_hstate_acc)
+                    ac_in_group = (
+                        obs_batch[actor_idx][np.newaxis, :],
+                        last_done[actor_idx][np.newaxis, :],
+                        agent_positions[actor_idx][np.newaxis, :],
+                    )
+                    other_hstate_group, other_pi, _ = network.apply(
+                        frozen_param_group, other_hstate_group, ac_in_group
+                    )
+                    group_rng, action_rng = jax.random.split(group_rng)
+                    other_action_group = other_pi.sample(seed=action_rng).squeeze()
+                    other_hstate_acc = jax.tree.map(
+                        lambda full, update: full.at[actor_idx].set(update),
+                        other_hstate_acc,
+                        other_hstate_group,
+                    )
+                    other_action_acc = other_action_acc.at[actor_idx].set(other_action_group)
+                    return other_hstate_acc, other_action_acc, group_rng
+
+                rng, _rng = jax.random.split(rng)
+                group_carry = (other_hstate, other_action_flat, _rng)
+                for group_idx in range(partners_per_update):
+                    group_carry = _partner_group_step(group_idx, group_carry)
+                other_hstate, other_action_flat, _ = group_carry
+                other_env_act = unbatchify(
+                    other_action_flat, env.agents, config["NUM_ENVS"], env.num_agents
+                )
+                other_env_act = {k: v.squeeze() for k, v in other_env_act.items()}
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
+                env_act['agent_0'] = jnp.where(frozen_is_agent_1, env_act['agent_0'], other_env_act['agent_0'])
+                env_act['agent_1'] = jnp.where(frozen_is_agent_1, other_env_act['agent_1'], env_act['agent_1'])
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -420,27 +408,11 @@ def make_train(config, update_step=0):
                 obsv, env_state, reward, done, info = jax.vmap(
                     env.step, in_axes=(0, 0, 0)
                 )(rng_step, env_state, env_act)
-                shaped_reward = info['shaped_reward']
-                reward_shaping_frac = jnp.maximum(0.0, 1.0 - (update_step / config["NUM_REWARD_SHAPING_STEPS"]))
-                reward = jax.tree_map(lambda x, y: x + y * reward_shaping_frac, reward, shaped_reward)
                 
                 # remove shaped rewards
                 del info['shaped_reward']
 
-                if is_overcooked:
-                    filtered_state = FilteredState(
-                        env_state.env_state.agent_dir_idx,
-                        env_state.env_state.agent_inv,
-                        env_state.env_state.maze_map,
-                    )
-                else:
-                    filtered_state = FilteredState(
-                        env_state.env_state.agent_pos,
-                        env_state.env_state.goal_pos,
-                        env_state.env_state.other_goal_pos,
-                    )
-
-                info = jax.tree_map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
+                info = jax.tree.map(lambda x: x.reshape((config["NUM_ACTORS"])), info)
                 done_batch = batchify(done, env.agents, config["NUM_ACTORS"]).squeeze()
                 transition = Transition(
                     jnp.tile(done["__all__"], env.num_agents),
@@ -453,19 +425,43 @@ def make_train(config, update_step=0):
                     info,
                     agent_positions
                 )
-                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
-                return runner_state, (transition, filtered_state)
+                runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, frozen_param, other_hstate, frozen_is_agent_1)
+                return runner_state, transition
 
             initial_hstate = runner_state[-2]
-            (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
-            runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
-            runner_state, (traj_batch, train_filtered_state) = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+            init_other_hstate = jax.tree.map(lambda x: jnp.zeros_like(x), initial_hstate)
+            # init_other_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+
+            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
+            # sample frozen partner params from the 3 * 6 partner population
+            rng, _rng = jax.random.split(rng)
+            partner_indices = jax.random.randint(
+                _rng, (partners_per_update,), minval=0, maxval=num_stacked_params
+            )
+            frozen_param = jax.tree.map(lambda x: x[partner_indices], frozen_param_stack)
+            rng, _rng = jax.random.split(rng)
+            frozen_is_agent_1_group = jax.random.bernoulli(_rng, 0.5, (partners_per_update,))
+            frozen_is_agent_1 = jnp.repeat(frozen_is_agent_1_group, partner_envs_per_group)
+
+            rollout_runner_state = train_state, env_state, last_obs, last_done, hstate, rng, frozen_param, init_other_hstate, frozen_is_agent_1
+            rollout_runner_state, traj_batch = jax.lax.scan(
+                _env_step, rollout_runner_state, None, config["NUM_STEPS"]
+            )
+            train_state, env_state, last_obs, last_done, hstate, rng, frozen_param, init_other_hstate, frozen_is_agent_1 = rollout_runner_state
+            runner_state = train_state, env_state, last_obs, last_done, hstate, rng
+
+            # Only the actor slots actually played by the trained network (not the frozen
+            # partner) should contribute to the loss; the other slot's action/log_prob never
+            # corresponds to what was actually executed in the env.
+            agent_0_is_trained = frozen_is_agent_1.astype(jnp.float32)
+            agent_1_is_trained = 1.0 - agent_0_is_trained
+            actor_mask = jnp.concatenate([agent_0_is_trained, agent_1_is_trained])
+            actor_mask = jnp.broadcast_to(
+                actor_mask[None, :], (config["NUM_STEPS"], config["NUM_ACTORS"])
             )
 
             # CALCULATE ADVANTAGE
-            train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
+            train_state, env_state, last_obs, last_done, hstate, rng = runner_state
             last_obs_batch = batchify(last_obs, env.agents, config["NUM_ACTORS"])
             agent_positions = {'agent_0': env_state.env_state.agent_pos, 'agent_1': env_state.env_state.agent_pos}
             agent_positions = batchify(agent_positions, env.agents, config["NUM_ACTORS"])
@@ -506,16 +502,23 @@ def make_train(config, update_step=0):
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
-                    init_hstate, traj_batch, advantages, targets = batch_info
+                    init_hstate, traj_batch, advantages, targets, actor_mask = batch_info
 
-                    def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                    def _loss_fn(params, init_hstate, traj_batch, gae, targets, actor_mask):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
-                            jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
                         )
                         log_prob = pi.log_prob(traj_batch.action)
+                        mask_frozen_agent_loss = config["FCP_KWARGS"].get("mask_frozen_agent_loss", True)
+                        if not mask_frozen_agent_loss:
+                            actor_mask = jnp.ones_like(actor_mask)
+
+                        def masked_mean(x):
+                            denom = jnp.maximum(actor_mask.sum(), 1.0)
+                            return (x * actor_mask).sum() / denom
 
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
@@ -523,14 +526,15 @@ def make_train(config, update_step=0):
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
+                        value_loss_raw = jnp.maximum(value_losses, value_losses_clipped)
+                        value_loss = 0.5 * masked_mean(value_loss_raw)
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        gae_mean = masked_mean(gae)
+                        gae_var = masked_mean(jnp.square(gae - gae_mean))
+                        gae = (gae - gae_mean) / (jnp.sqrt(gae_var) + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -541,12 +545,14 @@ def make_train(config, update_step=0):
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
+                        loss_actor = masked_mean(loss_actor)
+                        entropy = masked_mean(pi.entropy())
 
                         # debug
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+                        approx_kl = masked_mean((ratio - 1) - logratio)
+                        clip_frac = masked_mean(
+                            (jnp.abs(ratio - 1) > config["CLIP_EPS"]).astype(jnp.float32)
+                        )
 
                         total_loss = (
                             loss_actor
@@ -557,7 +563,7 @@ def make_train(config, update_step=0):
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
-                        train_state.params, init_hstate, traj_batch, advantages, targets
+                        train_state.params, init_hstate, traj_batch, advantages, targets, actor_mask
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     return train_state, total_loss
@@ -572,12 +578,13 @@ def make_train(config, update_step=0):
                 ) = update_state
                 rng, _rng = jax.random.split(rng)
 
-                init_hstate = jax.tree_map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                init_hstate = jax.tree.map(lambda x: jnp.reshape(x, (1, config["NUM_ACTORS"], -1)), init_hstate)
                 batch = (
                     init_hstate,
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
+                    actor_mask,
                 )
                 permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
 
@@ -603,7 +610,7 @@ def make_train(config, update_step=0):
                 )
                 update_state = (
                     train_state,
-                    jax.tree_map(lambda h: h.squeeze(), init_hstate),
+                    jax.tree.map(lambda x: x.squeeze(), init_hstate),
                     traj_batch,
                     advantages,
                     targets,
@@ -624,27 +631,14 @@ def make_train(config, update_step=0):
             )
             train_state = update_state[0]
             metric = traj_batch.info
-            metric = jax.tree_map(
+            metric = jax.tree.map(
                 lambda x: x.reshape(
                     (config["NUM_STEPS"], config["NUM_ENVS"], env.num_agents)
                 ),
                 traj_batch.info,
             )
-
-            episode_returns_step = metric["returned_episode_returns"][:, :, 0]  # (NUM_STEPS, NUM_ENVS)
-            episode_done_step = metric["returned_episode"][:, :, 0]             # (NUM_STEPS, NUM_ENVS)
-            done_count = jnp.maximum(episode_done_step.sum(), 1.0)
-            returns = (episode_returns_step * episode_done_step).sum() / done_count
-            success_rate = (
-                ((episode_returns_step > -config["ENV_KWARGS"]["max_steps"]) * episode_done_step).sum()
-                / done_count
-            )
-            normalized_returns = returns / (2.0 * config["ENV_KWARGS"]["max_steps"])
-            # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
-            metric = jax.tree_map(lambda x: x.mean(), metric)
-            
             ratio_0 = loss_info[1][3].at[0,0].get().mean()
-            loss_info = jax.tree_map(lambda x: x.mean(), loss_info)
+            loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
@@ -657,167 +651,53 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            def eval_layout(eval_env, params, eval_rng):
-                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
-                num_actors_eval = eval_env.num_agents * num_eval_envs 
-
-                eval_rng, reset_rng = jax.random.split(eval_rng)
-                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
-                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
-                init_hstate = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
-                init_done = jnp.zeros((num_actors_eval,), dtype=bool)
-                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
-                runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
-
-                def _eval_step(carry, _):
-                    env_state_e, obs_e, done_e, hstate_e, returns_e, rng_e = carry
-
-                    rng_e, _rng_e = jax.random.split(rng_e)
-                    obs_batch = batchify(obs_e, eval_env.agents, num_actors_eval)
-                    agent_positions = {'agent_0': env_state_e.env_state.agent_pos, 'agent_1': env_state_e.env_state.agent_pos}
-                    agent_positions = batchify(agent_positions, eval_env.agents, num_actors_eval)
-                    ac_in = (
-                        obs_batch[np.newaxis, :],
-                        done_e[np.newaxis, :],
-                        agent_positions[np.newaxis, :],
-                    )
-                    hstate_next, pi, _ = network.apply(params, hstate_e, ac_in)
-                    pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
-                    sampled_action = pi.sample(seed=_rng_e)[0]
-                    greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
-                    action = jnp.where(config["EVAL_KWARGS"]["argmax"], greedy_action, sampled_action)
-
-                    env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
-                    env_act = {k: v.squeeze() for k, v in env_act.items()} #TODO: check
-
-                    rng_e, _rng_e = jax.random.split(rng_e)
-                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
-                    obs_next, state_next, reward, done, _info = jax.vmap(
-                        eval_env.step, in_axes=(0, 0, 0)
-                    )(rng_step_e, env_state_e, env_act)
-
-                    done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
-                    returns_next = returns_e + reward["agent_0"]
-
-                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), None
-                
-                runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
-                state, obs, done, h_state, returns, rng = runner_state
-
-                return returns.mean()
-
-            run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
-
-            if is_overcooked and len(eval_envs) > 0:
-                def _do_eval(_):
-                    out = {}
-                    base = jax.random.fold_in(rng, update_steps)
-                    for i, layout_name in enumerate(EVAL_LAYOUTS_9):
-                        out[layout_name] = eval_layout(
-                            eval_envs[layout_name],
-                            train_state.params,
-                            jax.random.fold_in(base, i),
-                        )
-                    out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
-                    return out
-
-                def _skip_eval(_):
-                    out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
-                    out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                    return out
-
-                metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
-
             def callback(metric):
-                log_dict = {
-                    "returns": metric["returns"],
-                    "normalized_returns": metric["normalized_returns"],
-                    "success_rate": metric["success_rate"],
-                    "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
-                    **metric["loss"],
-                }
-                if "eval_returns" in metric:
-                    if np.isfinite(float(metric["eval_returns"]["mean"])):
-                        log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
-                        for _ln in EVAL_LAYOUTS_9:
-                            log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
+                wandb.log(
+                    {
+                        # the metrics have an agent dimension, but this is identical
+                        # for all agents so index into the 0th item of that dimension.
+                        "returns": metric["returns"],
+                        "normalized_returns": metric["normalized_returns"],
+                        "success_rate": metric["success_rate"],
+                        "env_step": metric["update_steps"]
+                        * config["NUM_ENVS"]
+                        * config["NUM_STEPS"],
+                        **metric["loss"],
+                    }
+                )
+                current_return = float(metric["returns"])
+                if current_return > best_return[0]:
+                    best_return[0] = current_return
+                    os.makedirs(config['filepath'], exist_ok=True)
+                    ckpt_path = f"{config['filepath']}/fcp_seed{config['SEED']}_best.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'params': metric["params"],
+                            'returns': current_return,
+                            'update_steps': int(metric['update_steps']),
+                        }, f)
 
-                if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        log_dict[f"layout_ratio/{name}"] = layout_counts[name] / total
-
-                    ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
-                    ep_done = np.array(metric["episode_done_step"]).astype(bool)
-                    step_maze = np.array(metric["train_filtered_state"].maze_map)  # (NUM_STEPS, NUM_ENVS, H, W, C)
-                    layout_returns = {name: [] for name in EVAL_LAYOUTS_9}
-                    for t in range(ep_done.shape[0]):
-                        for e in range(ep_done.shape[1]):
-                            if ep_done[t, e]:
-                                label = classify_layout(step_maze[t, e, 4:13, 4:13, 0])
-                                layout_returns[label].append(float(ep_rets[t, e]))
-                    for name in EVAL_LAYOUTS_9:
-                        returns_for_layout = layout_returns[name]
-                        log_dict[f"train_returns/{name}"] = (
-                            float(np.mean(returns_for_layout))
-                            if len(returns_for_layout) > 0
-                            else float("nan")
-                        )
-                wandb.log(log_dict)
-                
-                step = int(metric["update_steps"])
-                def save_frames(filtered_state, step, file_path):
-                    frames = [viz.custom_get_frame(jax.tree_map(lambda x: x[step], filtered_state), agent_view_size)
-                        for step in range(config["NUM_STEPS"])]
-                    
-                    os.makedirs(file_path, exist_ok=True)
-                    filename = f"step_{step:03}_animation.gif"
-                    save_path = os.path.join(file_path, filename)
-                    imageio.mimsave(save_path, frames, 'GIF', duration=0.5)
-            
-                if is_overcooked and config["save_frames"] and (step % config["save_frames_interval"] == 0):
-                    save_frames(metric["train_filtered_state"], step, f"/app/viz_results/{config['ENV_NAME']}/{save_xpid}/train_images")
-                
-                if is_overcooked and config["save_env_state"] and (step % config["save_env_state_interval"] == 0):
-                    save_slot = step // int(config["save_env_state_interval"])
-                    arrays = [getattr(metric["env_state"].env_state, k) for k in state_names]
-                    save_to_hdf5(save_path, state_names, arrays, save_slot, step)
-
-                if save_population_ckpts:
-                    current_return = float(metric["returns"])
-                    params = metric["params"]
-                    completed_updates = step + 1
-                    for ckpt_name, target_update in progress_ckpt_specs:
-                        if completed_updates >= target_update and ckpt_name not in saved_progress_ckpts:
-                            saved_progress_ckpts.add(ckpt_name)
-                            save_ippo_population_ckpt(params, ckpt_name, current_return, completed_updates)
-
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]
+            episode_done_step = metric["returned_episode"][:, :, 0]
+            done_count = jnp.maximum(episode_done_step.sum(), 1.0)
+            returns = (episode_returns_step * episode_done_step).sum() / done_count
+            success_rate = (
+                ((episode_returns_step > -config["ENV_KWARGS"]["max_steps"]) * episode_done_step).sum()
+                / done_count
+            )
+            normalized_returns = returns / (2.0 * config["ENV_KWARGS"]["max_steps"])
             metric["returns"] = returns
             metric["normalized_returns"] = normalized_returns
             metric["success_rate"] = success_rate
             metric["update_steps"] = update_steps
             metric["params"] = train_state.params
 
-            callback_metric = {
-                **metric,
-                "train_filtered_state": train_filtered_state,
-                "env_state": env_state,
-                "episode_returns_step": episode_returns_step,
-                "episode_done_step": episode_done_step,
-            }
-            jax.experimental.io_callback(callback, None, callback_metric)
+            jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
-            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
+            runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
 
-        saved_progress_ckpts = set()
+        best_return = [float('-inf')]
 
         rng, _rng = jax.random.split(rng)
         runner_state = (
@@ -836,30 +716,14 @@ def make_train(config, update_step=0):
     return train
 
 
-def finalize_ippo_population_ckpts(filepath, seed):
-    print(
-        "IPPO population checkpoints are saved during training at "
-        "progress_33, progress_67, and progress_100."
-    )
-
-
-@hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_dual_destination")
+@hydra.main(version_base=None, config_path="config", config_name="fcp_overcooked_CEC_dual_destination")
 def main(config):
+    save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
-    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
-
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
-        finetune_appendage = "_improved_finetune"
-        if config['FCP']:
-            fcp_prefix = "fcp_"
-        else:
-            fcp_prefix = ""
-    elif config['ENV_NAME'] == 'overcooked':
-        fcp_prefix = ""
-        finetune_appendage = "_improved"
+        finetune_appendage = "_improved_finetuneIK"
     else:
-        fcp_prefix = ""
         finetune_appendage = "_improved"
     
     if config['ENV_KWARGS']['partial_obs']:
@@ -873,53 +737,62 @@ def main(config):
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
-    
-    layout_name = config["ENV_KWARGS"]["layout"]
-    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoop" else layout_name
-    run_name_prefix = config.get("model_name", "CEC")
+
+    run_env_name = f"modified_wall_{get_wall_map_name(config)}" if config["ENV_NAME"] == "ToyCoop" else config["ENV_KWARGS"]["layout"]
+    run_name_prefix = config.get("model_name", "FCP")
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
+        tags=["IPPO", "RNN", "FCP"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f"{run_name_prefix}_{run_env_name}_seed{config['SEED']}"
     )
-    filepath = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    ckpt_group = "cec" if config["ENV_KWARGS"]["random_reset"] else "ippo"
-    filepath = f'{filepath}/ik{config["ENV_KWARGS"]["random_reset"]}/{config["ENV_KWARGS"]["random_reset_fn"]}/{ckpt_group}/{xpid}'
-    config["filepath"] = filepath
-    print(f"Working on: \n{filepath}\n")
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/fcp/{save_xpid}"
+    config['filepath'] = filepath
+
+    #####################
+    # Load frozen params
+    #####################
+    frozen_param_stack = []
+
+    if config['FCP_KWARGS']['train_oracle']:
+        # only load 2 strategies
+        path = f"{filepath}/seed3_ckpt16_improved_incentivize_strat_0.pkl"
+        with open(path, "rb") as f:
+            frozen_ckpt = pickle.load(f)
+            frozen_param_stack.append(frozen_ckpt['params'])
+        path = f"{filepath}/seed3_ckpt16_improved_incentivize_strat_1.pkl"
+        with open(path, "rb") as f:
+            frozen_ckpt = pickle.load(f)
+            frozen_param_stack.append(frozen_ckpt['params'])
+        finetune_appendage += "_oracle"
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
-        if os.path.exists(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
+        if os.path.exists(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
+            print(f"filepath: {filepath}")
             exit(0)
 
     if config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        with open(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             final_update_step = previous_ckpt['final_update_step']
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
-
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
+        print("Loading finetune checkpoint")
+        ik_filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/cramped_room_9"
-        if config['FCP']:
-            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
-            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
-        else:
-            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
-            finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
-        print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
+            ik_filepath += f"/{config['ENV_KWARGS']['layout']}"
+        ik_filepath += f"/ikTrue"
+        with open(f"{ik_filepath}/seed{config['SEED']}_ckpt19_improved.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             # final_update_step = previous_ckpt['final_update_step']
@@ -930,36 +803,68 @@ def main(config):
         model_params = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
+    
+    if len(frozen_param_stack) == 0:
+        partner_root_value = config.get("FCP_PARTNER_ROOT")
+        if (
+            config["ENV_NAME"] == "ToyCoop"
+            and (not partner_root_value or partner_root_value == "ckpts/ippo/ToyCoop/ikFalse/reset_all")
+        ):
+            partner_root_value = f"{toy_ckpt_root(config)}/ikFalse/reset_all"
+        partner_root = Path(partner_root_value)
+        if not partner_root.is_absolute():
+            partner_root = Path.cwd() / partner_root
 
-    print(f"Starting from update step {final_update_step}")
+        seed_list = config["FCP_KWARGS"].get("partner_seeds", list(range(6)))
+        ckpt_ids = config["FCP_KWARGS"].get("partner_ckpt_ids", [0])
+        partner_paths = []
+        for ckpt_seed in seed_list:
+            for ckpt_id in ckpt_ids:
+                patterns = [
+                    f"**/seed{ckpt_seed}_{ckpt_id}.pkl",
+                    f"**/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}_updates*.pkl",
+                    f"**/seed{ckpt_seed}_ckpt{ckpt_id}_improved_updates*.pkl",
+                    f"**/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl",
+                    f"**/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl",
+                ]
+                matches = []
+                for pattern in patterns:
+                    matches.extend(partner_root.glob(pattern))
+                if matches:
+                    path_to_open = sorted(matches, key=lambda p: p.stat().st_mtime)[-1]
+                    partner_paths.append(path_to_open)
+                    print(f"Loading FCP partner: {path_to_open}")
+                    with open(path_to_open, "rb") as f:
+                        frozen_ckpt = pickle.load(f)
+                        frozen_param_stack.append(frozen_ckpt["params"])
+
+        if len(frozen_param_stack) == 0:
+            raise FileNotFoundError(
+                f"No FCP partner checkpoints found under {partner_root}. "
+                "Train fixed-task IPPO partners first, or set FCP_PARTNER_ROOT."
+            )
+    num_stacked_params = len(frozen_param_stack)
+    frozen_param_stack = jax.tree.map(lambda *x: jnp.stack(x), *frozen_param_stack)
+    
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    jax.effects_barrier()
-    if (
-        config["ENV_NAME"] == "ToyCoop"
-        and not config["ENV_KWARGS"]["random_reset"]
-        and config.get("model_name", "") == "IPPO_baseline"
-    ):
-        finalize_ippo_population_ckpts(filepath, config["SEED"])
+    out = train_jit(rng, frozen_param_stack, model_params, final_update_step, num_stacked_params)
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
-
+    rng = runner_state[-1]
+    
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
-
+        
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     
-    jax.effects_barrier()
-    jax.clear_caches()
-    wandb.finish() 
 
 if __name__ == "__main__":
     main()

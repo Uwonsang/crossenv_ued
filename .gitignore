@@ -192,3 +192,7 @@ baselines/CEC_UED/dataset/*
 .idea/*
 
 baselines/CEC_UED/results/*
+
+
+#paper
+ongoingworks.pdf

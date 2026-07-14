@@ -5,9 +5,9 @@
 "NUM_STEPS": 100 # Dual Destination horizon
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
-"TOTAL_TIMESTEPS": 3e8 # Dual Destination experiments use 300M steps
-"MAX_TRAIN_STEPS": 3e8 #checked
-"UPDATE_EPOCHS": 4 #checked
+"TOTAL_TIMESTEPS": 1e8
+"MAX_TRAIN_STEPS": 1e8 #checked
+"UPDATE_EPOCHS": 32 #checked
 "NUM_MINIBATCHES": 2 #checked
 "GAMMA": 0.99 #checked
 "GAE_LAMBDA": 0.95 #checked
@@ -29,7 +29,7 @@
   "partial_obs": False
   "incentivize_strat": 2 # choose [0, 1, 2, 3] for top, bottom, none, or multiple
   # overcooked specific kwargs
-  "shuffle_inv_and_pot": True # if true, we shuffle pot status and inventory
+  "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
 "TRAINING": True
@@ -59,11 +59,11 @@
   # NUM_ENVS must be divisible by this value.
   "partners_per_update": 8
   "partner_seeds": [0, 1, 2, 3, 4, 5]
-  "partner_ckpt_ids": ["init", "mid", "final"]
+  "partner_ckpt_ids": ["progress_33", "progress_67", "progress_100"]
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_dual_destination"
-"WANDB_MODE" : "online"
+"WANDB_MODE" : "online" # disabled, online, offline
 "model_name": "FCP"
 "save_frames": False
 "save_frames_interval": 200
@@ -81,3 +81,6 @@
   "beta": 1.0
   "argmax": False
 "FCP_PARTNER_ROOT": "ckpts/ippo/ToyCoop/ikFalse/reset_all"
+
+# Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
+"map_name": "empty"  # empty, wall_a, wall_b, wall_c

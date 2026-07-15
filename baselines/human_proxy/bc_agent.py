@@ -129,18 +129,20 @@ def make_train(config, train_obs, train_actions, test_obs, test_actions):
 def main(config):
     config = OmegaConf.to_container(config)
 
+    run_name = f'bc_overcooked_{config["LAYOUT"]}_seed{config["SEED"]}'
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["BC", "human_proxy"],
+        tags=["BC", "human_proxy", config["LAYOUT"]],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f'bc_overcooked_seed{config["SEED"]}',
+        name=run_name,
     )
 
-    train_obs, train_actions = load_split(config["DATA_DIR"], config["DATA_STEM"], "train")
-    test_obs, test_actions = load_split(config["DATA_DIR"], config["DATA_STEM"], "test")
-    print(f"loaded {train_obs.shape[0]} train / {test_obs.shape[0]} test samples")
+    data_stem = f'{config["DATA_STEM"]}_{config["LAYOUT"]}'
+    train_obs, train_actions = load_split(config["DATA_DIR"], data_stem, "train")
+    test_obs, test_actions = load_split(config["DATA_DIR"], data_stem, "test")
+    print(f"loaded {train_obs.shape[0]} train / {test_obs.shape[0]} test samples for layout {config['LAYOUT']}")
 
     rng = jax.random.PRNGKey(config["SEED"])
     train_fn = jax.jit(make_train(config, train_obs, train_actions, test_obs, test_actions))
@@ -150,7 +152,7 @@ def main(config):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     import pickle
 
-    with open(ckpt_dir / f'bc_overcooked_seed{config["SEED"]}.pkl', "wb") as f:
+    with open(ckpt_dir / f"{run_name}.pkl", "wb") as f:
         pickle.dump(jax.device_get(out["train_state"].params), f)
     print(f"saved checkpoint to {ckpt_dir}")
 

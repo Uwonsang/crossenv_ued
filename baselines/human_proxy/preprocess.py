@@ -185,11 +185,13 @@ def compute_obs(env, arrays):
 
 
 def process_csv(csv_path, max_rows=None):
+    """Returns {jax_layout_name: (obs, actions, group_id)}, kept separate per layout so
+    a BC model can be trained on a single layout at a time."""
     usecols = ["state", "joint_action", "layout", "layout_name", "cur_gameloop", "trial_id", "player_0_id", "player_1_id"]
     df = pd.read_csv(csv_path, usecols=usecols, nrows=max_rows)
     df = df[df["layout_name"].isin(LAYOUT_NAME_MAP)]
 
-    all_obs, all_actions, all_group_id = [], [], []
+    per_layout = {}
     for raw_name, jax_name in LAYOUT_NAME_MAP.items():
         group_df = df[df["layout_name"] == raw_name]
         if len(group_df) == 0:
@@ -218,15 +220,11 @@ def process_csv(csv_path, max_rows=None):
         obs0, obs1 = compute_obs(env, arrays)
         obs = np.concatenate([obs0, obs1], axis=0)
         actions = np.concatenate([arrays["actions"][:, 0], arrays["actions"][:, 1]], axis=0)
+        group_id = np.concatenate([trial_key, trial_key])
 
-        all_obs.append(obs)
-        all_actions.append(actions)
-        all_group_id.append(np.concatenate([trial_key, trial_key]))
+        per_layout[jax_name] = (obs, actions, group_id)
 
-    obs = np.concatenate(all_obs, axis=0)
-    actions = np.concatenate(all_actions, axis=0)
-    group_id = np.concatenate(all_group_id, axis=0)
-    return obs, actions, group_id
+    return per_layout
 
 
 def train_test_split_by_group(group_id, train_frac=0.8, seed=0):
@@ -241,20 +239,21 @@ def train_test_split_by_group(group_id, train_frac=0.8, seed=0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", required=True)
-    parser.add_argument("--out_dir", required=True)
+    parser.add_argument("--csv", default= "baselines/human_proxy/data/origin/2019_hh_trials.csv")
+    parser.add_argument("--out_dir", default="baselines/human_proxy/data/processed")
     parser.add_argument("--max_rows", type=int, default=None, help="for quick smoke tests")
     args = parser.parse_args()
 
-    obs, actions, group_id = process_csv(args.csv, max_rows=args.max_rows)
-    is_train = train_test_split_by_group(group_id)
+    per_layout = process_csv(args.csv, max_rows=args.max_rows)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = Path(args.csv).stem
-    np.savez_compressed(out_dir / f"{stem}_train.npz", obs=obs[is_train], actions=actions[is_train])
-    np.savez_compressed(out_dir / f"{stem}_test.npz", obs=obs[~is_train], actions=actions[~is_train])
-    print(f"saved {is_train.sum()} train / {(~is_train).sum()} test samples to {out_dir}")
+    for jax_name, (obs, actions, group_id) in per_layout.items():
+        is_train = train_test_split_by_group(group_id)
+        np.savez_compressed(out_dir / f"{stem}_{jax_name}_train.npz", obs=obs[is_train], actions=actions[is_train])
+        np.savez_compressed(out_dir / f"{stem}_{jax_name}_test.npz", obs=obs[~is_train], actions=actions[~is_train])
+        print(f"[{jax_name}] saved {is_train.sum()} train / {(~is_train).sum()} test samples to {out_dir}")
 
 
 if __name__ == "__main__":

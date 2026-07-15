@@ -1,29 +1,30 @@
 # Human Proxy (Behaviour Cloning)
 
-Trains a CNN policy via behaviour cloning on the Overcooked-AI human-human trial data,
-producing a "human proxy" agent that can be dropped into the same evaluation pipeline
-as the other Overcooked baselines (same 9×9 observation format as CEC/IPPO).
+Overcooked-AI human-human trial 데이터로 behaviour cloning을 학습해, CEC/IPPO와 동일한
+9×9 observation 포맷을 쓰는 "human proxy" 에이전트를 만듭니다. 레이아웃별로 데이터와
+모델을 분리해서 학습합니다.
 
-## Files
+## 파일 구성
 
-| File | Description |
-|------|-------------|
-| [layouts.py](layouts.py) | Maps raw human-data grids onto jaxmarl's fixed 9×9 `Overcooked` layout format |
-| [preprocess.py](preprocess.py) | Converts a raw trial CSV into `(obs, action)` pairs, using `Overcooked.get_obs` directly so observations exactly match the live env |
-| [bc_agent.py](bc_agent.py) | Flax CNN classifier trained with cross-entropy on human actions (Hydra + W&B) |
-| [config/bc.yaml](config/bc.yaml) | Hydra config (hyperparams, data paths, W&B settings) |
-| [data/](data/) | Raw `2019_hh_trials.csv` / `2020_hh_trials.csv` and `data/processed/` (preprocessed `.npz`) |
+| 파일 | 설명 |
+|------|------|
+| [layouts.py](layouts.py) | raw human 데이터 그리드를 jaxmarl의 고정 9×9 `Overcooked` 레이아웃 포맷으로 변환 |
+| [preprocess.py](preprocess.py) | raw trial CSV를 레이아웃별 `(obs, action)` 쌍으로 변환. `Overcooked.get_obs`를 직접 호출해서 실제 환경과 observation이 완전히 동일하도록 함 |
+| [bc_agent.py](bc_agent.py) | 사람 행동에 대해 cross-entropy로 학습하는 Flax CNN 분류기 (Hydra + W&B) |
+| [config/bc.yaml](config/bc.yaml) | Hydra 설정 (하이퍼파라미터, 데이터 경로, 레이아웃, W&B 설정) |
+| [data/origin/](data/origin/) | raw `2019_hh_trials.csv` |
+| [data/processed/](data/processed/) | 전처리된 레이아웃별 `.npz` |
 
-## Data & layout mapping
+## 데이터 & 레이아웃 매핑
 
-The raw CSVs are the original (unprocessed) Overcooked-AI web-experiment trial logs — one
-row per game timestep, with the full JSON `state`, `joint_action`, and the layout's own
-grid string. `jaxmarl`'s `Overcooked` env hardcodes a 9×9 board, but the raw layouts are
-smaller (e.g. `cramped_room` is 4×5), so `layouts.py` embeds each raw grid **top-left**
-into a 9×9 canvas and fills the rest with walls (zero coordinate offset needed as a
-result). Only 5 of the 2019 layouts have a matching jaxmarl layout family:
+raw CSV는 Overcooked-AI 웹 실험의 원본(미가공) 로그입니다 — 한 row가 한 타임스텝이고,
+전체 JSON `state`, `joint_action`, 그리고 그 레이아웃 고유의 그리드 문자열을 담고 있습니다.
+`jaxmarl`의 `Overcooked` 환경은 9×9 보드를 하드코딩하고 있는데, raw 레이아웃은 그보다
+작기 때문에(예: `cramped_room`은 4×5), `layouts.py`가 raw 그리드를 9×9 캔버스의
+**왼쪽 상단**에 그대로 배치하고 나머지는 벽으로 채웁니다 (왼쪽 상단 정렬이라 좌표 오프셋이
+필요 없습니다). 2019 데이터의 레이아웃 중 5개만 jaxmarl에 대응되는 레이아웃이 있습니다:
 
-| Raw `layout_name` | jaxmarl layout |
+| raw `layout_name` | jaxmarl 레이아웃 |
 |---|---|
 | `cramped_room` | `cramped_room` |
 | `coordination_ring` | `coord_ring` |
@@ -31,38 +32,47 @@ result). Only 5 of the 2019 layouts have a matching jaxmarl layout family:
 | `random0` | `forced_coord` |
 | `random3` | `counter_circuit` |
 
-**2020 data is not supported.** All 8 of its layouts either exceed 9 columns (too wide
-for the 9×9 grid) or use tomato as an actual order ingredient, which `jaxmarl`'s
-`Overcooked` has no object type for (`common.py`'s `OBJECT_TO_INDEX` has no `tomato`
-entry). Using it would require extending the shared env, not just this pipeline.
+**2020 데이터는 지원하지 않습니다.** 8개 레이아웃 전부 폭이 9칸을 넘거나(9×9에 안 들어감),
+tomato를 실제 주문 재료로 사용하는데 `jaxmarl`의 `Overcooked`에는 tomato 오브젝트 타입 자체가
+없습니다 (`common.py`의 `OBJECT_TO_INDEX`에 `tomato` 항목 없음). 쓰려면 이 파이프라인이
+아니라 jaxmarl 환경 자체를 확장해야 합니다.
 
-## Usage
+## 사용법
 
-**Preprocess the raw CSV into train/test `.npz`:**
+**raw CSV를 레이아웃별 train/test `.npz`로 전처리:**
 ```bash
-python -m baselines.human_proxy.preprocess \
-  --csv baselines/human_proxy/data/2019_hh_trials.csv \
-  --out_dir baselines/human_proxy/data/processed
+python -m baselines.human_proxy.preprocess
+```
+`--csv`/`--out_dir` 기본값은 각각 `data/origin/2019_hh_trials.csv`, `data/processed`이며,
+필요하면 오버라이드할 수 있습니다. 레이아웃마다 `{stem}_{jax_layout}_train.npz` /
+`_test.npz` 형태로 따로 저장됩니다 (예: `2019_hh_trials_cramped_room_train.npz`).
+
+**학습 (레이아웃 하나씩):**
+```bash
+python -m baselines.human_proxy.bc_agent LAYOUT=cramped_room
+```
+`LAYOUT`은 `cramped_room`, `coord_ring`, `asymm_advantages`, `forced_coord`,
+`counter_circuit` 중 하나입니다. 다른 config 값도 Hydra 문법으로 오버라이드할 수 있습니다:
+```bash
+python -m baselines.human_proxy.bc_agent LAYOUT=counter_circuit NUM_EPOCHS=100 BATCH_SIZE=512 WANDB_MODE=online
 ```
 
-**Train:**
-```bash
-python -m baselines.human_proxy.bc_agent
-```
-
-Config overrides follow Hydra syntax, e.g.:
-```bash
-python -m baselines.human_proxy.bc_agent NUM_EPOCHS=100 BATCH_SIZE=512 WANDB_MODE=online
-```
-
-| Key | Default | Notes |
+| Key | 기본값 | 설명 |
 |-----|---------|-------|
-| `DATA_DIR` / `DATA_STEM` | `baselines/human_proxy/data/processed` / `2019_hh_trials` | Which preprocessed split to load |
-| `NUM_EPOCHS` | `50` | Full dataset passes |
+| `LAYOUT` | `cramped_room` | 학습할 레이아웃 (하나씩 학습) |
+| `DATA_DIR` / `DATA_STEM` | `baselines/human_proxy/data/processed` / `2019_hh_trials` | 전처리된 데이터 위치 (실제로는 `{DATA_STEM}_{LAYOUT}_{split}.npz`를 로드) |
+| `NUM_EPOCHS` | `50` | 전체 데이터셋 반복 횟수 |
 | `BATCH_SIZE` | `256` | |
-| `CKPT_DIR` | `baselines/human_proxy/checkpoints` | Where the trained params (pickled) are saved |
-| `WANDB_MODE` | `disabled` | Set to `online` to log to W&B |
+| `CKPT_DIR` | `baselines/human_proxy/checkpoints` | 학습된 파라미터(pickle) 저장 위치, `bc_overcooked_{LAYOUT}_seed{SEED}.pkl`로 저장 |
+| `WANDB_MODE` | `disabled` | `online`으로 바꾸면 W&B에 로깅 |
 
-Both players' (obs, action) pairs from every trial are used as independent training
-samples; train/test are split by `(trial_id, player_0_id, player_1_id)` so no single
-human play session leaks across the split.
+같은 trial의 두 플레이어 (obs, action) 쌍을 모두 독립적인 학습 샘플로 사용합니다.
+train/test는 `(trial_id, player_0_id, player_1_id)` 단위로 분리해서, 같은 사람 플레이
+세션이 양쪽에 섞이지 않도록 했습니다.
+
+## 참고: 학습 시 환경(env)을 쓰지 않습니다
+
+`bc_agent.py`는 학습 시점에 jaxmarl 환경을 직접 실행하지 않습니다. 환경은 `preprocess.py`
+단계에서 `get_obs()`를 한 번 호출해 observation을 미리 만들어두는 데만 쓰이고,
+`bc_agent.py`는 그 결과 `.npz`를 불러와 순수 지도학습(supervised learning)으로
+cross-entropy loss를 최소화할 뿐입니다.

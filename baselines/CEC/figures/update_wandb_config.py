@@ -13,14 +13,16 @@ import argparse
 import wandb
 
 ENTITY = "overcooked_ai"
-PROJECT = "crossenv_ued_gradient"
+PROJECT = "crossenv_ued_aaai"
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--entity", default=ENTITY)
     parser.add_argument("--project", default=PROJECT)
-    parser.add_argument("--display-name", required=True, help="exact run display name to match")
+    name_group = parser.add_mutually_exclusive_group(required=True)
+    name_group.add_argument("--display-name", help="exact run display name to match")
+    name_group.add_argument("--name-contains", help="substring to match in run display name")
     parser.add_argument("--key", default="model_name", help="config key to patch")
     parser.add_argument("--value", required=True, help="new value for the config key")
     parser.add_argument("--exclude-states", nargs="*", default=["running"],
@@ -33,8 +35,11 @@ def parse_args():
 def main():
     args = parse_args()
     api = wandb.Api()
-    runs = api.runs(f"{args.entity}/{args.project}",
-                     filters={"display_name": args.display_name})
+    if args.display_name:
+        filters = {"display_name": args.display_name}
+    else:
+        filters = {"display_name": {"$regex": args.name_contains}}
+    runs = api.runs(f"{args.entity}/{args.project}", filters=filters)
 
     targets = [r for r in runs if r.state not in args.exclude_states]
     skipped = [r for r in runs if r.state in args.exclude_states]

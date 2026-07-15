@@ -1,0 +1,14 @@
+"LR": 0.0005
+"BATCH_SIZE": 256
+"NUM_EPOCHS": 50
+"ACTIVATION": "relu"
+"MAX_GRAD_NORM": 0.5
+"SEED": 30
+"DATA_DIR": "baselines/human_proxy/data/processed"
+"DATA_STEM": "2019_hh_trials"
+"CKPT_DIR": "baselines/human_proxy/checkpoints"
+
+# WandB Params
+"ENTITY": ""
+"PROJECT": ""
+"WANDB_MODE": "disabled"

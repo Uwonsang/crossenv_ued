@@ -62,16 +62,19 @@
 "save_env_state": False
 "save_env_state_interval": 10
 "EVAL_KWARGS":
-  "eval_interval": 10
-  "num_envs": 5            
+  "eval_interval": 100
+  "num_envs": 5
   "num_steps": 400         
   "max_steps": 400
   "random_reset": False    
   "check_held_out": False  
   "shuffle_inv_and_pot": False
-  "random_reset_fn": "reset_all" 
+  "random_reset_fn": "reset_all"
   "beta": 1.0
   "argmax": False
+  "eval_xp": True  # also cross-play each layout's agent against human_proxy (BC) checkpoints
+  "human_proxy_ckpt_dir": "baselines/human_proxy/checkpoints"
+  "human_proxy_num_seeds": 5
 # for gradient conflict
 "GRAD_CONFLICT_STEPS": 32
 "POPART_ALPHA": 0.01

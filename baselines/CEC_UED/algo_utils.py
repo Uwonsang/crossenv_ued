@@ -1,7 +1,12 @@
 import os
+import sys
+import pickle
 import h5py
 import numpy as np
 from scipy import ndimage
+import jax
+import jax.numpy as jnp
+from baselines.human_proxy.bc_agent import BCPolicy
 
 EVAL_LAYOUTS_9 = [
     "cramped_room_9",
@@ -77,3 +82,19 @@ def make_eval_envs_overcooked(config):
             env_params={"random_reset_fn": config["EVAL_KWARGS"]["random_reset_fn"]},
         )
     return envs
+
+def load_human_proxy_params(ckpt_dir, num_seeds):
+    """Loads human_proxy (BC) checkpoints for every EVAL_LAYOUTS_9 layout, stacked across seeds.
+
+    Returns {layout_name_9: params_pytree} where each leaf has a leading `num_seeds` axis.
+    """
+    params_by_layout = {}
+    for layout_name_9 in EVAL_LAYOUTS_9:
+        layout_name = layout_name_9[:-2]  # strip the CEC_UED-only "_9" suffix
+        seed_params = []
+        for seed in range(num_seeds):
+            ckpt_path = os.path.join(ckpt_dir, layout_name, f"bc_overcooked_{layout_name}_seed{seed}.pkl")
+            with open(ckpt_path, "rb") as f:
+                seed_params.append(pickle.load(f))
+        params_by_layout[layout_name_9] = jax.tree.map(lambda *x: jnp.stack(x), *seed_params)
+    return params_by_layout

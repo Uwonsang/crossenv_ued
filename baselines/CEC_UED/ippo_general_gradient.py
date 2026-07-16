@@ -33,7 +33,7 @@ from jaxmarl.viz.overcooked_visualizer import OvercookedVisualizer
 from flax import struct
 import chex
 import imageio
-from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
+from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -344,6 +344,18 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 
     eval_envs = make_eval_envs_overcooked(config)
 
+    eval_xp_enabled = (
+        config["ENV_NAME"] == "overcooked"
+        and len(eval_envs) > 0
+        and bool(config["EVAL_KWARGS"].get("eval_xp", False))
+    )
+    human_proxy_params = {}
+    if eval_xp_enabled:
+        human_proxy_params = load_human_proxy_params(
+            config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
+            int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+        )
+
     def linear_schedule(count):
         frac = (
             1.0
@@ -359,6 +371,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
         save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
+        bc_network = BCPolicy()
         rng, _rng = jax.random.split(rng)
         # get flattened obs dim
         flattened_obs_dim = 1
@@ -922,6 +935,76 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 
                 return returns.mean()
 
+            def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
+                """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
+
+                `main_agent_id` picks which env seat the main agent controls; the other seat
+                is controlled by the (stateless) BC policy.
+                """
+                other_agent_id = "agent_1" if main_agent_id == "agent_0" else "agent_0"
+                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+
+                eval_rng, reset_rng = jax.random.split(eval_rng)
+                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+                init_hstate = ScannedRNN.initialize_carry(num_eval_envs, config["GRU_HIDDEN_DIM"])
+                init_done = jnp.zeros((num_eval_envs,), dtype=bool)
+                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+                runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+                def _eval_step(carry, _):
+                    env_state_e, obs_e, main_done_e, hstate_e, returns_e, rng_e = carry
+                    rng_e, main_rng_e, other_rng_e = jax.random.split(rng_e, 3)
+
+                    agent_positions_e = env_state_e.env_state.agent_pos.reshape(num_eval_envs, -1)
+                    main_ac_in = (
+                        obs_e[main_agent_id].reshape(num_eval_envs, -1)[np.newaxis, :],
+                        main_done_e[np.newaxis, :],
+                        agent_positions_e[np.newaxis, :],
+                    )
+                    hstate_next, main_pi, _ = network.apply(main_params, hstate_e, main_ac_in)
+                    main_pi = distrax.Categorical(logits=main_pi.logits * config["EVAL_KWARGS"]["beta"])
+                    main_sampled = main_pi.sample(seed=main_rng_e)[0]
+                    main_greedy = jnp.argmax(main_pi.probs, axis=-1)[0]
+                    main_action = jnp.where(config["EVAL_KWARGS"]["argmax"], main_greedy, main_sampled)
+
+                    other_logits = bc_network.apply(bc_params, obs_e[other_agent_id].astype(jnp.float32))
+                    other_pi = distrax.Categorical(logits=other_logits * config["EVAL_KWARGS"]["beta"])
+                    other_sampled = other_pi.sample(seed=other_rng_e)
+                    other_greedy = jnp.argmax(other_pi.probs, axis=-1)
+                    other_action = jnp.where(config["EVAL_KWARGS"]["argmax"], other_greedy, other_sampled)
+
+                    env_act = {main_agent_id: main_action, other_agent_id: other_action}
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                    obs_next, state_next, reward, done, _info = jax.vmap(
+                        eval_env.step, in_axes=(0, 0, 0)
+                    )(rng_step_e, env_state_e, env_act)
+
+                    returns_next = returns_e + reward["agent_0"]
+
+                    return (state_next, obs_next, done[main_agent_id], hstate_next, returns_next, rng_e), None
+
+                runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
+                _, _, _, _, returns, _ = runner_state
+
+                return returns.mean()
+
+            def eval_layout_xp(eval_env, main_params, bc_params_stacked, eval_rng):
+                """Cross-play score for one layout: averaged over human_proxy seeds and over
+                which env seat (agent_0/agent_1) the main agent occupies."""
+                def _one_seed(bc_params_seed, rng_seed):
+                    rng_a, rng_b = jax.random.split(rng_seed)
+                    r_main_as_0 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_a, "agent_0")
+                    r_main_as_1 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_b, "agent_1")
+                    return (r_main_as_0 + r_main_as_1) / 2.0
+
+                num_hp_seeds = int(config["EVAL_KWARGS"]["human_proxy_num_seeds"])
+                seed_rngs = jax.random.split(eval_rng, num_hp_seeds)
+                per_seed_returns = jax.vmap(_one_seed)(bc_params_stacked, seed_rngs)
+                return per_seed_returns.mean()
+
             run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
 
             if config["ENV_NAME"] == "overcooked" and len(eval_envs) > 0:
@@ -935,11 +1018,25 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                             jax.random.fold_in(base, i),
                         )
                     out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
+                    if eval_xp_enabled:
+                        xp_base = jax.random.fold_in(base, 1000)
+                        for i, layout_name in enumerate(EVAL_LAYOUTS_9):
+                            out[f"{layout_name}_xp"] = eval_layout_xp(
+                                eval_envs[layout_name],
+                                train_state.params,
+                                human_proxy_params[layout_name],
+                                jax.random.fold_in(xp_base, i),
+                            )
+                        out["mean_xp"] = jnp.mean(jnp.stack([out[f"{n}_xp"] for n in EVAL_LAYOUTS_9]))
                     return out
 
                 def _skip_eval(_):
                     out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
                     out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                    if eval_xp_enabled:
+                        for n in EVAL_LAYOUTS_9:
+                            out[f"{n}_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                        out["mean_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
                     return out
 
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
@@ -955,6 +1052,10 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         log_dict["eval/mean"] = float(metric["eval_returns"]["mean"])
                         for _ln in EVAL_LAYOUTS_9:
                             log_dict[f"eval/{_ln}"] = float(metric["eval_returns"][_ln])
+                    if eval_xp_enabled and np.isfinite(float(metric["eval_returns"]["mean_xp"])):
+                        log_dict["eval/mean_xp"] = float(metric["eval_returns"]["mean_xp"])
+                        for _ln in EVAL_LAYOUTS_9:
+                            log_dict[f"eval/{_ln}_xp"] = float(metric["eval_returns"][f"{_ln}_xp"])
 
                 if config["ENV_NAME"] == "overcooked":
                     maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)

@@ -92,8 +92,13 @@ def build_base_maze_map(layout, env):
     )
 
 
-def build_state_arrays(group_df, layout, base_maze_map):
-    """Parses every row of `group_df` (all sharing one layout) into batched State fields."""
+def build_state_arrays(group_df, layout, base_maze_map, row_offset):
+    """Parses every row of `group_df` (all sharing one layout) into batched State fields.
+
+    `row_offset` is the number of leading all-wall rows `build_padded_layout` trimmed off
+    the raw grid (see `layouts.py`); raw y-positions must be shifted by the same amount to
+    land in the padded grid's coordinate system.
+    """
     pad = (base_maze_map.shape[0] - GRID_SIZE) // 2
     pot_positions = {
         (int(layout["pot_idx"][i]) % GRID_SIZE, int(layout["pot_idx"][i]) // GRID_SIZE)
@@ -124,6 +129,7 @@ def build_state_arrays(group_df, layout, base_maze_map):
 
         for p_i, player in enumerate(state["players"]):
             x, y = player["position"]
+            y -= row_offset
             agent_pos[row_i, p_i] = (x, y)
             agent_dir_idx[row_i, p_i] = DIR_VEC_TO_IDX[tuple(player["orientation"])]
             held = player.get("held_object")
@@ -133,6 +139,7 @@ def build_state_arrays(group_df, layout, base_maze_map):
         objects_iter = objects.values() if isinstance(objects, dict) else objects
         for obj in objects_iter:
             x, y = obj["position"]
+            y -= row_offset
             if obj["name"] == "soup" and (x, y) in pot_positions:
                 maze_maps[row_i, pad + y, pad + x, 2] = soup_pot_status(obj)
             else:
@@ -199,7 +206,7 @@ def process_csv(csv_path, max_rows=None):
         print(f"[{raw_name} -> {jax_name}] {len(group_df)} rows")
 
         grid_rows = ast.literal_eval(group_df.iloc[0]["layout"])
-        layout = build_padded_layout(grid_rows, jax_name)
+        layout, row_offset = build_padded_layout(grid_rows, jax_name)
         env = Overcooked(layout=layout, random_reset=False)
         base_maze_map = build_base_maze_map(layout, env)
 
@@ -209,7 +216,7 @@ def process_csv(csv_path, max_rows=None):
             + "_" + group_df["player_1_id"].astype(str)
         ).values
 
-        arrays = build_state_arrays(group_df, layout, base_maze_map)
+        arrays = build_state_arrays(group_df, layout, base_maze_map, row_offset)
         valid = arrays.pop("valid")
         n_invalid = (~valid).sum()
         if n_invalid:

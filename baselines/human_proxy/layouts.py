@@ -5,8 +5,11 @@ jaxmarl's fixed 9x9 Overcooked grid.
 wall/agent/pot/... indices relative to width=9. We build that by placing the raw grid
 (taken verbatim from the CSV's own `layout` column) in the top-left corner of a 9x9
 canvas and filling the rest with walls -- the same placement `make_9x9_layout` uses for
-`rotate=False`. Because the placement is top-left-aligned, a raw (x, y) position from the
-CSV state maps to the padded grid with zero offset.
+`rotate=False`. Leading rows that are entirely wall (e.g. asymmetric_advantages' row 0)
+are trimmed first, so the layout sits flush against the top instead of leaving a
+redundant all-wall row. `build_padded_layout` returns the row offset this trims, which
+callers must subtract from any raw (x, y) position (agent/object positions in CSV state)
+before indexing into the padded grid -- a raw x is unaffected (columns aren't trimmed).
 """
 
 from jaxmarl.environments.overcooked import layout_grid_to_dict
@@ -41,8 +44,14 @@ GRID_SIZE = 9
 
 def build_padded_layout(raw_grid_rows, jax_layout_name):
     """Embed `raw_grid_rows` (list[str] in overcooked_ai symbols) top-left into a 9x9
-    canvas (unused cells become walls) and return a jaxmarl FrozenDict layout.
+    canvas (unused cells become walls) and return `(layout, row_offset)`, where
+    `row_offset` is the number of leading all-wall rows trimmed (see module docstring).
     """
+    row_offset = 0
+    while len(raw_grid_rows) > 1 and all(ch == "X" for ch in raw_grid_rows[0]):
+        raw_grid_rows = raw_grid_rows[1:]
+        row_offset += 1
+
     height = len(raw_grid_rows)
     width = len(raw_grid_rows[0])
     if height > GRID_SIZE or width > GRID_SIZE:
@@ -68,4 +77,4 @@ def build_padded_layout(raw_grid_rows, jax_layout_name):
             padded_rows.append("W" * GRID_SIZE)
 
     grid_str = "\n" + "\n".join(padded_rows) + "\n"
-    return layout_grid_to_dict(grid_str, layout_name=jax_layout_name)
+    return layout_grid_to_dict(grid_str, layout_name=jax_layout_name), row_offset

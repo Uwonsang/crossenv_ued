@@ -70,6 +70,24 @@ python -m baselines.human_proxy.bc_agent LAYOUT=counter_circuit NUM_EPOCHS=100 B
 train/test는 `(trial_id, player_0_id, player_1_id)` 단위로 분리해서, 같은 사람 플레이
 세션이 양쪽에 섞이지 않도록 했습니다.
 
+**시드 여러 개 돌리기 (레이아웃 하나, seed 0~5):**
+```bash
+bash baselines/human_proxy/shell/bash_bc_sweep.sh <gpu_id> cramped_room
+```
+`SEED`별로 W&B run과 체크포인트(`bc_overcooked_{LAYOUT}_seed{SEED}.pkl`)가 따로 저장되므로,
+W&B에서 같은 레이아웃의 seed들을 겹쳐서 비교할 수 있습니다. 5개 레이아웃 전부 돌리려면
+레이아웃을 바꿔가며 5번 실행하면 됩니다 (`bash_ippo_pop.sh`와 동일한 패턴).
+
+## 트러블슈팅: cuSolver 에러
+
+GPU에서 `CustomCall failed: ... gpusolverDnCreate(&handle) failed: cuSolver internal error`가
+뜨면, 네트워크의 `orthogonal()` 초기화(QR 분해, cuSolver 사용)가 JAX의 기본 GPU 메모리
+preallocation과 충돌해서 그렇습니다. 아래처럼 preallocation을 꺼주면 해결됩니다
+(`bash_bc_sweep.sh`에는 이미 반영되어 있습니다):
+```bash
+XLA_PYTHON_CLIENT_PREALLOCATE=false python -m baselines.human_proxy.bc_agent LAYOUT=cramped_room
+```
+
 ## 참고: 학습 시 환경(env)을 쓰지 않습니다
 
 `bc_agent.py`는 학습 시점에 jaxmarl 환경을 직접 실행하지 않습니다. 환경은 `preprocess.py`

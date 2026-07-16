@@ -15,10 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import wandb
+from jax_tqdm import scan_tqdm
 from flax.linen.initializers import constant, orthogonal
 from flax.training.train_state import TrainState
 import flax.linen as nn
 from omegaconf import OmegaConf
+
 
 ACTION_DIM = 6  # right, down, left, up, stay, interact (matches env.action_set)
 
@@ -57,14 +59,14 @@ def load_split(data_dir, stem, split):
     return jnp.asarray(npz["obs"]), jnp.asarray(npz["actions"])
 
 
-def make_train(config, train_obs, train_actions, test_obs, test_actions):
-    n_train = train_obs.shape[0]
+def make_train(config):
     batch_size = config["BATCH_SIZE"]
-    n_batches = n_train // batch_size
-
     network = BCPolicy(activation=config["ACTIVATION"])
 
-    def train(rng):
+    def train(rng, train_obs, train_actions, test_obs, test_actions):
+        n_train = train_obs.shape[0]
+        n_batches = n_train // batch_size
+
         rng, init_rng = jax.random.split(rng)
         dummy_obs = jnp.zeros((1, 9, 9, 26), dtype=jnp.float32)
         params = network.init(init_rng, dummy_obs)
@@ -91,6 +93,7 @@ def make_train(config, train_obs, train_actions, test_obs, test_actions):
             train_state = train_state.apply_gradients(grads=grads)
             return train_state, (loss, acc)
 
+        @scan_tqdm(config["NUM_EPOCHS"])
         def _update_epoch(runner_state, epoch_idx):
             train_state, rng = runner_state
             rng, perm_rng = jax.random.split(rng)
@@ -145,16 +148,18 @@ def main(config):
     print(f"loaded {train_obs.shape[0]} train / {test_obs.shape[0]} test samples for layout {config['LAYOUT']}")
 
     rng = jax.random.PRNGKey(config["SEED"])
-    train_fn = jax.jit(make_train(config, train_obs, train_actions, test_obs, test_actions))
-    out = train_fn(rng)
+    train_fn = jax.jit(make_train(config))
+    out = train_fn(rng, train_obs, train_actions, test_obs, test_actions)
 
-    ckpt_dir = Path(config["CKPT_DIR"])
+    ckpt_dir = Path(config["CKPT_DIR"]) / config["LAYOUT"]
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     import pickle
 
     with open(ckpt_dir / f"{run_name}.pkl", "wb") as f:
         pickle.dump(jax.device_get(out["train_state"].params), f)
     print(f"saved checkpoint to {ckpt_dir}")
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

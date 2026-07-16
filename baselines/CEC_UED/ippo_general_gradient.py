@@ -291,7 +291,10 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0, save_info=None, opt_state=None):
+def make_train(
+    config, update_step=0, save_info=None, opt_state=None,
+    train_state_step=None,
+):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
 
@@ -345,7 +348,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
 
     remaining_updates = int(config["NUM_UPDATES"]) - update_step
 
-    def train(rng, model_params=None):
+    def train(rng, model_params=None, resume_runner_state=None):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         bc_network = BCPolicy()
@@ -381,13 +384,22 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             tx=tx,
         )
         if opt_state is not None:
-            train_state = train_state.replace(opt_state=opt_state)
+            train_state = train_state.replace(
+                opt_state=opt_state,
+                step=train_state.step if train_state_step is None else train_state_step,
+            )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+        # INIT OR RESTORE ENV RUNNER STATE
+        if resume_runner_state is None:
+            rng, _rng = jax.random.split(rng)
+            reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+            init_hstate = ScannedRNN.initialize_carry(
+                config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+            )
+            rng, runner_rng = jax.random.split(rng)
+        else:
+            env_state, obsv, restored_done, init_hstate, runner_rng = resume_runner_state
 
         # wandb logging: cap at ~100 points over the full run. Each logged point is
         # the running average of every step since the previous log point (accumulated
@@ -986,7 +998,10 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             }
             jax.experimental.io_callback(callback, None, callback_metric)
 
-            def ckpt_callback(params, opt_state_, tx_step, step):
+            def ckpt_callback(
+                params, opt_state_, tx_step, step,
+                env_state_, last_obs_, last_done_, hstate_, rng_,
+            ):
                 step = int(step)
                 mid_ckpt_dir = config["MID_CKPT_DIR"]
                 os.makedirs(mid_ckpt_dir, exist_ok=True)
@@ -998,14 +1013,22 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
                         'tx_step': tx_step,
                         'final_update_step': step + 1,
                         'wandb_run_id': wandb.run.id,
+                        'runner_state': (
+                            env_state_, last_obs_, last_done_, hstate_, rng_,
+                        ),
                     }, f)
 
-            save_ckpt_interval = int(config.get("SAVE_CKPT_INTERVAL", 5000))
+            # Keep resume checkpoints aligned with WandB aggregation boundaries.
+            save_ckpt_interval = LOG_INTERVAL
             if save_ckpt_interval > 0:
                 run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
                 jax.lax.cond(
                     run_save_ckpt,
-                    lambda _: jax.experimental.io_callback(ckpt_callback, None, train_state.params, train_state.opt_state, train_state.step, update_steps),
+                    lambda _: jax.experimental.io_callback(
+                        ckpt_callback, None,
+                        train_state.params, train_state.opt_state, train_state.step,
+                        update_steps, env_state, last_obs, last_done, hstate, rng,
+                    ),
                     lambda _: None,
                     operand=None,
                 )
@@ -1037,14 +1060,17 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
 
-        rng, _rng = jax.random.split(rng)
+        initial_done = (
+            jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+            if resume_runner_state is None else restored_done
+        )
         runner_state = (
             train_state,
             env_state,
             obsv,
-            jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
+            initial_done,
             init_hstate,
-            _rng,
+            runner_rng,
         )
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step), jnp.arange(remaining_updates), remaining_updates
@@ -1100,6 +1126,8 @@ def main(config):
     mid_ckpt_path = os.path.join(config['MID_CKPT_DIR'], "resume_ckpt.pkl")
     _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
     wandb_resume_id = None
+    resume_runner_state = None
+    resume_train_state_step = None
     if _has_mid_ckpt:
         with open(mid_ckpt_path, "rb") as f:
             _peek = pickle.load(f)
@@ -1134,6 +1162,8 @@ def main(config):
         print(f"Found mid-run checkpoint: {mid_ckpt_path}")
         model_params = _peek['params']
         opt_state = _peek.get('opt_state', None)
+        resume_train_state_step = _peek.get('tx_step', None)
+        resume_runner_state = _peek.get('runner_state', None)
         final_update_step = _peek['final_update_step']
         rng = jax.random.PRNGKey(config["SEED"])
         print(f"Resuming from update step {final_update_step}")
@@ -1182,8 +1212,14 @@ def main(config):
     }
 
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step, save_info, opt_state), device=jax.devices()[0])
-    out = train_jit(rng, model_params)
+    train_jit = jax.jit(
+        make_train(
+            config, final_update_step, save_info, opt_state,
+            resume_train_state_step,
+        ),
+        device=jax.devices()[0],
+    )
+    out = train_jit(rng, model_params, resume_runner_state)
 
     jax.effects_barrier()
     jax.clear_caches()

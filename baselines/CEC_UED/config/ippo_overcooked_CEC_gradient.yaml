@@ -57,12 +57,8 @@
 "PROJECT": "crossenv_ued_gradient"
 "WANDB_MODE" : "disabled"
 "model_name": "CEC"
-"save_frames": False
-"save_frames_interval": 200
-"save_env_state": False
-"save_env_state_interval": 10
+# EVAL Params
 "EVAL_KWARGS":
-  "eval_interval": 100
   "num_envs": 5
   "num_steps": 400         
   "max_steps": 400
@@ -77,5 +73,6 @@
   "human_proxy_num_seeds": 5
 # for gradient conflict
 "GRAD_CONFLICT_STEPS": 32
+"GRAD_CONFLICT_CHUNK_SIZE": 32  # must evenly divide NUM_ENVS (one sample contains both actors)
 "POPART_ALPHA": 0.01
 "RESUME_XPID": ""  # set to xpid string (e.g. "lr-20240608-143022") to resume that run

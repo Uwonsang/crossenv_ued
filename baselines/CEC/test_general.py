@@ -183,10 +183,9 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"])
+    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"]) + f"/{config['ENV_NAME']}"
     config['SAVE_PATH_FINAL'] = save_path_final
     os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
-
     param_list = []
     seed_list = []
     iter_range = range(config['NUM_MODELS'])
@@ -211,10 +210,30 @@ def main(config):
             if matches:
                 return matches[-1]
         return None
+    
+    def find_toy_model_path(seed):
+        model_path = os.path.join(config['MODEL_PATH'], "ToyCoop")
+        if config["model_name"] == "CEC":
+            patterns = [f"{model_path}/CEC/seed{seed}/seed{seed}_best.pkl"] 
+        elif config["model_name"] == "FCP":
+            patterns = [
+                f"{model_path}/FCP/seed{seed}/fcp_seed{seed}_best.pkl"
+                ]
+        elif config["model_name"] == "IPPO":
+            patterns = [
+                f"{model_path}/IPPO/seed{seed}/seed{seed}_best.pkl"]
+        for pat in patterns:
+            matches = sorted(glob_module.glob(pat))
+            if matches:
+                return matches[-1]
+        return None
 
     for seed in iter_range:
         try:
-            filepath = find_model_path(seed)
+            if config["ENV_NAME"] == "ToyCoop":
+                filepath = find_toy_model_path(seed)
+            else:
+                filepath = find_model_path(seed)
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
@@ -284,7 +303,11 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results.csv"
+
+        if config["ENV_NAME"] == "ToyCoop":
+            savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_XP_results.csv"
+        else:
+            savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results.csv"
         df.to_csv(savefile, index=False)
         print(f"Saved data to {savefile}")
     else:

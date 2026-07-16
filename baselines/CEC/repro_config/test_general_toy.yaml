@@ -1,8 +1,8 @@
-"ENV_NAME": "overcooked"  # ToyCoop or overcooked
+"ENV_NAME": "ToyCoop"  # ToyCoop or overcooked
 "LR": 3e-4
 "NUM_ENVS": 512
 "NUM_SEEDS": 1
-"NUM_STEPS": 400
+"NUM_STEPS": 100
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 # 3e9 for overcooked
@@ -22,7 +22,7 @@
 "SEED": 0
 "ENV_KWARGS": 
   "random_reset" : False # relevant for which env to train/test on. If true, it is CEC, otherwise single task
-  "max_steps": 400
+  "max_steps": 100
   "check_held_out": False  # if false, we don't check if the reset env is held out
   # toy specific kwargs
   "debug": False

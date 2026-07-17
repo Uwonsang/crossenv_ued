@@ -12,7 +12,7 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
+from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
 import hydra
@@ -25,16 +25,18 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import time
 import yaml
 from algo_utils import make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
-from gradient_conflict_utils import compute_gradient_conflict_metrics
+from gradient_conflict_utils import (
+    compute_gradient_conflict_metrics,
+    empty_gradient_conflict_metrics,
+)
+from representation_metrics import compute_penultimate_metrics, empty_penultimate_metrics
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
-    config['layout_name'] = layout_name
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
@@ -235,6 +237,9 @@ class ActorCriticRNN(nn.Module):
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
 
+        if not self.is_initializing():
+            self.sow("intermediates", "actor_penultimate", actor_mean)
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        
@@ -261,6 +266,8 @@ class ActorCriticRNN(nn.Module):
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
+        if not self.is_initializing():
+            self.sow("intermediates", "critic_penultimate", critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -309,9 +316,6 @@ def make_train(
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
     config["NUM_REWARD_SHAPING_STEPS"] = config["MAX_TRAIN_UPDATES"] // 2  # used for annealing reward shaping
-    config["MINIBATCH_SIZE"] = (
-        config["NUM_ACTORS"] * config["NUM_STEPS"] // config["NUM_MINIBATCHES"]
-    )
     config["CLIP_EPS"] = (
         config["CLIP_EPS"] / env.num_agents
         if config["SCALE_CLIP_EPS"]
@@ -405,7 +409,7 @@ def make_train(
         # the running average of every step since the previous log point (accumulated
         # as a sum/count on the host in `callback`, not stacked into an array).
         LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
-        _log_accum = {"sum": {}, "count": 0, "layout_sum": {}, "layout_count": {}, "eval_last": None}
+        _log_accum = {"sum": {}, "count": {}, "layout_sum": {}, "layout_count": {}, "eval_last": None}
 
         # TRAIN LOOP
         @scan_tqdm(remaining_updates)
@@ -532,75 +536,89 @@ def make_train(
             target_stats["target_raw/mean"] = targets.mean()
 
             _err = targets - traj_batch.value
-            target_stats["critic/bias"] = _err.mean()
             target_stats["critic/rmse"] = jnp.sqrt((_err ** 2).mean())
 
-            target_stats["td_error/mean_abs"] = jnp.abs(td_errors).mean()
             target_stats["td_error/rmse"] = jnp.sqrt((td_errors ** 2).mean())
 
-            _N = targets.size
-            _layer_means, _layer_vars, _layer_counts = [], [], []
             for _lid, _name in enumerate(_LAYOUT_NAMES):
                 _mask = (_actor_layout_full == _lid).astype(jnp.float32)
                 _cnt_raw = _mask.sum()
-                _cnt = _cnt_raw + 1e-8
+                _cnt = jnp.maximum(_cnt_raw, 1.0)
+                _valid = _cnt_raw > 0
                 _mean_l = (targets * _mask).sum() / _cnt
-                _var_l = ((targets - _mean_l) ** 2 * _mask).sum() / _cnt
-                _layer_means.append(_mean_l)
-                _layer_vars.append(_var_l)
-                _layer_counts.append(_cnt_raw)
-                target_stats[f"target_raw/{_name}/mean"] = _mean_l
-                target_stats[f"target_scale/{_name}/std"] = jnp.sqrt(_var_l + 1e-8)
+                target_stats[f"target_raw/{_name}/mean"] = jnp.where(
+                    _valid, _mean_l, jnp.nan
+                )
 
-                _err_l = _err * _mask
-                _bias_l = _err_l.sum() / _cnt
                 _mse_l = ((_err ** 2) * _mask).sum() / _cnt
-                target_stats[f"critic/{_name}/bias"] = _bias_l
-                target_stats[f"critic/{_name}/rmse"] = jnp.sqrt(_mse_l)
+                target_stats[f"critic/{_name}/rmse"] = jnp.where(
+                    _valid, jnp.sqrt(_mse_l), jnp.nan
+                )
 
                 _td_l = td_errors * _mask
-                target_stats[f"td_error/{_name}/mean_abs"] = jnp.abs(_td_l).sum() / _cnt
-                target_stats[f"td_error/{_name}/rmse"] = jnp.sqrt((_td_l ** 2).sum() / _cnt)
-
-            # law of total variance: total_var ≈ within_var + between_var
-            _within_var = sum(c * v for c, v in zip(_layer_counts, _layer_vars)) / _N
-            _grand_mean = sum(c * m for c, m in zip(_layer_counts, _layer_means)) / _N
-            _between_var = sum(c * (m - _grand_mean) ** 2 for c, m in zip(_layer_counts, _layer_means)) / _N
-            target_stats["target_variance_decomp/within"] = _within_var
-            target_stats["target_variance_decomp/between"] = _between_var
-            target_stats["target_variance_decomp/between_ratio"] = _between_var / (_within_var + _between_var + 1e-8)
-
-            _layer_stds = jnp.sqrt(jnp.stack(_layer_vars) + 1e-8)
-            target_stats["target_scale/std_max"] = jnp.max(_layer_stds)
-            target_stats["target_scale/std_min"] = jnp.min(_layer_stds)
-            target_stats["target_scale/std_ratio"] = (
-                jnp.max(_layer_stds) / (jnp.min(_layer_stds) + 1e-8)
-            )
-            target_stats["target_scale/std_cv"] = (
-                jnp.std(_layer_stds) / (jnp.mean(_layer_stds) + 1e-8)
-            )
+                target_stats[f"td_error/{_name}/rmse"] = jnp.where(
+                    _valid, jnp.sqrt((_td_l ** 2).sum() / _cnt), jnp.nan
+                )
 
             # ── end value target / critic quality statistics ───────────────
 
-            grad_conflict = compute_gradient_conflict_metrics(
-                network=network,
-                original_params=original_params,
-                initial_hstate=initial_hstate,
-                traj_batch=traj_batch,
-                advantages=advantages,
-                value_targets=targets,
-                layout_ids_full=_layout_ids_full,
-                layout_names=_LAYOUT_NAMES,
-                config=config,
-                num_agents=env.num_agents,
-                value_trunk_keys=(
-                    'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                    'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'Dense_11',
-                ),
-                actor_trunk_keys=(
-                    'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                    'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
-                ),
+            run_eval = jnp.equal(update_steps % LOG_INTERVAL, 0)
+
+            def _compute_gradient_conflict(_):
+                return compute_gradient_conflict_metrics(
+                    network=network,
+                    original_params=original_params,
+                    initial_hstate=initial_hstate,
+                    traj_batch=traj_batch,
+                    advantages=advantages,
+                    value_targets=targets,
+                    layout_ids_full=_layout_ids_full,
+                    layout_names=_LAYOUT_NAMES,
+                    config=config,
+                    num_agents=env.num_agents,
+                    value_trunk_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'Dense_11',
+                    ),
+                    actor_trunk_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
+                    ),
+                )
+
+            grad_conflict = jax.lax.cond(
+                run_eval,
+                _compute_gradient_conflict,
+                lambda _: empty_gradient_conflict_metrics(_LAYOUT_NAMES),
+                operand=None,
+            )
+
+            # Measure representations at the same pre-update parameter state
+            # and on the same rollout window used by the conflict diagnostics.
+            def _compute_representation_metrics(_):
+                repr_traj = jax.tree.map(
+                    lambda x: x[:config["DIAGNOSTIC_WINDOW_STEPS"]], traj_batch
+                )
+                return compute_penultimate_metrics(
+                    network,
+                    original_params,
+                    initial_hstate,
+                    (repr_traj.obs, repr_traj.done, repr_traj.agent_positions),
+                    actor_param_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
+                    ),
+                    critic_param_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'Dense_11',
+                    ),
+                )
+
+            representation_metrics = jax.lax.cond(
+                run_eval,
+                _compute_representation_metrics,
+                lambda _: empty_penultimate_metrics(),
+                operand=None,
             )
 
             # UPDATE NETWORK
@@ -752,9 +770,9 @@ def make_train(
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
-                **grad_conflict,
                 **target_stats,
             }
+            metric["gradient_conflict"] = grad_conflict
             rng = update_state[-1]
 
             def eval_layout(eval_env, params, eval_rng):
@@ -788,7 +806,7 @@ def make_train(
                     action = jnp.where(config["EVAL_KWARGS"]["argmax"], greedy_action, sampled_action)
 
                     env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
-                    env_act = {k: v.squeeze() for k, v in env_act.items()} #TODO: check
+                    env_act = {k: v.squeeze() for k, v in env_act.items()}
 
                     rng_e, _rng_e = jax.random.split(rng_e)
                     rng_step_e = jax.random.split(_rng_e, num_eval_envs)
@@ -876,7 +894,7 @@ def make_train(
                 per_seed_returns = jax.vmap(_one_seed)(bc_params_stacked, seed_rngs)
                 return per_seed_returns.mean()
 
-            run_eval = jnp.equal(update_steps % LOG_INTERVAL, 0)
+            metric["representation"] = representation_metrics
 
             if config["ENV_NAME"] == "overcooked" and len(eval_envs) > 0:
                 def _do_eval(_):
@@ -915,12 +933,20 @@ def make_train(
             def callback(metric):
                 step = int(metric["update_steps"])
 
-                # accumulate this step's metrics into the running sum (moving average,
-                # not a growing array) since the previous log point
-                _log_accum["sum"]["returns"] = _log_accum["sum"].get("returns", 0.0) + float(metric["returns"])
+                # Average finite training metrics over the interval. Per-key counts
+                # prevent a temporarily absent layout (NaN) from poisoning the
+                # entire interval.
+                def _accumulate(key, value):
+                    value = float(value)
+                    _log_accum["sum"].setdefault(key, 0.0)
+                    _log_accum["count"].setdefault(key, 0)
+                    if np.isfinite(value):
+                        _log_accum["sum"][key] += value
+                        _log_accum["count"][key] += 1
+
+                _accumulate("returns", metric["returns"])
                 for k, v in metric["loss"].items():
-                    _log_accum["sum"][k] = _log_accum["sum"].get(k, 0.0) + float(v)
-                _log_accum["count"] += 1
+                    _accumulate(k, v)
 
                 if "eval_returns" in metric:
                     if np.isfinite(float(metric["eval_returns"]["mean"])):
@@ -944,25 +970,27 @@ def make_train(
                             layout_counts[label] += 1
                     total = maze_map.shape[0]
                     for name in EVAL_LAYOUTS_9:
-                        _log_accum["sum"][f"layout_ratio/{name}"] = (
-                            _log_accum["sum"].get(f"layout_ratio/{name}", 0.0) + layout_counts[name] / total
+                        _accumulate(
+                            f"layout_ratio/{name}",
+                            layout_counts[name] / total,
                         )
 
                     ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
                     ep_done = np.array(metric["episode_done_step"]).astype(bool)
                     layout_ids = np.array(metric["layout_ids"])  # (NUM_STEPS, NUM_ENVS), pre-step layout
-                    for t in range(ep_done.shape[0]):
-                        for e in range(ep_done.shape[1]):
-                            if ep_done[t, e]:
-                                label = EVAL_LAYOUTS_9[int(layout_ids[t, e])]
-                                _log_accum["layout_sum"][label] = _log_accum["layout_sum"].get(label, 0.0) + float(ep_rets[t, e])
-                                _log_accum["layout_count"][label] = _log_accum["layout_count"].get(label, 0) + 1
+                    for t, e in np.argwhere(ep_done):
+                        label = EVAL_LAYOUTS_9[int(layout_ids[t, e])]
+                        _log_accum["layout_sum"][label] = _log_accum["layout_sum"].get(label, 0.0) + float(ep_rets[t, e])
+                        _log_accum["layout_count"][label] = _log_accum["layout_count"].get(label, 0) + 1
 
                 if step % LOG_INTERVAL == 0:
-                    log_dict = {"env_step": int(step * config["NUM_ENVS"] * config["NUM_STEPS"])}
-                    cnt = _log_accum["count"]
+                    log_dict = {
+                        "update_step": step,
+                        "env_step": int(step * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                    }
                     for k, s in _log_accum["sum"].items():
-                        log_dict[k] = s / cnt
+                        cnt = _log_accum["count"][k]
+                        log_dict[k] = s / cnt if cnt > 0 else float("nan")
 
                     if _log_accum["eval_last"] is not None:
                         log_dict["eval/mean"] = _log_accum["eval_last"]["mean"]
@@ -973,16 +1001,27 @@ def make_train(
                             for _ln in EVAL_LAYOUTS_9:
                                 log_dict[f"eval_xp/{_ln}"] = _log_accum["eval_last"][f"{_ln}_xp"]
 
+                    # Expensive diagnostics are evaluated only at this update and
+                    # logged directly rather than averaged across the interval.
+                    for k, v in metric["gradient_conflict"].items():
+                        log_dict[k] = float(v)
+
+                    for k, v in metric["representation"].items():
+                        if np.isfinite(float(v)):
+                            log_dict[k] = float(v)
+
                     if config["ENV_NAME"] == "overcooked":
                         for name in EVAL_LAYOUTS_9:
                             c = _log_accum["layout_count"].get(name, 0)
                             log_dict[f"train_returns/{name}"] = (
                                 _log_accum["layout_sum"][name] / c if c > 0 else float("nan")
                             )
-                    wandb.log(log_dict)
+                    # Use the actual PPO update as WandB's global x-axis, rather than
+                    # the number of times logging has occurred.
+                    wandb.log(log_dict, step=step)
 
                     _log_accum["sum"] = {}
-                    _log_accum["count"] = 0
+                    _log_accum["count"] = {}
                     _log_accum["layout_sum"] = {}
                     _log_accum["layout_count"] = {}
 
@@ -1035,7 +1074,7 @@ def make_train(
 
             if save_info is not None:
                 num_updates_total = save_info["num_updates"]
-                def final_save_callback(params, step):
+                def final_save_callback(params):
                     fp = save_info["filepath"]
                     prefix = save_info["fcp_prefix"]
                     appendage = save_info["finetune_appendage"]
@@ -1046,12 +1085,12 @@ def make_train(
                         pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total}, f)
                     print(f"Saved final model to {ckpt_path}")
                     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
-                    print(f"--------------------------------")
+                    print("--------------------------------")
 
                 is_last_step = jnp.equal(update_steps, num_updates_total - 1)
                 jax.lax.cond(
                     is_last_step,
-                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params, update_steps),
+                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params),
                     lambda _: None,
                     operand=None,
                 )
@@ -1219,7 +1258,7 @@ def main(config):
         ),
         device=jax.devices()[0],
     )
-    out = train_jit(rng, model_params, resume_runner_state)
+    train_jit(rng, model_params, resume_runner_state)
 
     jax.effects_barrier()
     jax.clear_caches()

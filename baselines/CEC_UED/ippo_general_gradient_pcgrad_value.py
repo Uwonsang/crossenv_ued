@@ -525,7 +525,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             original_params = train_state.params
 
             # subsample: use only the first _GC_STEPS steps to reduce activation memory
-            _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
+            _GC_STEPS = config["DIAGNOSTIC_WINDOW_STEPS"]
             _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
             _gc_adv  = advantages[:_GC_STEPS]
             _gc_tgt  = targets[:_GC_STEPS]

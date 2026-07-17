@@ -4,6 +4,46 @@ import jax
 import jax.numpy as jnp
 
 
+def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
+    """Shape-compatible skipped output for interval-only diagnostics."""
+    names = []
+    for layout_name in layout_names:
+        names.append(f"sample_share/{layout_name}")
+
+    for loss_type in ("actor", "value"):
+        for layout_name in layout_names:
+            names.append(f"grad_conflict_{loss_type}/norm/{layout_name}")
+        names.append(f"grad_conflict_{loss_type}/norm/total")
+
+        for i, layout_i in enumerate(layout_names):
+            for layout_j in layout_names[i + 1:]:
+                names.append(
+                    f"grad_conflict_{loss_type}/{layout_i}_vs_{layout_j}"
+                )
+                names.append(
+                    f"grad_neg_dot_{loss_type}/{layout_i}_vs_{layout_j}"
+                )
+
+        for layout_name in layout_names:
+            names.append(f"grad_conflict_{loss_type}/alignment/{layout_name}")
+            names.append(
+                f"grad_conflict_{loss_type}/alignment_loo/{layout_name}"
+            )
+
+        for metric_name in (
+            "avg_pairwise_cosine",
+            "conflict_rate",
+            "avg_negative_cosine",
+            "alignment",
+        ):
+            names.append(f"grad_conflict_sample_{loss_type}/{metric_name}")
+
+    return {
+        name: jnp.asarray(jnp.nan, dtype=dtype)
+        for name in names
+    }
+
+
 def compute_gradient_conflict_metrics(
     *,
     network,
@@ -21,7 +61,7 @@ def compute_gradient_conflict_metrics(
 ):
     _num_layouts = len(layout_names)
     # subsample: use only the first _GC_STEPS steps to reduce activation memory
-    _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
+    _GC_STEPS = config["DIAGNOSTIC_WINDOW_STEPS"]
     _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
     _gc_adv  = advantages[:_GC_STEPS]
     _gc_tgt  = value_targets[:_GC_STEPS]
@@ -98,9 +138,6 @@ def compute_gradient_conflict_metrics(
     _sample_counts_arr = jnp.stack(_sample_counts)
     _sample_total = _sample_counts_arr.sum() + 1e-8
     for _i in range(_num_layouts):
-        grad_conflict[
-            f"grad_conflict/sample_count/{layout_names[_i]}"
-        ] = _sample_counts_arr[_i]
         grad_conflict[f"sample_share/{layout_names[_i]}"] = _sample_counts_arr[_i] / _sample_total
     
     for _loss_type, _s in _gc_state.items():
@@ -111,36 +148,6 @@ def compute_gradient_conflict_metrics(
                 jnp.where(
                     _valid_layout[_i],
                     jnp.sqrt(_s['norms_sq'][_i]),
-                    jnp.nan,
-                )
-            )
-        # gradient share p_f, dominance ratio D, norm CV
-        _norms = jnp.stack([
-            jnp.sqrt(_s['norms_sq'][_i]) for _i in range(_num_layouts)
-        ])
-        _norm_sum = _norms.sum() + 1e-8
-        for _i in range(_num_layouts):
-            grad_conflict[f"grad_share_{_loss_type}/{layout_names[_i]}"] = jnp.where(
-                _valid_layout[_i], _norms[_i] / _norm_sum, jnp.nan
-            )
-        _valid_norms = jnp.where(_valid_layout, _norms, jnp.nan)
-        grad_conflict[f"grad_dominance_{_loss_type}"] = (
-            jnp.nanmax(_valid_norms) / (jnp.nanmedian(_valid_norms) + 1e-8)
-        )
-        grad_conflict[f"grad_norm_cv_{_loss_type}"] = (
-            jnp.nanstd(_valid_norms) / (jnp.nanmean(_valid_norms) + 1e-8)
-        )
-    
-        # sample-weighted gradient share: weights each layout's (per-sample-mean) norm
-        # by its actual sample count, approximating its contribution to the real,
-        # unmasked combined gradient (which averages over all samples, not per layout).
-        _weighted_norms = _norms * _sample_counts_arr
-        _weighted_norm_sum = _weighted_norms.sum() + 1e-8
-        for _i in range(_num_layouts):
-            grad_conflict[f"grad_share_weighted_{_loss_type}/{layout_names[_i]}"] = (
-                jnp.where(
-                    _valid_layout[_i],
-                    _weighted_norms[_i] / _weighted_norm_sum,
                     jnp.nan,
                 )
             )
@@ -173,6 +180,12 @@ def compute_gradient_conflict_metrics(
             *_s['prev'],
         )
         _norm_all_sq = _tnorm2(_g_all)
+        # `_g_all` is the count-weighted sum of per-layout mean gradients.
+        # Divide by the total count so this norm is directly comparable with
+        # each per-layout mean-gradient norm above.
+        grad_conflict[f"grad_conflict_{_loss_type}/norm/total"] = (
+            jnp.sqrt(_norm_all_sq) / _sample_total
+        )
         for _i in range(_num_layouts):
             _dot_i_all = _tdot(_s['prev'][_i], _g_all)
             _align = jnp.where(
@@ -305,9 +318,6 @@ def compute_gradient_conflict_metrics(
     _CHUNK = config["GRAD_CONFLICT_CHUNK_SIZE"]
     _n_envs = config["NUM_ENVS"]
     _n_agents = num_agents
-    assert _n_envs % _CHUNK == 0, (
-        "GRAD_CONFLICT_CHUNK_SIZE must evenly divide NUM_ENVS"
-    )
     _n_chunks = _n_envs // _CHUNK
     
     # batchify is agent-major:
@@ -341,6 +351,10 @@ def compute_gradient_conflict_metrics(
             _sum_unit_value, _sum_unit_actor,
             _sum_sqnorm_value, _sum_sqnorm_actor,
             _sum_unit_sqnorm_value, _sum_unit_sqnorm_actor,
+            _pending_unit_value, _pending_unit_actor, _has_pending,
+            _conflict_count_value, _conflict_count_actor,
+            _negative_cosine_sum_value, _negative_cosine_sum_actor,
+            _pair_count,
         ) = carry
         (
             hstate_i, obs_i, done_i, pos_i, value_i, tgt_i,
@@ -375,6 +389,40 @@ def compute_gradient_conflict_metrics(
             _sum_unit_actor,
             _unit_actor,
         )
+
+        # Estimate sign-sensitive pair statistics without retaining all
+        # NUM_ENVS gradients. Consecutive environment slots form disjoint
+        # pairs, giving NUM_ENVS / 2 pair samples per update.
+        _pair_cosine_value = _tdot(_pending_unit_value, _unit_value)
+        _pair_cosine_actor = _tdot(_pending_unit_actor, _unit_actor)
+        _pair_weight = _has_pending.astype(jnp.float32)
+        _conflict_count_value += _pair_weight * (
+            _pair_cosine_value < 0
+        ).astype(jnp.float32)
+        _conflict_count_actor += _pair_weight * (
+            _pair_cosine_actor < 0
+        ).astype(jnp.float32)
+        _negative_cosine_sum_value += _pair_weight * jnp.maximum(
+            0.0, -_pair_cosine_value
+        )
+        _negative_cosine_sum_actor += _pair_weight * jnp.maximum(
+            0.0, -_pair_cosine_actor
+        )
+        _pair_count += _pair_weight
+        _pending_unit_value = jax.tree.map(
+            lambda pending, unit: jnp.where(
+                _has_pending, jnp.zeros_like(pending), unit
+            ),
+            _pending_unit_value,
+            _unit_value,
+        )
+        _pending_unit_actor = jax.tree.map(
+            lambda pending, unit: jnp.where(
+                _has_pending, jnp.zeros_like(pending), unit
+            ),
+            _pending_unit_actor,
+            _unit_actor,
+        )
         return (
             _sum_unit_value,
             _sum_unit_actor,
@@ -382,6 +430,14 @@ def compute_gradient_conflict_metrics(
             _sum_sqnorm_actor + _sq_actor,
             _sum_unit_sqnorm_value + _sq_value / (_denom_value ** 2),
             _sum_unit_sqnorm_actor + _sq_actor / (_denom_actor ** 2),
+            _pending_unit_value,
+            _pending_unit_actor,
+            ~_has_pending,
+            _conflict_count_value,
+            _conflict_count_actor,
+            _negative_cosine_sum_value,
+            _negative_cosine_sum_actor,
+            _pair_count,
         ), None
     
     def _chunk_body(carry, chunk_data):
@@ -394,11 +450,23 @@ def compute_gradient_conflict_metrics(
         jnp.array(0.0),
         jnp.array(0.0),
         jnp.array(0.0),
+        jax.tree.map(jnp.zeros_like, _value_trunk_params),
+        jax.tree.map(jnp.zeros_like, _actor_trunk_params),
+        jnp.array(False),
+        jnp.array(0.0),
+        jnp.array(0.0),
+        jnp.array(0.0),
+        jnp.array(0.0),
+        jnp.array(0.0),
     )
     (
         _sum_unit_value, _sum_unit_actor,
         _sum_sqnorm_value, _sum_sqnorm_actor,
         _sum_unit_sqnorm_value, _sum_unit_sqnorm_actor,
+        _pending_unit_value, _pending_unit_actor, _has_pending,
+        _conflict_count_value, _conflict_count_actor,
+        _negative_cosine_sum_value, _negative_cosine_sum_actor,
+        _pair_count,
     ), _ = jax.lax.scan(
         _chunk_body,
         _sample_accum_init,
@@ -411,28 +479,24 @@ def compute_gradient_conflict_metrics(
     for (
         _loss_type, _sum_indiv_sqnorm, _sum_unit,
         _sum_unit_indiv_sqnorm, _global_grad, _keys,
+        _conflict_count, _negative_cosine_sum,
     ) in (
         (
             'value', _sum_sqnorm_value, _sum_unit_value,
             _sum_unit_sqnorm_value, _global_value_grad, _VALUE_TRUNK_KEYS,
+            _conflict_count_value, _negative_cosine_sum_value,
         ),
         (
             'actor', _sum_sqnorm_actor, _sum_unit_actor,
             _sum_unit_sqnorm_actor, _global_actor_grad, _ACTOR_TRUNK_KEYS,
+            _conflict_count_actor, _negative_cosine_sum_actor,
         ),
     ):
         _mean_grad_normsq = _restricted_normsq(_global_grad, _keys)
         _sum_all_sqnorm = (_n_envs ** 2) * _mean_grad_normsq
-        _avg_pairwise_dot = (
-            (_sum_all_sqnorm - _sum_indiv_sqnorm)
-            / (_n_envs * (_n_envs - 1) + 1e-8)
-        )
         _alignment = (
             _sum_all_sqnorm / (_n_envs * _sum_indiv_sqnorm + 1e-8)
         )
-        grad_conflict[
-            f"grad_conflict_sample_{_loss_type}/avg_pairwise_dot"
-        ] = _avg_pairwise_dot
         # For u_i = g_i / (||g_i|| + eps):
         # sum_{i != j} cos(g_i, g_j) = ||sum_i u_i||^2 - sum_i ||u_i||^2.
         _avg_pairwise_cosine = (
@@ -442,6 +506,12 @@ def compute_gradient_conflict_metrics(
         grad_conflict[
             f"grad_conflict_sample_{_loss_type}/avg_pairwise_cosine"
         ] = _avg_pairwise_cosine
+        grad_conflict[
+            f"grad_conflict_sample_{_loss_type}/conflict_rate"
+        ] = _conflict_count / (_pair_count + 1e-8)
+        grad_conflict[
+            f"grad_conflict_sample_{_loss_type}/avg_negative_cosine"
+        ] = _negative_cosine_sum / (_pair_count + 1e-8)
         grad_conflict[
             f"grad_conflict_sample_{_loss_type}/alignment"
         ] = _alignment

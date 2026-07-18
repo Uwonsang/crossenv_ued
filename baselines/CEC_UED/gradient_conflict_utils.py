@@ -4,6 +4,334 @@ import jax
 import jax.numpy as jnp
 
 
+def compute_projected_gradient_cosine_matrices(
+    *,
+    network,
+    original_params,
+    initial_hstate,
+    traj_batch,
+    advantages,
+    value_targets,
+    config,
+    num_agents,
+    value_trunk_keys,
+    actor_trunk_keys,
+):
+    """Compute memory-bounded per-environment gradient cosine heatmaps.
+
+    At each configured time, one sample is one environment's joint transition:
+    the two agents' losses are averaged before differentiating. Full gradients
+    are computed one environment at a time and immediately reduced to a fixed
+    signed feature-hash sketch, so no ``NUM_ENVS x NUM_PARAMS`` tensor is kept.
+
+    Returns:
+        Array with shape ``(2, num_times, NUM_ENVS, NUM_ENVS)``. Axis 0 is
+        ``(actor, value)``. The matrices are projected cosine/Gram matrices,
+        not statistically centered covariance matrices.
+    """
+    timesteps = tuple(
+        int(t) for t in config["GRADIENT_COVARIANCE_TIMESTEPS"]
+    )
+    sketch_dim = int(config["GRADIENT_COVARIANCE_SKETCH_DIM"])
+    sketch_seed = int(config["GRADIENT_COVARIANCE_SKETCH_SEED"])
+    num_envs = int(config["NUM_ENVS"])
+    num_actors = num_envs * int(num_agents)
+    if int(traj_batch.obs.shape[1]) != num_actors:
+        raise ValueError(
+            "trajectory actor axis does not match NUM_ENVS * num_agents"
+        )
+
+    value_keys = tuple(value_trunk_keys)
+    actor_keys = tuple(actor_trunk_keys)
+
+    def _select_params(params, keys):
+        return {key: params["params"][key] for key in keys}
+
+    value_params = _select_params(original_params, value_keys)
+    actor_params = _select_params(original_params, actor_keys)
+    other_value_params = {
+        key: value
+        for key, value in original_params["params"].items()
+        if key not in value_keys
+    }
+    other_actor_params = {
+        key: value
+        for key, value in original_params["params"].items()
+        if key not in actor_keys
+    }
+
+    def _rebuild_value_params(selected):
+        merged = dict(other_value_params)
+        merged.update(selected)
+        return {"params": merged}
+
+    def _rebuild_actor_params(selected):
+        merged = dict(other_actor_params)
+        merged.update(selected)
+        return {"params": merged}
+
+    # Match the existing actor diagnostic's common advantage normalization.
+    diagnostic_steps = int(config["DIAGNOSTIC_WINDOW_STEPS"])
+    diagnostic_advantages = advantages[:diagnostic_steps]
+    advantage_mean = jnp.mean(diagnostic_advantages)
+    advantage_std = jnp.sqrt(
+        jnp.mean((diagnostic_advantages - advantage_mean) ** 2) + 1e-8
+    )
+
+    def _value_loss(
+        selected_params, hstate, obs, done, positions, old_value, target
+    ):
+        _, _, value = jax.checkpoint(network.apply)(
+            _rebuild_value_params(selected_params),
+            hstate,
+            (obs, done, positions),
+        )
+        value_clipped = old_value + (value - old_value).clip(
+            -config["CLIP_EPS"], config["CLIP_EPS"]
+        )
+        # obs has shape (1, num_agents, ...), so mean() first combines the two
+        # actors into one environment-level loss and then grad() is applied.
+        return 0.5 * jnp.maximum(
+            jnp.square(value - target),
+            jnp.square(value_clipped - target),
+        ).mean()
+
+    def _actor_loss(
+        selected_params, hstate, obs, done, positions, action, old_log_prob,
+        advantage,
+    ):
+        _, policy, _ = jax.checkpoint(network.apply)(
+            _rebuild_actor_params(selected_params),
+            hstate,
+            (obs, done, positions),
+        )
+        ratio = jnp.exp(policy.log_prob(action) - old_log_prob)
+        normalized_advantage = (
+            (advantage - advantage_mean) / (advantage_std + 1e-8)
+        )
+        return -jnp.minimum(
+            ratio * normalized_advantage,
+            jnp.clip(
+                ratio,
+                1.0 - config["CLIP_EPS"],
+                1.0 + config["CLIP_EPS"],
+            )
+            * normalized_advantage,
+        ).mean()
+
+    value_grad = jax.grad(_value_loss)
+    actor_grad = jax.grad(_actor_loss)
+
+    def _make_sign_tree(params, ordered_keys, salt):
+        base_key = jax.random.fold_in(
+            jax.random.PRNGKey(sketch_seed), int(salt)
+        )
+        signs = {}
+        for module_index, key in enumerate(ordered_keys):
+            leaves, treedef = jax.tree_util.tree_flatten(params[key])
+            module_key = jax.random.fold_in(base_key, module_index)
+            module_signs = [
+                jax.random.bernoulli(
+                    jax.random.fold_in(module_key, leaf_index),
+                    p=0.5,
+                    shape=leaf.shape,
+                )
+                for leaf_index, leaf in enumerate(leaves)
+            ]
+            signs[key] = jax.tree_util.tree_unflatten(
+                treedef, module_signs
+            )
+        return signs
+
+    # Use the supplied logical module order rather than JAX's sorted dict-key
+    # order. This keeps the projection aligned between the standard critic's
+    # Dense_11 and PopArt's equivalently positioned critic_output module.
+    value_signs = _make_sign_tree(value_params, value_keys, salt=0)
+    actor_signs = _make_sign_tree(actor_params, actor_keys, salt=1)
+
+    def _signed_feature_hash(gradient, signs, ordered_keys):
+        """Balanced CountSketch-style projection without a dense P x r map."""
+        sketch = jnp.zeros((sketch_dim,), dtype=jnp.float32)
+        global_offset = 0
+        for key in ordered_keys:
+            gradient_leaves = jax.tree_util.tree_leaves(gradient[key])
+            sign_leaves = jax.tree_util.tree_leaves(signs[key])
+            for grad_leaf, sign_leaf in zip(gradient_leaves, sign_leaves):
+                flat_gradient = jnp.asarray(
+                    grad_leaf, dtype=jnp.float32
+                ).reshape(-1)
+                flat_sign = sign_leaf.reshape(-1)
+                signed_gradient = jnp.where(
+                    flat_sign, flat_gradient, -flat_gradient
+                )
+
+                # Coordinate i is assigned to bucket i mod sketch_dim.
+                # Independent Rademacher signs make cross-bucket collisions
+                # cancel in expectation.
+                front_pad = global_offset % sketch_dim
+                end_pad = (-(front_pad + int(grad_leaf.size))) % sketch_dim
+                padded = jnp.pad(signed_gradient, (front_pad, end_pad))
+                sketch = sketch + padded.reshape(
+                    (-1, sketch_dim)
+                ).sum(axis=0)
+                global_offset += int(grad_leaf.size)
+        return sketch
+
+    def _env_major_transition(x, timestep):
+        # batchify is agent-major: (agents * envs, ...) -> (envs, 1, agents, ...)
+        x_t = x[timestep].reshape(
+            (num_agents, num_envs) + x.shape[2:]
+        )
+        return jnp.moveaxis(x_t, 1, 0)[:, None, ...]
+
+    def _env_major_hstate(hstate):
+        return jax.tree.map(
+            lambda h: jnp.moveaxis(
+                h.reshape((num_agents, num_envs) + h.shape[1:]), 1, 0
+            ),
+            hstate,
+        )
+
+    # Recover the actual recurrent carry before each selected transition by
+    # replaying only the required prefix segments. Carries are treated as fixed
+    # inputs to the independent-transition gradient, matching the paper's
+    # per-data-point view without storing the full rollout carry history.
+    hstates_at_time = {}
+    current_hstate = initial_hstate
+    previous_timestep = 0
+    for timestep in timesteps:
+        if timestep > previous_timestep:
+            current_hstate, _, _ = network.apply(
+                original_params,
+                current_hstate,
+                (
+                    traj_batch.obs[previous_timestep:timestep],
+                    traj_batch.done[previous_timestep:timestep],
+                    traj_batch.agent_positions[previous_timestep:timestep],
+                ),
+            )
+        current_hstate = jax.tree.map(jax.lax.stop_gradient, current_hstate)
+        hstates_at_time[timestep] = current_hstate
+        previous_timestep = timestep
+
+    actor_matrices = []
+    value_matrices = []
+    for timestep in timesteps:
+        env_data = (
+            _env_major_hstate(hstates_at_time[timestep]),
+            _env_major_transition(traj_batch.obs, timestep),
+            _env_major_transition(traj_batch.done, timestep),
+            _env_major_transition(traj_batch.agent_positions, timestep),
+            _env_major_transition(traj_batch.value, timestep),
+            _env_major_transition(value_targets, timestep),
+            _env_major_transition(traj_batch.action, timestep),
+            _env_major_transition(traj_batch.log_prob, timestep),
+            _env_major_transition(advantages, timestep),
+        )
+
+        def _project_one_environment(_, sample):
+            (
+                hstate, obs, done, positions, old_value, target,
+                action, old_log_prob, advantage,
+            ) = sample
+            gradient_value = value_grad(
+                value_params,
+                hstate,
+                obs,
+                done,
+                positions,
+                old_value,
+                target,
+            )
+            value_sketch = _signed_feature_hash(
+                gradient_value, value_signs, value_keys
+            )
+
+            gradient_actor = actor_grad(
+                actor_params,
+                hstate,
+                obs,
+                done,
+                positions,
+                action,
+                old_log_prob,
+                advantage,
+            )
+            actor_sketch = _signed_feature_hash(
+                gradient_actor, actor_signs, actor_keys
+            )
+            return None, (actor_sketch, value_sketch)
+
+        _, (actor_sketches, value_sketches) = jax.lax.scan(
+            _project_one_environment, None, env_data
+        )
+
+        def _cosine_matrix(sketches):
+            row_norm = jnp.linalg.norm(sketches, axis=1)
+            valid = row_norm > 1e-12
+            unit_sketches = sketches / (row_norm[:, None] + 1e-12)
+            matrix = jnp.clip(unit_sketches @ unit_sketches.T, -1.0, 1.0)
+            valid_pairs = valid[:, None] & valid[None, :]
+            matrix = jnp.where(valid_pairs, matrix, jnp.nan)
+            diagonal = jnp.arange(num_envs)
+            return matrix.at[diagonal, diagonal].set(
+                jnp.where(valid, 1.0, jnp.nan)
+            )
+
+        actor_matrices.append(_cosine_matrix(actor_sketches))
+        value_matrices.append(_cosine_matrix(value_sketches))
+
+    return jnp.stack(
+        (jnp.stack(actor_matrices), jnp.stack(value_matrices)), axis=0
+    )
+
+
+def render_projected_gradient_cosine_heatmaps(matrices, timesteps):
+    """Render host-side RGBA images for WandB without retaining figures."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    matrices = np.asarray(matrices)
+    timesteps = tuple(int(t) for t in timesteps)
+    expected_prefix = (2, len(timesteps))
+    if matrices.shape[:2] != expected_prefix:
+        raise ValueError(
+            f"expected matrix prefix {expected_prefix}, got {matrices.shape}"
+        )
+
+    images = {}
+    for loss_index, loss_name in enumerate(("actor", "value")):
+        for time_index, timestep in enumerate(timesteps):
+            matrix = matrices[loss_index, time_index]
+            fig, axis = plt.subplots(figsize=(6.4, 5.6), dpi=120)
+            image = axis.imshow(
+                matrix,
+                cmap="coolwarm",
+                vmin=-1.0,
+                vmax=1.0,
+                interpolation="nearest",
+                origin="upper",
+            )
+            axis.set_title(
+                "Projected normalized gradient Gram matrix\n"
+                f"{loss_name}, t={timestep}; one joint sample per env"
+            )
+            axis.set_xlabel("environment slot j")
+            axis.set_ylabel("environment slot i")
+            fig.colorbar(image, ax=axis, label="projected cosine similarity")
+            fig.tight_layout()
+            fig.canvas.draw()
+            rgba = np.asarray(fig.canvas.buffer_rgba()).copy()
+            plt.close(fig)
+            images[
+                f"gradient_covariance_projected/{loss_name}/t_{timestep}"
+            ] = rgba
+    return images
+
+
 def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
     """Shape-compatible skipped output for interval-only diagnostics."""
     names = []

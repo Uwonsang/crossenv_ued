@@ -28,10 +28,12 @@ import functools
 from jax_tqdm import scan_tqdm
 import time
 import yaml
-from algo_utils import make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
+from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
 from gradient_conflict_utils import (
     compute_gradient_conflict_metrics,
+    compute_projected_gradient_cosine_matrices,
     empty_gradient_conflict_metrics,
+    render_projected_gradient_cosine_heatmaps,
 )
 from representation_metrics import compute_penultimate_metrics, empty_penultimate_metrics
 
@@ -266,8 +268,10 @@ class ActorCriticRNN(nn.Module):
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
+
         if not self.is_initializing():
             self.sow("intermediates", "critic_penultimate", critic)
+            
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -306,6 +310,9 @@ def make_train(
     env = initialize_environment(config)
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
+    gradient_covariance_timesteps = tuple(
+        int(t) for t in config["GRADIENT_COVARIANCE_TIMESTEPS"]
+    )
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -405,11 +412,16 @@ def make_train(
         else:
             env_state, obsv, restored_done, init_hstate, runner_rng = resume_runner_state
 
-        # wandb logging: cap at ~100 points over the full run. Each logged point is
-        # the running average of every step since the previous log point (accumulated
-        # as a sum/count on the host in `callback`, not stacked into an array).
+        # WandB logging: cap at ~100 points over the full run. PPO scalars are
+        # update-averaged; target/critic/TD metrics are logging-step snapshots.
         LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
-        _log_accum = {"sum": {}, "count": {}, "layout_sum": {}, "layout_count": {}, "eval_last": None}
+        _log_accum = {
+            "sum": {},
+            "count": {},
+            "layout_sum": {},
+            "layout_count": {},
+            "eval_last": None,
+        }
 
         # TRAIN LOOP
         @scan_tqdm(remaining_updates)
@@ -545,24 +557,26 @@ def make_train(
                 _cnt_raw = _mask.sum()
                 _cnt = jnp.maximum(_cnt_raw, 1.0)
                 _valid = _cnt_raw > 0
-                _mean_l = (targets * _mask).sum() / _cnt
                 target_stats[f"target_raw/{_name}/mean"] = jnp.where(
-                    _valid, _mean_l, jnp.nan
+                    _valid, (targets * _mask).sum() / _cnt, jnp.nan
                 )
-
-                _mse_l = ((_err ** 2) * _mask).sum() / _cnt
                 target_stats[f"critic/{_name}/rmse"] = jnp.where(
-                    _valid, jnp.sqrt(_mse_l), jnp.nan
+                    _valid,
+                    jnp.sqrt(((_err ** 2) * _mask).sum() / _cnt),
+                    jnp.nan,
                 )
-
-                _td_l = td_errors * _mask
                 target_stats[f"td_error/{_name}/rmse"] = jnp.where(
-                    _valid, jnp.sqrt((_td_l ** 2).sum() / _cnt), jnp.nan
+                    _valid,
+                    jnp.sqrt(((td_errors ** 2) * _mask).sum() / _cnt),
+                    jnp.nan,
                 )
 
             # ── end value target / critic quality statistics ───────────────
 
-            run_eval = jnp.equal(update_steps % LOG_INTERVAL, 0)
+            run_eval = jnp.logical_or(
+                jnp.equal(update_steps % LOG_INTERVAL, 0),
+                jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+            )
 
             def _compute_gradient_conflict(_):
                 return compute_gradient_conflict_metrics(
@@ -930,12 +944,16 @@ def make_train(
 
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
 
-            def callback(metric):
+            def callback(metric, projected_gradient_matrices=None):
                 step = int(metric["update_steps"])
+                snapshot_prefixes = (
+                    "target_raw/",
+                    "target_popart/",
+                    "critic/",
+                    "td_error/",
+                )
 
-                # Average finite training metrics over the interval. Per-key counts
-                # prevent a temporarily absent layout (NaN) from poisoning the
-                # entire interval.
+                # Average finite scalar training metrics over the interval.
                 def _accumulate(key, value):
                     value = float(value)
                     _log_accum["sum"].setdefault(key, 0.0)
@@ -946,7 +964,8 @@ def make_train(
 
                 _accumulate("returns", metric["returns"])
                 for k, v in metric["loss"].items():
-                    _accumulate(k, v)
+                    if not k.startswith(snapshot_prefixes):
+                        _accumulate(k, v)
 
                 if "eval_returns" in metric:
                     if np.isfinite(float(metric["eval_returns"]["mean"])):
@@ -961,20 +980,6 @@ def make_train(
                         _log_accum["eval_last"] = eval_last
 
                 if config["ENV_NAME"] == "overcooked":
-                    maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
-                    active = maze_map[:, 4:13, 4:13, 0]  # (num_envs, 9, 9)
-                    layout_counts = {name: 0 for name in EVAL_LAYOUTS_9}
-                    for e in range(maze_map.shape[0]):
-                        label = classify_layout(active[e])
-                        if label in layout_counts:
-                            layout_counts[label] += 1
-                    total = maze_map.shape[0]
-                    for name in EVAL_LAYOUTS_9:
-                        _accumulate(
-                            f"layout_ratio/{name}",
-                            layout_counts[name] / total,
-                        )
-
                     ep_rets = np.array(metric["episode_returns_step"])   # (NUM_STEPS, NUM_ENVS)
                     ep_done = np.array(metric["episode_done_step"]).astype(bool)
                     layout_ids = np.array(metric["layout_ids"])  # (NUM_STEPS, NUM_ENVS), pre-step layout
@@ -983,7 +988,10 @@ def make_train(
                         _log_accum["layout_sum"][label] = _log_accum["layout_sum"].get(label, 0.0) + float(ep_rets[t, e])
                         _log_accum["layout_count"][label] = _log_accum["layout_count"].get(label, 0) + 1
 
-                if step % LOG_INTERVAL == 0:
+                if (
+                    step % LOG_INTERVAL == 0
+                    or step == int(config["NUM_UPDATES"]) - 1
+                ):
                     log_dict = {
                         "update_step": step,
                         "env_step": int(step * config["NUM_ENVS"] * config["NUM_STEPS"]),
@@ -991,6 +999,12 @@ def make_train(
                     for k, s in _log_accum["sum"].items():
                         cnt = _log_accum["count"][k]
                         log_dict[k] = s / cnt if cnt > 0 else float("nan")
+
+                    # Target/critic/TD statistics are snapshots from this
+                    # logging update, for both total and per-layout metrics.
+                    for k, v in metric["loss"].items():
+                        if k.startswith(snapshot_prefixes):
+                            log_dict[k] = float(v)
 
                     if _log_accum["eval_last"] is not None:
                         log_dict["eval/mean"] = _log_accum["eval_last"]["mean"]
@@ -1016,6 +1030,15 @@ def make_train(
                             log_dict[f"train_returns/{name}"] = (
                                 _log_accum["layout_sum"][name] / c if c > 0 else float("nan")
                             )
+
+                    if projected_gradient_matrices is not None:
+                        heatmaps = render_projected_gradient_cosine_heatmaps(
+                            projected_gradient_matrices,
+                            gradient_covariance_timesteps,
+                        )
+                        for key, rgba in heatmaps.items():
+                            log_dict[key] = wandb.Image(rgba)
+
                     # Use the actual PPO update as WandB's global x-axis, rather than
                     # the number of times logging has occurred.
                     wandb.log(log_dict, step=step)
@@ -1030,12 +1053,52 @@ def make_train(
 
             callback_metric = {
                 **metric,
-                "env_state": env_state,
                 "episode_returns_step": episode_returns_step,
                 "episode_done_step": episode_done_step,
                 "layout_ids": _layout_ids_full,
             }
-            jax.experimental.io_callback(callback, None, callback_metric)
+
+            # Heatmaps are calculated and transferred only at diagnostic updates.
+            # They never enter `metric`, so the outer update scan cannot stack a
+            # NUM_UPDATES x 2 x 3 x NUM_ENVS x NUM_ENVS tensor.
+            def _callback_with_gradient_matrices(_):
+                projected_matrices = compute_projected_gradient_cosine_matrices(
+                    network=network,
+                    original_params=original_params,
+                    initial_hstate=initial_hstate,
+                    traj_batch=traj_batch,
+                    advantages=advantages,
+                    value_targets=targets,
+                    config=config,
+                    num_agents=env.num_agents,
+                    value_trunk_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'Dense_11',
+                    ),
+                    actor_trunk_keys=(
+                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
+                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
+                    ),
+                )
+                return jax.experimental.io_callback(
+                    callback,
+                    None,
+                    callback_metric,
+                    projected_matrices,
+                    ordered=True,
+                )
+
+            def _callback_without_gradient_matrices(_):
+                return jax.experimental.io_callback(
+                    callback, None, callback_metric, ordered=True
+                )
+
+            jax.lax.cond(
+                run_eval,
+                _callback_with_gradient_matrices,
+                _callback_without_gradient_matrices,
+                operand=None,
+            )
 
             def ckpt_callback(
                 params, opt_state_, tx_step, step,
@@ -1067,6 +1130,7 @@ def make_train(
                         ckpt_callback, None,
                         train_state.params, train_state.opt_state, train_state.step,
                         update_steps, env_state, last_obs, last_done, hstate, rng,
+                        ordered=True,
                     ),
                     lambda _: None,
                     operand=None,
@@ -1090,7 +1154,12 @@ def make_train(
                 is_last_step = jnp.equal(update_steps, num_updates_total - 1)
                 jax.lax.cond(
                     is_last_step,
-                    lambda _: jax.experimental.io_callback(final_save_callback, None, train_state.params),
+                    lambda _: jax.experimental.io_callback(
+                        final_save_callback,
+                        None,
+                        train_state.params,
+                        ordered=True,
+                    ),
                     lambda _: None,
                     operand=None,
                 )

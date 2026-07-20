@@ -339,9 +339,16 @@ def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
         names.append(f"sample_share/{layout_name}")
 
     for loss_type in ("actor", "value"):
+        norm_role = "actor" if loss_type == "actor" else "critic"
         for layout_name in layout_names:
-            names.append(f"grad_conflict_{loss_type}/norm/{layout_name}")
-        names.append(f"grad_conflict_{loss_type}/norm/total")
+            names.append(f"grad_norm_{norm_role}/{layout_name}")
+            names.append(
+                f"grad_contribution_magnitude_{norm_role}/{layout_name}"
+            )
+            names.append(
+                f"grad_contribution_signed_{norm_role}/{layout_name}"
+            )
+        names.append(f"grad_norm_{norm_role}/total")
 
         for i, layout_i in enumerate(layout_names):
             for layout_j in layout_names[i + 1:]:
@@ -384,6 +391,7 @@ def compute_gradient_conflict_metrics(
     layout_names,
     config,
     num_agents,
+    pairing_key,
     value_trunk_keys,
     actor_trunk_keys,
 ):
@@ -470,9 +478,10 @@ def compute_gradient_conflict_metrics(
     
     for _loss_type, _s in _gc_state.items():
         _valid_layout = _sample_counts_arr > 0
+        _norm_role = "actor" if _loss_type == "actor" else "critic"
         # per-layout gradient norms
         for _i in range(_num_layouts):
-            grad_conflict[f"grad_conflict_{_loss_type}/norm/{layout_names[_i]}"] = (
+            grad_conflict[f"grad_norm_{_norm_role}/{layout_names[_i]}"] = (
                 jnp.where(
                     _valid_layout[_i],
                     jnp.sqrt(_s['norms_sq'][_i]),
@@ -511,7 +520,7 @@ def compute_gradient_conflict_metrics(
         # `_g_all` is the count-weighted sum of per-layout mean gradients.
         # Divide by the total count so this norm is directly comparable with
         # each per-layout mean-gradient norm above.
-        grad_conflict[f"grad_conflict_{_loss_type}/norm/total"] = (
+        grad_conflict[f"grad_norm_{_norm_role}/total"] = (
             jnp.sqrt(_norm_all_sq) / _sample_total
         )
         for _i in range(_num_layouts):
@@ -524,6 +533,25 @@ def compute_gradient_conflict_metrics(
                 jnp.nan,
             )
             grad_conflict[f"grad_conflict_{_loss_type}/alignment/{layout_names[_i]}"] = _align
+            # Two complementary layout-update signals:
+            #   magnitude = sample_share_i * ||mean_gradient_i||
+            #   signed = magnitude * cos(mean_gradient_i, combined_gradient)
+            # The first ignores direction; the second is signed and measures
+            # the component along the actual combined update direction.
+            _sample_share_i = _sample_counts_arr[_i] / _sample_total
+            _weighted_magnitude = jnp.where(
+                _valid_layout[_i],
+                _sample_share_i * jnp.sqrt(_s['norms_sq'][_i]),
+                jnp.nan,
+            )
+            grad_conflict[
+                f"grad_contribution_magnitude_{_norm_role}/{layout_names[_i]}"
+            ] = _weighted_magnitude
+            grad_conflict[
+                f"grad_contribution_signed_{_norm_role}/{layout_names[_i]}"
+            ] = jnp.where(
+                _valid_layout[_i], _weighted_magnitude * _align, jnp.nan
+            )
             # Remove the layout's full count-weighted contribution.
             _g_others = jax.tree.map(
                 lambda ga, gi: ga - _sample_counts_arr[_i] * gi,
@@ -647,6 +675,11 @@ def compute_gradient_conflict_metrics(
     _n_envs = config["NUM_ENVS"]
     _n_agents = num_agents
     _n_chunks = _n_envs // _CHUNK
+    # Form a new random perfect matching at every diagnostic update.  After
+    # permutation, adjacent slots make NUM_ENVS / 2 disjoint unordered pairs.
+    # This keeps the streaming memory footprint while avoiding a fixed
+    # environment-slot pairing bias.
+    _env_permutation = jax.random.permutation(pairing_key, _n_envs)
     
     # batchify is agent-major:
     # (T, agents * envs, ...) -> (chunks, chunk, T, agents, ...)
@@ -655,6 +688,7 @@ def compute_gradient_conflict_metrics(
             (x.shape[0], _n_agents, _n_envs) + x.shape[2:]
         )
         x = jnp.moveaxis(x, 2, 0)
+        x = jnp.take(x, _env_permutation, axis=0)
         return x.reshape((_n_chunks, _CHUNK) + x.shape[1:])
     
     _obs_ec = _to_env_chunks(_gc_traj.obs)
@@ -665,14 +699,16 @@ def compute_gradient_conflict_metrics(
     _action_ec = _to_env_chunks(_gc_traj.action)
     _logprob_ec = _to_env_chunks(_gc_traj.log_prob)
     _adv_ec = _to_env_chunks(_gc_adv)
-    _hstate_ec = jax.tree.map(
-        lambda h: jnp.moveaxis(
+    def _hstate_to_env_chunks(h):
+        h = jnp.moveaxis(
             h.reshape((_n_agents, _n_envs) + h.shape[1:]), 1, 0
-        ).reshape(
-            (_n_chunks, _CHUNK, _n_agents) + h.shape[1:]
-        ),
-        initial_hstate,
-    )
+        )
+        h = jnp.take(h, _env_permutation, axis=0)
+        return h.reshape(
+            (_n_chunks, _CHUNK, _n_agents) + h.shape[2:]
+        )
+
+    _hstate_ec = jax.tree.map(_hstate_to_env_chunks, initial_hstate)
     
     def _accumulate_env_gradients(carry, env_data):
         (
@@ -719,8 +755,8 @@ def compute_gradient_conflict_metrics(
         )
 
         # Estimate sign-sensitive pair statistics without retaining all
-        # NUM_ENVS gradients. Consecutive environment slots form disjoint
-        # pairs, giving NUM_ENVS / 2 pair samples per update.
+        # NUM_ENVS gradients. Adjacent slots in the randomized order form a
+        # perfect matching, giving NUM_ENVS / 2 pair samples per update.
         _pair_cosine_value = _tdot(_pending_unit_value, _unit_value)
         _pair_cosine_actor = _tdot(_pending_unit_actor, _unit_actor)
         _pair_weight = _has_pending.astype(jnp.float32)

@@ -35,7 +35,13 @@ from gradient_conflict_utils import (
     empty_gradient_conflict_metrics,
     render_projected_gradient_cosine_heatmaps,
 )
-from representation_metrics import compute_penultimate_metrics, empty_penultimate_metrics
+from representation_metrics import (
+    compute_penultimate_metrics,
+    empty_penultimate_metrics,
+    tree_global_l2_norm,
+    tree_group_leaf_count_weighted_rms_norm,
+    tree_leaf_count_weighted_rms_norm,
+)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -171,6 +177,29 @@ class ActorCriticRNN(nn.Module):
     def __call__(self, hidden, x):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
+
+        # Intermediate feature norms are only materialized during the
+        # diagnostic apply(..., mutable=["intermediates"]) call.  Recording
+        # scalars here avoids retaining every Conv/Dense activation while
+        # adding no norm-computation overhead to ordinary rollout/update
+        # forwards.
+        collect_intermediates = (
+            not self.is_initializing()
+            and self.is_mutable_collection("intermediates")
+        )
+
+        def record_feature_norm(name, features):
+            if collect_intermediates:
+                feature_vectors = features.reshape(
+                    (batch_size, num_envs, -1)
+                )
+                mean_norm = jnp.mean(
+                    jnp.linalg.norm(feature_vectors, axis=-1)
+                )
+                self.sow(
+                    "intermediates", f"feature_norm_{name}", mean_norm
+                )
+
         if self.config["CONV_NET"]:
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
@@ -185,6 +214,7 @@ class ActorCriticRNN(nn.Module):
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
+            record_feature_norm("shared_conv_0", embedding)
             embedding = nn.Conv(
                 # features=32 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked") else self.config["FC_DIM_SIZE"],
                 features=32,
@@ -193,6 +223,7 @@ class ActorCriticRNN(nn.Module):
                 bias_init=constant(0.0),
             )(embedding)
             embedding = nn.relu(embedding)
+            record_feature_norm("shared_conv_1", embedding)
 
             embedding = embedding.reshape((batch_size, num_envs, -1))
         else:
@@ -202,6 +233,7 @@ class ActorCriticRNN(nn.Module):
             self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
+        record_feature_norm("shared_dense_0", embedding)
 
         embedding = nn.Dense(
             # self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
@@ -209,6 +241,7 @@ class ActorCriticRNN(nn.Module):
             kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
+        record_feature_norm("shared_dense_1", embedding)
 
         if self.config["LSTM"]:
             rnn_in = (embedding, dones)
@@ -217,6 +250,7 @@ class ActorCriticRNN(nn.Module):
             embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
             embedding = nn.relu(embedding)
         embedding = embedding.reshape((batch_size, num_envs, -1))
+        record_feature_norm("shared_recurrent", embedding)
 
         #########
         # Actor
@@ -225,19 +259,23 @@ class ActorCriticRNN(nn.Module):
             embedding
         )
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_0", actor_mean)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
             actor_mean
         )
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_1", actor_mean)
         actor_mean = nn.Dense(
             self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_2", actor_mean)
         if self.config["ENV_NAME"] == "overcooked":
             actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 actor_mean
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
+            record_feature_norm("actor_hidden_3", actor_mean)
 
         if not self.is_initializing():
             self.sow("intermediates", "actor_penultimate", actor_mean)
@@ -255,19 +293,23 @@ class ActorCriticRNN(nn.Module):
             embedding
         )
         critic = nn.relu(critic)
+        record_feature_norm("critic_hidden_0", critic)
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             critic
         )
         critic = nn.relu(critic)
+        record_feature_norm("critic_hidden_1", critic)
         if self.config["ENV_NAME"] == "overcooked":
             critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
             critic = nn.relu(critic)  # extra layer 1
+            record_feature_norm("critic_hidden_2", critic)
             critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
+            record_feature_norm("critic_hidden_3", critic)
 
         if not self.is_initializing():
             self.sow("intermediates", "critic_penultimate", critic)
@@ -590,6 +632,9 @@ def make_train(
                     layout_names=_LAYOUT_NAMES,
                     config=config,
                     num_agents=env.num_agents,
+                    pairing_key=jax.random.fold_in(
+                        jax.random.PRNGKey(config["SEED"]), update_steps
+                    ),
                     value_trunk_keys=(
                         'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
                         'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'Dense_11',
@@ -691,8 +736,42 @@ def make_train(
                     total_loss, grads = grad_fn(
                         train_state.params, init_hstate, traj_batch, advantages, targets
                     )
+                    gradient_global_norm = tree_global_l2_norm(grads)
+                    gradient_weighted_rms_norm = (
+                        tree_leaf_count_weighted_rms_norm(grads)
+                    )
+                    actor_gradient_weighted_rms_norm = (
+                        tree_group_leaf_count_weighted_rms_norm(
+                            grads,
+                            (
+                                'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1',
+                                'ScannedRNN_0', 'Dense_2', 'Dense_3', 'Dense_4',
+                                'Dense_5', 'Dense_6',
+                            ),
+                        )
+                    )
+                    critic_gradient_weighted_rms_norm = (
+                        tree_group_leaf_count_weighted_rms_norm(
+                            grads,
+                            (
+                                'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1',
+                                'ScannedRNN_0', 'Dense_7', 'Dense_8', 'Dense_9',
+                                'Dense_10', 'Dense_11',
+                            ),
+                        )
+                    )
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    loss, loss_aux = total_loss
+                    return train_state, (
+                        loss,
+                        (
+                            *loss_aux,
+                            gradient_global_norm,
+                            gradient_weighted_rms_norm,
+                            actor_gradient_weighted_rms_norm,
+                            critic_gradient_weighted_rms_norm,
+                        ),
+                    )
 
                 (
                     train_state,
@@ -784,6 +863,10 @@ def make_train(
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
+                "gradient_norm/global_norm": loss_info[1][6],
+                "gradient_norm/weighted_rms_norm": loss_info[1][7],
+                "gradient_norm/actor_weighted_rms_norm": loss_info[1][8],
+                "gradient_norm/critic_weighted_rms_norm": loss_info[1][9],
                 **target_stats,
             }
             metric["gradient_conflict"] = grad_conflict

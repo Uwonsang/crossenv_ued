@@ -73,7 +73,7 @@
   "human_proxy_num_seeds": 5
 # for gradient conflict
 "DIAGNOSTIC_WINDOW_STEPS": 32  # rollout steps used by gradient/representation diagnostics
-"GRAD_CONFLICT_CHUNK_SIZE": 32  # must evenly divide NUM_ENVS (one sample contains both actors)
+"GRAD_CONFLICT_CHUNK_SIZE": 64  # must evenly divide NUM_ENVS (one sample contains both actors)
 "GRADIENT_COVARIANCE_TIMESTEPS": [0, 16, 31]  # 0-indexed joint-transition heatmaps
 "GRADIENT_COVARIANCE_SKETCH_DIM": 1025  # signed feature-hash size; avoids storing full gradients
 "GRADIENT_COVARIANCE_SKETCH_SEED": 0  # fixed across checkpoints/runs for comparable projections

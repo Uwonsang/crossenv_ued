@@ -4,29 +4,102 @@ import jax
 import jax.numpy as jnp
 
 
-def weight_l2_norm(params):
-    """Global L2 norm of matrix/tensor weights, excluding 1-D parameters.
+INTERMEDIATE_FEATURE_GROUPS = {
+    "shared": (
+        "shared_conv_0",
+        "shared_conv_1",
+        "shared_dense_0",
+        "shared_dense_1",
+        "shared_recurrent",
+    ),
+    "actor": (
+        "actor_hidden_0",
+        "actor_hidden_1",
+        "actor_hidden_2",
+        "actor_hidden_3",
+    ),
+    "critic": (
+        "critic_hidden_0",
+        "critic_hidden_1",
+        "critic_hidden_2",
+        "critic_hidden_3",
+    ),
+}
 
-    This matches the common layer-weight convention used by the reference
-    PyTorch metrics: Dense/Conv/RNN kernels are included, while biases and
-    LayerNorm scale/shift parameters are excluded.
-    """
+INTERMEDIATE_FEATURE_NAMES = tuple(
+    name
+    for names in INTERMEDIATE_FEATURE_GROUPS.values()
+    for name in names
+)
+
+
+def tree_global_l2_norm(tree):
+    """Global L2 norm over every array leaf in a pytree."""
     squared_norm = sum(
         (
             jnp.sum(jnp.square(x))
-            for x in jax.tree_util.tree_leaves(params)
-            if x.ndim > 1
+            for x in jax.tree_util.tree_leaves(tree)
         ),
         jnp.asarray(0.0),
     )
     return jnp.sqrt(squared_norm)
 
 
+def weight_l2_norm(params):
+    """Global L2 norm over every parameter leaf.
+
+    Dense/Conv/RNN kernels, biases, and any 1-D learned scale/shift parameters
+    are all included. This is equivalent to flattening and concatenating the
+    complete parameter pytree before taking one L2 norm.
+    """
+    return tree_global_l2_norm(params)
+
+
 def parameter_group_l2_norm(params, module_names):
-    """Matrix/tensor-weight L2 norm for selected Flax parameter modules."""
+    """All-leaf global L2 norm for selected Flax parameter modules."""
     param_tree = params["params"] if "params" in params else params
     selected = {name: param_tree[name] for name in module_names}
     return weight_l2_norm(selected)
+
+
+def tree_leaf_count_weighted_rms_norm(tree):
+    """Leaf-size-weighted RMS of leaf L2 norms for an array pytree."""
+    leaves = jax.tree_util.tree_leaves(tree)
+    dtype = leaves[0].dtype
+    numerator = sum(
+        (
+            jnp.asarray(leaf.size, dtype=dtype)
+            * jnp.sum(jnp.square(leaf))
+            for leaf in leaves
+        ),
+        jnp.asarray(0.0, dtype=dtype),
+    )
+    denominator = sum(leaf.size for leaf in leaves)
+    return jnp.sqrt(
+        numerator / jnp.asarray(denominator, dtype=dtype)
+    )
+
+
+def parameter_count_weighted_rms(params):
+    """SimbaV2-style parameter-count weighted RMS of leaf L2 norms.
+
+    For leaves ``theta_i`` with ``n_i`` elements, this computes
+    ``sqrt(sum_i n_i * ||theta_i||_2^2 / sum_i n_i)``. All leaves, including
+    biases and learned 1-D scale/shift parameters, participate.
+    """
+    return tree_leaf_count_weighted_rms_norm(params)
+
+
+def tree_group_leaf_count_weighted_rms_norm(tree, module_names):
+    """Leaf-size-weighted RMS for selected Flax parameter modules."""
+    module_tree = tree["params"] if "params" in tree else tree
+    selected = {name: module_tree[name] for name in module_names}
+    return tree_leaf_count_weighted_rms_norm(selected)
+
+
+def parameter_group_count_weighted_rms(params, module_names):
+    """Weighted RMS for all leaves in selected Flax parameter modules."""
+    return tree_group_leaf_count_weighted_rms_norm(params, module_names)
 
 
 def feature_metrics(features, cutoff=0.01):
@@ -151,11 +224,13 @@ def compute_penultimate_metrics(
     critic_param_keys,
     cutoff=0.01,
 ):
-    """Measure weights and actor/critic penultimate activations.
+    """Measure weights, penultimate spectra, and layerwise feature norms.
 
     The network must sow ``actor_penultimate`` and ``critic_penultimate`` into
-    Flax's ``intermediates`` collection. Time and actor axes are combined into
-    the observation/sample axis before computing the SVD.
+    Flax's ``intermediates`` collection. It also sows scalar mean per-sample
+    L2 norms for the shared, actor, and critic hidden layers. Time and actor
+    axes are combined into the observation/sample axis before computing the
+    penultimate SVD.
     """
     _, intermediates = network.apply(
         params,
@@ -178,6 +253,15 @@ def compute_penultimate_metrics(
         "representation_weight/critic_weight_norm": parameter_group_l2_norm(
             params, critic_param_keys
         ),
+        "representation_weight/weighted_rms_norm": (
+            parameter_count_weighted_rms(params)
+        ),
+        "representation_weight/actor_weighted_rms_norm": (
+            parameter_group_count_weighted_rms(params, actor_param_keys)
+        ),
+        "representation_weight/critic_weighted_rms_norm": (
+            parameter_group_count_weighted_rms(params, critic_param_keys)
+        ),
     }
     rank_names = {
         "feature_rank",
@@ -197,6 +281,41 @@ def compute_penultimate_metrics(
                 else "representation_feature"
             )
             metrics[f"{namespace}/{role}_{name}"] = value
+
+    # Match SimbaV2's layer-level definition internally: each value is the
+    # batch mean of per-sample L2 feature norms. Only actor/critic path totals
+    # are exported, so the individual layer values do not clutter W&B.
+    layer_norms = {}
+    for name in INTERMEDIATE_FEATURE_NAMES:
+        captured_name = f"feature_norm_{name}"
+        layer_norms[name] = (
+            captured[captured_name][0]
+            if captured_name in captured
+            else jnp.asarray(jnp.nan, dtype=actor_features.dtype)
+        )
+
+    def _sum_present(group):
+        present_values = [
+            layer_norms[name]
+            for name in INTERMEDIATE_FEATURE_GROUPS[group]
+            if f"feature_norm_{name}" in captured
+        ]
+        return sum(
+            present_values,
+            jnp.asarray(0.0, dtype=actor_features.dtype),
+        )
+
+    # Totals are simple sums of layer mean norms, as in SimbaV2's
+    # featnorm_total. Actor/critic totals include the shared feature path.
+    shared_total = _sum_present("shared")
+    actor_branch_total = _sum_present("actor")
+    critic_branch_total = _sum_present("critic")
+    metrics["representation_feature_total/actor_feature_norm"] = (
+        shared_total + actor_branch_total
+    )
+    metrics["representation_feature_total/critic_feature_norm"] = (
+        shared_total + critic_branch_total
+    )
     return metrics
 
 
@@ -206,6 +325,9 @@ def empty_penultimate_metrics(dtype=jnp.float32):
         "representation_weight/weight_norm",
         "representation_weight/actor_weight_norm",
         "representation_weight/critic_weight_norm",
+        "representation_weight/weighted_rms_norm",
+        "representation_weight/actor_weighted_rms_norm",
+        "representation_weight/critic_weighted_rms_norm",
         "representation_feature/actor_feature_norm",
         "representation_feature/actor_lambda_1",
         "representation_feature/actor_lambda_1_ratio",
@@ -224,5 +346,9 @@ def empty_penultimate_metrics(dtype=jnp.float32):
         "representation_rank/critic_srank_kumar",
         "representation_rank/critic_approximate_rank_pca",
         "representation_rank/critic_matrix_rank",
+    )
+    names = names + (
+        "representation_feature_total/actor_feature_norm",
+        "representation_feature_total/critic_feature_norm",
     )
     return {name: jnp.asarray(jnp.nan, dtype=dtype) for name in names}

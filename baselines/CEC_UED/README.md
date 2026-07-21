@@ -22,20 +22,26 @@ $$
 
 | 종류 | 기록 방식 |
 |---|---|
-| PPO loss, entropy, ratio, optimizer gradient norm, `returns` | interval 동안 finite 값의 평균 |
+| PPO loss, entropy, ratio, optimizer gradient norm, parameter weight norm, `returns` | interval 동안 finite 값의 평균 |
 | target, critic RMSE, TD-error RMSE | 해당 logging update의 rollout snapshot |
-| gradient conflict, representation, gradient heatmap | 해당 logging update에서만 계산한 pre-update snapshot |
+| gradient conflict, representation feature/rank, gradient heatmap | 해당 logging update에서만 계산한 pre-update snapshot |
 | evaluation | 가장 최근 diagnostic evaluation 결과 |
 | layout별 training return | interval에서 종료된 episode들의 평균 |
 
 마지막 PPO update는 interval 경계와 일치하지 않더라도 기록된다. Gradient
-conflict와 representation은 PPO parameter update 직전의 parameter 및 rollout로
-계산된다.
+conflict와 representation feature/rank는 PPO parameter update 직전의 parameter
+및 rollout로 계산된다. Weight norm은 각 PPO minibatch optimizer step 직전
+parameter에서 계산하지만 W&B 값은 interval 동안 평균한다.
 
 ## 표기법
 
 - $N$: environment sample 수. 기본 설정에서는 `NUM_ENVS=256`.
-- $T_d$: `DIAGNOSTIC_WINDOW_STEPS`.
+- $T_d$: gradient conflict에 사용하는 rollout 앞부분의 길이
+  (`DIAGNOSTIC_WINDOW_STEPS`).
+- $T_r$: actor별 representation random timestep 수. 현재는 계산량 기준을
+  맞추기 위해 `DIAGNOSTIC_WINDOW_STEPS`와 같은 값을 사용한다.
+- $A$: `NUM_ACTORS`. 기본 Overcooked 설정에서는 environment당 두 actor이므로
+  $A=2N$이다.
 - $g_i$: environment sample $i$ 또는 layout $i$의 gradient.
 - $\theta_k$: parameter tree의 $k$번째 array leaf.
 - $n_k$: $\theta_k$의 원소 수.
@@ -347,7 +353,11 @@ cosine과 dot-product 행렬은 하나의 projected Gram matrix에서 함께 계
 ## Representation weight metrics
 
 현재 weight metric은 kernel뿐 아니라 bias와 learned 1D scale/shift를 포함한
-모든 parameter leaf를 사용한다.
+모든 parameter leaf를 사용한다. SimBaV2의 update-level parameter norm과
+맞추기 위해 각 PPO minibatch optimizer step 직전 parameter에서 계산한다.
+먼저 한 PPO update의 epoch/minibatch 전체를 평균하고, W&B에는 다시 logging
+interval 동안의 update 평균을 기록한다. 따라서 이 지표는 diagnostic snapshot이
+아니다.
 
 $$
 \|\theta\|_2=
@@ -378,7 +388,23 @@ CEC와 PopArt CEC의 `critic_weight_norm`을 직접 비교할 때 주의해야 �
 
 Actor와 critic의 마지막 output layer 직전 activation으로 $\Phi$를 구성한다.
 Feature를 mean-center하지 않으므로 아래 spectrum은 centered covariance가 아니라
-uncentered feature matrix의 spectrum이다.
+uncentered feature matrix의 spectrum이다. SimBaV2의 별도 metric replay batch에
+대응하여, CEC에서는 diagnostic interval의 최신 on-policy rollout 전체에서
+actor마다 `DIAGNOSTIC_WINDOW_STEPS`개의 timestep을 중복 없이 독립적으로
+무작위 선택한다. Rollout을 처음부터 순차 재생하므로 선택한 각 transition의
+episode reset과 LSTM state가 data collection 당시와 일치한다. 모든 timestep의
+hidden state를 저장하지 않고 선택한 feature만 고정 크기 buffer에 보관한다.
+
+각 actor에서 선택한 timestep의 feature를 개별 sample로 사용하며, 같은
+environment의 두 actor를 평균하거나 concatenate하지 않는다. 따라서 두 actor는
+서로 독립적인 feature sample이고, feature matrix의 sample 수는
+
+$$
+M=T_rA
+$$
+
+이다. 기본값에서는 $M=32\times512=16{,}384$다. 이 값들은 interval 평균이
+아니라 해당 pre-update parameter와 rollout의 snapshot이다.
 
 ### Feature norm
 

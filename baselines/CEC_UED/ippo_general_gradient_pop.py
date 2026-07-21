@@ -37,12 +37,27 @@ from gradient_conflict_utils import (
     render_projected_gradient_heatmaps,
 )
 from representation_metrics import (
-    compute_penultimate_metrics,
+    compute_sampled_recurrent_penultimate_metrics,
+    compute_weight_metrics,
     empty_penultimate_metrics,
+    sample_recurrent_timesteps,
     tree_global_l2_norm,
     tree_group_leaf_count_weighted_rms_norm,
     tree_leaf_count_weighted_rms_norm,
 )
+
+
+# Parameter groups used consistently by gradient diagnostics and norm metrics.
+# Each group contains the shared encoder/RNN, its branch, and its output head.
+ACTOR_TRUNK_KEYS = (
+    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
+    "Dense_2", "Dense_3", "Dense_4", "Dense_5", "Dense_6",
+)
+VALUE_TRUNK_KEYS = (
+    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
+    "Dense_7", "Dense_8", "Dense_9", "Dense_10", "critic_output",
+)
+
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -181,8 +196,8 @@ class ActorCriticRNN(nn.Module):
         batch_size, num_envs, flattened_obs_dim = obs.shape
 
         # Intermediate feature norms are only materialized during the
-        # diagnostic apply(..., mutable=["intermediates"]) call.  Recording
-        # scalars here avoids retaining every Conv/Dense activation while
+        # diagnostic apply(..., mutable=["intermediates"]) call. Recording
+        # per-sample norms avoids retaining every Conv/Dense activation while
         # adding no norm-computation overhead to ordinary rollout/update
         # forwards.
         collect_intermediates = (
@@ -195,11 +210,9 @@ class ActorCriticRNN(nn.Module):
                 feature_vectors = features.reshape(
                     (batch_size, num_envs, -1)
                 )
-                mean_norm = jnp.mean(
-                    jnp.linalg.norm(feature_vectors, axis=-1)
-                )
+                sample_norms = jnp.linalg.norm(feature_vectors, axis=-1)
                 self.sow(
-                    "intermediates", f"feature_norm_{name}", mean_norm
+                    "intermediates", f"feature_norm_{name}", sample_norms
                 )
 
         if self.config["CONV_NET"]:
@@ -664,14 +677,8 @@ def make_train(
                     pairing_key=jax.random.fold_in(
                         jax.random.PRNGKey(config["SEED"]), update_steps
                     ),
-                    value_trunk_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'critic_output',
-                    ),
-                    actor_trunk_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
-                    ),
+                    value_trunk_keys=VALUE_TRUNK_KEYS,
+                    actor_trunk_keys=ACTOR_TRUNK_KEYS,
                 )
 
             grad_conflict = jax.lax.cond(
@@ -681,25 +688,31 @@ def make_train(
                 operand=None,
             )
 
-            # Measure representations at the same pre-update parameter state
-            # and on the same rollout window used by the conflict diagnostics.
+            # Measure representations at the same pre-update parameter state.
+            # Sample timesteps across the complete rollout, replay recurrent
+            # history exactly, and keep every actor as an independent sample.
             def _compute_representation_metrics(_):
-                repr_traj = jax.tree.map(
-                    lambda x: x[:config["DIAGNOSTIC_WINDOW_STEPS"]], traj_batch
+                sampled_timesteps = sample_recurrent_timesteps(
+                    jax.random.fold_in(
+                        jax.random.fold_in(
+                            jax.random.PRNGKey(config["SEED"]), update_steps
+                        ),
+                        1,
+                    ),
+                    config["NUM_STEPS"],
+                    config["DIAGNOSTIC_WINDOW_STEPS"],
+                    config["NUM_ACTORS"],
                 )
-                return compute_penultimate_metrics(
+                return compute_sampled_recurrent_penultimate_metrics(
                     network,
                     original_params,
                     initial_hstate,
-                    (repr_traj.obs, repr_traj.done, repr_traj.agent_positions),
-                    actor_param_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
+                    (
+                        traj_batch.obs,
+                        traj_batch.done,
+                        traj_batch.agent_positions,
                     ),
-                    critic_param_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'critic_output',
-                    ),
+                    sampled_timesteps,
                 )
 
             representation_metrics = jax.lax.cond(
@@ -773,22 +786,22 @@ def make_train(
                     actor_gradient_weighted_rms_norm = (
                         tree_group_leaf_count_weighted_rms_norm(
                             grads,
-                            (
-                                'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1',
-                                'ScannedRNN_0', 'Dense_2', 'Dense_3', 'Dense_4',
-                                'Dense_5', 'Dense_6',
-                            ),
+                            ACTOR_TRUNK_KEYS,
                         )
                     )
                     critic_gradient_weighted_rms_norm = (
                         tree_group_leaf_count_weighted_rms_norm(
                             grads,
-                            (
-                                'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1',
-                                'ScannedRNN_0', 'Dense_7', 'Dense_8', 'Dense_9',
-                                'Dense_10', 'critic_output',
-                            ),
+                            VALUE_TRUNK_KEYS,
                         )
+                    )
+                    # Match SimBaV2's optimizer-update semantics: measure the
+                    # parameter state used by this minibatch immediately before
+                    # applying its gradient, then average across minibatches.
+                    minibatch_weight_metrics = compute_weight_metrics(
+                        train_state.params,
+                        actor_param_keys=ACTOR_TRUNK_KEYS,
+                        critic_param_keys=VALUE_TRUNK_KEYS,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
@@ -800,6 +813,24 @@ def make_train(
                             gradient_weighted_rms_norm,
                             actor_gradient_weighted_rms_norm,
                             critic_gradient_weighted_rms_norm,
+                            minibatch_weight_metrics[
+                                "representation_weight/weight_norm"
+                            ],
+                            minibatch_weight_metrics[
+                                "representation_weight/actor_weight_norm"
+                            ],
+                            minibatch_weight_metrics[
+                                "representation_weight/critic_weight_norm"
+                            ],
+                            minibatch_weight_metrics[
+                                "representation_weight/weighted_rms_norm"
+                            ],
+                            minibatch_weight_metrics[
+                                "representation_weight/actor_weighted_rms_norm"
+                            ],
+                            minibatch_weight_metrics[
+                                "representation_weight/critic_weighted_rms_norm"
+                            ],
                         ),
                     )
 
@@ -923,6 +954,12 @@ def make_train(
                 "gradient_norm/weighted_rms_norm": loss_info[1][7],
                 "gradient_norm/actor_weighted_rms_norm": loss_info[1][8],
                 "gradient_norm/critic_weighted_rms_norm": loss_info[1][9],
+                "representation_weight/weight_norm": loss_info[1][10],
+                "representation_weight/actor_weight_norm": loss_info[1][11],
+                "representation_weight/critic_weight_norm": loss_info[1][12],
+                "representation_weight/weighted_rms_norm": loss_info[1][13],
+                "representation_weight/actor_weighted_rms_norm": loss_info[1][14],
+                "representation_weight/critic_weighted_rms_norm": loss_info[1][15],
                 **target_stats,
             }
             metric["gradient_conflict"] = grad_conflict
@@ -1210,14 +1247,8 @@ def make_train(
                     value_targets=_targets_norm,
                     config=config,
                     num_agents=env.num_agents,
-                    value_trunk_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_7', 'Dense_8', 'Dense_9', 'Dense_10', 'critic_output',
-                    ),
-                    actor_trunk_keys=(
-                        'Conv_0', 'Conv_1', 'Dense_0', 'Dense_1', 'ScannedRNN_0',
-                        'Dense_2', 'Dense_3', 'Dense_4', 'Dense_5', 'Dense_6',
-                    ),
+                    value_trunk_keys=VALUE_TRUNK_KEYS,
+                    actor_trunk_keys=ACTOR_TRUNK_KEYS,
                 )
                 return jax.experimental.io_callback(
                     callback,

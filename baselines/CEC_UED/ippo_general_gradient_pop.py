@@ -37,10 +37,10 @@ from gradient_conflict_utils import (
     render_projected_gradient_heatmaps,
 )
 from representation_metrics import (
-    compute_sampled_recurrent_penultimate_metrics,
+    compute_minibatch_penultimate_metrics,
     compute_weight_metrics,
     empty_penultimate_metrics,
-    sample_recurrent_timesteps,
+    first_epoch_first_minibatch_indices,
     tree_global_l2_norm,
     tree_group_leaf_count_weighted_rms_norm,
     tree_leaf_count_weighted_rms_norm,
@@ -688,31 +688,32 @@ def make_train(
                 operand=None,
             )
 
-            # Measure representations at the same pre-update parameter state.
-            # Sample timesteps across the complete rollout, replay recurrent
-            # history exactly, and keep every actor as an independent sample.
+            # Use exactly the actor subset that the first epoch's first PPO
+            # minibatch will consume. Time remains contiguous and each actor's
+            # matching initial recurrent state is preserved.
             def _compute_representation_metrics(_):
-                sampled_timesteps = sample_recurrent_timesteps(
-                    jax.random.fold_in(
-                        jax.random.fold_in(
-                            jax.random.PRNGKey(config["SEED"]), update_steps
-                        ),
-                        1,
-                    ),
-                    config["NUM_STEPS"],
-                    config["DIAGNOSTIC_WINDOW_STEPS"],
+                first_minibatch_indices = first_epoch_first_minibatch_indices(
+                    rng,
                     config["NUM_ACTORS"],
+                    config["NUM_MINIBATCHES"],
                 )
-                return compute_sampled_recurrent_penultimate_metrics(
+                representation_hstate = jax.tree.map(
+                    lambda h: jnp.take(h, first_minibatch_indices, axis=0),
+                    initial_hstate,
+                )
+                representation_traj = jax.tree.map(
+                    lambda x: jnp.take(x, first_minibatch_indices, axis=1),
+                    traj_batch,
+                )
+                return compute_minibatch_penultimate_metrics(
                     network,
                     original_params,
-                    initial_hstate,
+                    representation_hstate,
                     (
-                        traj_batch.obs,
-                        traj_batch.done,
-                        traj_batch.agent_positions,
+                        representation_traj.obs,
+                        representation_traj.done,
+                        representation_traj.agent_positions,
                     ),
-                    sampled_timesteps,
                 )
 
             representation_metrics = jax.lax.cond(

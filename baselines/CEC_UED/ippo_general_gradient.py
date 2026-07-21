@@ -29,6 +29,7 @@ from jax_tqdm import scan_tqdm
 import time
 import yaml
 from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
+
 from gradient_conflict_utils import (
     compute_gradient_conflict_metrics,
     compute_projected_gradient_matrices,
@@ -36,10 +37,10 @@ from gradient_conflict_utils import (
     render_projected_gradient_heatmaps,
 )
 from representation_metrics import (
-    compute_sampled_recurrent_penultimate_metrics,
+    compute_minibatch_penultimate_metrics,
     compute_weight_metrics,
     empty_penultimate_metrics,
-    sample_recurrent_timesteps,
+    first_epoch_first_minibatch_indices,
     tree_global_l2_norm,
     tree_group_leaf_count_weighted_rms_norm,
     tree_leaf_count_weighted_rms_norm,
@@ -140,7 +141,6 @@ def _is_connected_jax(passable_9x9):
     visited, _ = jax.lax.scan(_spread, visited, None, 18)
     return jnp.sum(visited) == jnp.sum(passable_9x9.astype(jnp.float32))
 
-
 def _classify_layout_jax(maze_map_9x9_ch0):
     """Return layout ID: 0=cramped_room_9, 1=asymm_advantages_9, 2=coord_ring_9,
                          3=counter_circuit_9, 4=forced_coord_9"""
@@ -198,6 +198,7 @@ class ActorCriticRNN(nn.Module):
         # per-sample norms avoids retaining every Conv/Dense activation while
         # adding no norm-computation overhead to ordinary rollout/update
         # forwards.
+
         collect_intermediates = (
             not self.is_initializing()
             and self.is_mutable_collection("intermediates")
@@ -228,6 +229,7 @@ class ActorCriticRNN(nn.Module):
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             record_feature_norm("shared_conv_0", embedding)
+
             embedding = nn.Conv(
                 # features=32 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked") else self.config["FC_DIM_SIZE"],
                 features=32,
@@ -659,31 +661,32 @@ def make_train(
                 operand=None,
             )
 
-            # Measure representations at the same pre-update parameter state.
-            # Sample timesteps across the complete rollout, replay recurrent
-            # history exactly, and keep every actor as an independent sample.
+            # Use exactly the actor subset that the first epoch's first PPO
+            # minibatch will consume. Time remains contiguous and each actor's
+            # matching initial recurrent state is preserved.
             def _compute_representation_metrics(_):
-                sampled_timesteps = sample_recurrent_timesteps(
-                    jax.random.fold_in(
-                        jax.random.fold_in(
-                            jax.random.PRNGKey(config["SEED"]), update_steps
-                        ),
-                        1,
-                    ),
-                    config["NUM_STEPS"],
-                    config["DIAGNOSTIC_WINDOW_STEPS"],
+                first_minibatch_indices = first_epoch_first_minibatch_indices(
+                    rng,
                     config["NUM_ACTORS"],
+                    config["NUM_MINIBATCHES"],
                 )
-                return compute_sampled_recurrent_penultimate_metrics(
+                representation_hstate = jax.tree.map(
+                    lambda h: jnp.take(h, first_minibatch_indices, axis=0),
+                    initial_hstate,
+                )
+                representation_traj = jax.tree.map(
+                    lambda x: jnp.take(x, first_minibatch_indices, axis=1),
+                    traj_batch,
+                )
+                return compute_minibatch_penultimate_metrics(
                     network,
                     original_params,
-                    initial_hstate,
+                    representation_hstate,
                     (
-                        traj_batch.obs,
-                        traj_batch.done,
-                        traj_batch.agent_positions,
+                        representation_traj.obs,
+                        representation_traj.done,
+                        representation_traj.agent_positions,
                     ),
-                    sampled_timesteps,
                 )
 
             representation_metrics = jax.lax.cond(

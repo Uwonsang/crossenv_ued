@@ -37,11 +37,11 @@ parameter에서 계산하지만 W&B 값은 interval 동안 평균한다.
 
 - $N$: environment sample 수. 기본 설정에서는 `NUM_ENVS=256`.
 - $T_d$: gradient conflict에 사용하는 rollout 앞부분의 길이
-  (`DIAGNOSTIC_WINDOW_STEPS`).
-- $T_r$: actor별 representation random timestep 수. 현재는 계산량 기준을
-  맞추기 위해 `DIAGNOSTIC_WINDOW_STEPS`와 같은 값을 사용한다.
+  (`GRAD_CONFLICT_WINDOW_STEPS`).
+- $T$: `NUM_STEPS`.
 - $A$: `NUM_ACTORS`. 기본 Overcooked 설정에서는 environment당 두 actor이므로
   $A=2N$이다.
+- $A_m=A/\texttt{NUM\_MINIBATCHES}$: 한 PPO minibatch의 actor 수.
 - $g_i$: environment sample $i$ 또는 layout $i$의 gradient.
 - $\theta_k$: parameter tree의 $k$번째 array leaf.
 - $n_k$: $\theta_k$의 원소 수.
@@ -215,7 +215,7 @@ Layout이 해당 diagnostic window에 존재하지 않으면 관련 layout metri
 
 ## Environment-sample gradient conflict
 
-하나의 sample은 한 environment slot의 `DIAGNOSTIC_WINDOW_STEPS` trajectory이며
+하나의 sample은 한 environment slot의 `GRAD_CONFLICT_WINDOW_STEPS` trajectory이며
 두 actor를 함께 포함한다. Episode reset을 통과하면 `done`이 recurrent state를
 reset한다. Actor와 value gradient는 별도로 측정한다.
 
@@ -389,22 +389,22 @@ CEC와 PopArt CEC의 `critic_weight_norm`을 직접 비교할 때 주의해야 �
 Actor와 critic의 마지막 output layer 직전 activation으로 $\Phi$를 구성한다.
 Feature를 mean-center하지 않으므로 아래 spectrum은 centered covariance가 아니라
 uncentered feature matrix의 spectrum이다. SimBaV2의 별도 metric replay batch에
-대응하여, CEC에서는 diagnostic interval의 최신 on-policy rollout 전체에서
-actor마다 `DIAGNOSTIC_WINDOW_STEPS`개의 timestep을 중복 없이 독립적으로
-무작위 선택한다. Rollout을 처음부터 순차 재생하므로 선택한 각 transition의
-episode reset과 LSTM state가 data collection 당시와 일치한다. 모든 timestep의
-hidden state를 저장하지 않고 선택한 feature만 고정 크기 buffer에 보관한다.
+대응하여, CEC에서는 diagnostic logging update에서 첫 PPO epoch의 첫 minibatch가
+사용할 actor permutation을 동일한 RNG로 재현한다. 해당 minibatch의 전체
+`NUM_STEPS` trajectory와 actor별 초기 LSTM state를 사용하므로 episode reset과
+recurrent history가 실제 PPO update와 일치한다. Representation은 첫 minibatch
+update 직전 parameter에서 별도 diagnostic forward로 한 번만 계산하며 학습
+gradient에는 포함되지 않는다.
 
-각 actor에서 선택한 timestep의 feature를 개별 sample로 사용하며, 같은
-environment의 두 actor를 평균하거나 concatenate하지 않는다. 따라서 두 actor는
-서로 독립적인 feature sample이고, feature matrix의 sample 수는
+같은 environment의 두 actor를 평균하거나 concatenate하지 않고 각 actor-time
+feature를 독립적인 matrix row로 사용한다. Feature matrix의 sample 수는
 
 $$
-M=T_rA
+M=TA_m
 $$
 
-이다. 기본값에서는 $M=32\times512=16{,}384$다. 이 값들은 interval 평균이
-아니라 해당 pre-update parameter와 rollout의 snapshot이다.
+이다. 기본값에서는 $M=400\times256=102{,}400$다. 이 값들은 interval 평균이
+아니라 해당 첫 epoch·첫 minibatch의 pre-update snapshot이다.
 
 ### Feature norm
 

@@ -290,195 +290,57 @@ def _assemble_penultimate_metrics(
     return metrics
 
 
-def sample_recurrent_timesteps(
-    key,
-    num_steps,
-    num_sampled_steps,
+def first_epoch_first_minibatch_indices(
+    update_rng,
     num_actors,
+    num_minibatches,
 ):
-    """Choose sorted unique rollout timesteps independently per actor."""
-    if not 0 < num_sampled_steps <= num_steps:
+    """Reproduce the actor indices used by the first PPO minibatch.
+
+    ``_update_epoch`` splits its incoming RNG once and uses the second key for
+    the actor-axis permutation. Calling this helper with that same incoming
+    RNG therefore selects exactly the actors that the first epoch's first
+    minibatch will consume, without advancing the training RNG.
+    """
+    if num_actors % num_minibatches != 0:
         raise ValueError(
-            "num_sampled_steps must be in [1, num_steps], got "
-            f"{num_sampled_steps} for num_steps={num_steps}"
+            "NUM_ACTORS must be divisible by NUM_MINIBATCHES, got "
+            f"{num_actors} and {num_minibatches}"
         )
-    actor_keys = jax.random.split(key, num_actors)
-    sampled = jax.vmap(
-        lambda actor_key: jax.random.permutation(actor_key, num_steps)[
-            :num_sampled_steps
-        ]
-    )(actor_keys)
-    # (num_sampled_steps, num_actors): each column is one actor's independently
-    # sampled, sorted rollout timesteps.
-    return jnp.sort(sampled, axis=1).T
+    _, permutation_key = jax.random.split(update_rng)
+    permutation = jax.random.permutation(permutation_key, num_actors)
+    actors_per_minibatch = num_actors // num_minibatches
+    return permutation[:actors_per_minibatch]
 
 
-def compute_sampled_recurrent_penultimate_metrics(
+def compute_minibatch_penultimate_metrics(
     network,
     params,
     initial_hstate,
     network_inputs,
-    sampled_timesteps,
     cutoff=0.01,
 ):
-    """Measure features at exact recurrent states from sampled timesteps.
+    """Measure representation metrics on one recurrent PPO minibatch.
 
-    The full rollout is replayed sequentially from ``initial_hstate`` so reset
-    boundaries and recurrent history match data collection. Only features at
-    ``sampled_timesteps`` are retained. Timesteps are sampled independently
-    for each actor. Actors from the same environment are never averaged,
-    concatenated, or otherwise grouped.
-
-    Sampling the same number of timesteps per actor keeps actor sampling
-    balanced and bounds memory by
-    ``num_sampled_steps * num_actors * feature_dim`` rather than storing every
-    recurrent state or every rollout feature.
+    The input keeps the complete rollout-time axis and a subset of the actor
+    axis, together with the matching initial recurrent states. The network
+    therefore reconstructs features with the same sequence and reset handling
+    as PPO. Time and actor axes are flattened only after features are computed;
+    actors from the same environment remain separate rows.
     """
-    obs, dones, agent_positions = network_inputs
-    num_steps = obs.shape[0]
-    num_actors = obs.shape[1]
-    num_sampled_steps = sampled_timesteps.shape[0]
-    if sampled_timesteps.shape != (num_sampled_steps, num_actors):
-        raise ValueError(
-            "sampled_timesteps must have shape "
-            "(num_sampled_steps, num_actors), got "
-            f"{sampled_timesteps.shape}"
-        )
-
-    # One shape-probing apply keeps this utility independent of actor/critic
-    # feature dimensions. Its state/output are discarded; the scan below
-    # replays the complete trajectory from the original initial_hstate.
-    (_, _, _), probe_intermediates = network.apply(
+    (_, _, _), intermediates = network.apply(
         params,
         initial_hstate,
-        (obs[:1], dones[:1], agent_positions[:1]),
+        network_inputs,
         mutable=["intermediates"],
     )
-    probe_captured = probe_intermediates["intermediates"]
-    actor_probe = probe_captured["actor_penultimate"][0][0]
-    critic_probe = probe_captured["critic_penultimate"][0][0]
-
-    actor_buffer = jnp.zeros(
-        (num_sampled_steps,) + actor_probe.shape,
-        dtype=actor_probe.dtype,
-    )
-    critic_buffer = jnp.zeros(
-        (num_sampled_steps,) + critic_probe.shape,
-        dtype=critic_probe.dtype,
-    )
-    present_layer_names = tuple(
-        name
-        for name in INTERMEDIATE_FEATURE_NAMES
-        if f"feature_norm_{name}" in probe_captured
-    )
-    layer_norm_sums = {
-        name: jnp.asarray(0.0, dtype=actor_probe.dtype)
-        for name in present_layer_names
-    }
-    actor_indices = jnp.arange(num_actors, dtype=jnp.int32)
-
-    def _replay_step(carry, step_inputs):
-        hstate, sample_cursor, actor_buffer, critic_buffer, layer_norm_sums = carry
-        step_index, step_obs, step_done, step_positions = step_inputs
-
-        (next_hstate, _, _), intermediates = network.apply(
-            params,
-            hstate,
-            (
-                step_obs[jnp.newaxis, ...],
-                step_done[jnp.newaxis, ...],
-                step_positions[jnp.newaxis, ...],
-            ),
-            mutable=["intermediates"],
-        )
-        captured = intermediates["intermediates"]
-        actor_features = captured["actor_penultimate"][0][0]
-        critic_features = captured["critic_penultimate"][0][0]
-
-        safe_cursor = jnp.minimum(sample_cursor, num_sampled_steps - 1)
-        next_sampled_steps = sampled_timesteps[
-            safe_cursor,
-            actor_indices,
-        ]
-        is_sampled = jnp.logical_and(
-            sample_cursor < num_sampled_steps,
-            step_index == next_sampled_steps,
-        )
-
-        previous_actor_features = actor_buffer[
-            safe_cursor,
-            actor_indices,
-        ]
-        previous_critic_features = critic_buffer[
-            safe_cursor,
-            actor_indices,
-        ]
-        actor_buffer = actor_buffer.at[
-            safe_cursor,
-            actor_indices,
-        ].set(
-            jnp.where(
-                is_sampled[:, jnp.newaxis],
-                actor_features,
-                previous_actor_features,
-            )
-        )
-        critic_buffer = critic_buffer.at[
-            safe_cursor,
-            actor_indices,
-        ].set(
-            jnp.where(
-                is_sampled[:, jnp.newaxis],
-                critic_features,
-                previous_critic_features,
-            )
-        )
-        layer_norm_sums = {
-            name: layer_norm_sums[name]
-            + jnp.sum(
-                jnp.where(
-                    is_sampled,
-                    captured[f"feature_norm_{name}"][0][0],
-                    0.0,
-                )
-            )
-            for name in present_layer_names
-        }
-        sample_cursor = sample_cursor + is_sampled.astype(jnp.int32)
-        return (
-            next_hstate,
-            sample_cursor,
-            actor_buffer,
-            critic_buffer,
-            layer_norm_sums,
-        ), None
-
-    replay_init = (
-        initial_hstate,
-        jnp.zeros((num_actors,), dtype=jnp.int32),
-        actor_buffer,
-        critic_buffer,
-        layer_norm_sums,
-    )
-    replay_inputs = (
-        jnp.arange(num_steps, dtype=jnp.int32),
-        obs,
-        dones,
-        agent_positions,
-    )
-    replay_final, _ = jax.lax.scan(
-        _replay_step,
-        replay_init,
-        replay_inputs,
-    )
-    _, _, actor_features, critic_features, layer_norm_sums = replay_final
-    sample_count = jnp.asarray(
-        num_sampled_steps * num_actors,
-        dtype=actor_probe.dtype,
-    )
+    captured = intermediates["intermediates"]
+    actor_features = captured["actor_penultimate"][0]
+    critic_features = captured["critic_penultimate"][0]
     layer_norms = {
-        name: value / sample_count
-        for name, value in layer_norm_sums.items()
+        name: jnp.mean(captured[f"feature_norm_{name}"][0])
+        for name in INTERMEDIATE_FEATURE_NAMES
+        if f"feature_norm_{name}" in captured
     }
     return _assemble_penultimate_metrics(
         actor_features,

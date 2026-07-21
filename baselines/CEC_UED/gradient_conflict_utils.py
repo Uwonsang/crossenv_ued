@@ -71,7 +71,7 @@ def compute_projected_gradient_matrices(
         return {"params": merged}
 
     # Match the existing actor diagnostic's common advantage normalization.
-    diagnostic_steps = int(config["DIAGNOSTIC_WINDOW_STEPS"])
+    diagnostic_steps = int(config["GRAD_CONFLICT_WINDOW_STEPS"])
     diagnostic_advantages = advantages[:diagnostic_steps]
     advantage_mean = jnp.mean(diagnostic_advantages)
     advantage_std = jnp.sqrt(
@@ -460,7 +460,7 @@ def compute_gradient_conflict_metrics(
 ):
     _num_layouts = len(layout_names)
     # subsample: use only the first _GC_STEPS steps to reduce activation memory
-    _GC_STEPS = config["DIAGNOSTIC_WINDOW_STEPS"]
+    _GC_STEPS = config["GRAD_CONFLICT_WINDOW_STEPS"]
     _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
     _gc_adv  = advantages[:_GC_STEPS]
     _gc_tgt  = value_targets[:_GC_STEPS]

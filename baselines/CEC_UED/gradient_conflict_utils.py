@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 
-def compute_projected_gradient_cosine_matrices(
+def compute_projected_gradient_matrices(
     *,
     network,
     original_params,
@@ -17,7 +17,7 @@ def compute_projected_gradient_cosine_matrices(
     value_trunk_keys,
     actor_trunk_keys,
 ):
-    """Compute memory-bounded per-environment gradient cosine heatmaps.
+    """Compute memory-bounded per-environment gradient heatmap matrices.
 
     At each configured time, one sample is one environment's joint transition:
     the two agents' losses are averaged before differentiating. Full gradients
@@ -25,9 +25,9 @@ def compute_projected_gradient_cosine_matrices(
     signed feature-hash sketch, so no ``NUM_ENVS x NUM_PARAMS`` tensor is kept.
 
     Returns:
-        Array with shape ``(2, num_times, NUM_ENVS, NUM_ENVS)``. Axis 0 is
-        ``(actor, value)``. The matrices are projected cosine/Gram matrices,
-        not statistically centered covariance matrices.
+        Array with shape ``(2, 2, num_times, NUM_ENVS, NUM_ENVS)``. Axis 0 is
+        ``(cosine, dot_product)`` and axis 1 is ``(actor, value)``. These are
+        projected Gram matrices, not statistically centered covariances.
     """
     timesteps = tuple(
         int(t) for t in config["GRADIENT_COVARIANCE_TIMESTEPS"]
@@ -214,8 +214,10 @@ def compute_projected_gradient_cosine_matrices(
         hstates_at_time[timestep] = current_hstate
         previous_timestep = timestep
 
-    actor_matrices = []
-    value_matrices = []
+    actor_cosine_matrices = []
+    value_cosine_matrices = []
+    actor_dot_product_matrices = []
+    value_dot_product_matrices = []
     for timestep in timesteps:
         env_data = (
             _env_major_hstate(hstates_at_time[timestep]),
@@ -266,27 +268,56 @@ def compute_projected_gradient_cosine_matrices(
             _project_one_environment, None, env_data
         )
 
-        def _cosine_matrix(sketches):
+        def _matrix_pair(sketches):
             row_norm = jnp.linalg.norm(sketches, axis=1)
             valid = row_norm > 1e-12
-            unit_sketches = sketches / (row_norm[:, None] + 1e-12)
-            matrix = jnp.clip(unit_sketches @ unit_sketches.T, -1.0, 1.0)
+            # One Gram matmul serves both views.  The raw projected dot product
+            # retains gradient magnitude, while division by the outer product
+            # of norms gives the direction-only cosine matrix.
+            dot_product_matrix = sketches @ sketches.T
             valid_pairs = valid[:, None] & valid[None, :]
-            matrix = jnp.where(valid_pairs, matrix, jnp.nan)
+            dot_product_matrix = jnp.where(
+                valid_pairs, dot_product_matrix, jnp.nan
+            )
+            cosine_matrix = jnp.clip(
+                dot_product_matrix
+                / (row_norm[:, None] * row_norm[None, :] + 1e-12),
+                -1.0,
+                1.0,
+            )
             diagonal = jnp.arange(num_envs)
-            return matrix.at[diagonal, diagonal].set(
+            cosine_matrix = cosine_matrix.at[diagonal, diagonal].set(
                 jnp.where(valid, 1.0, jnp.nan)
             )
+            return cosine_matrix, dot_product_matrix
 
-        actor_matrices.append(_cosine_matrix(actor_sketches))
-        value_matrices.append(_cosine_matrix(value_sketches))
+        actor_cosine, actor_dot_product = _matrix_pair(actor_sketches)
+        value_cosine, value_dot_product = _matrix_pair(value_sketches)
+        actor_cosine_matrices.append(actor_cosine)
+        value_cosine_matrices.append(value_cosine)
+        actor_dot_product_matrices.append(actor_dot_product)
+        value_dot_product_matrices.append(value_dot_product)
 
     return jnp.stack(
-        (jnp.stack(actor_matrices), jnp.stack(value_matrices)), axis=0
+        (
+            jnp.stack(
+                (
+                    jnp.stack(actor_cosine_matrices),
+                    jnp.stack(value_cosine_matrices),
+                )
+            ),
+            jnp.stack(
+                (
+                    jnp.stack(actor_dot_product_matrices),
+                    jnp.stack(value_dot_product_matrices),
+                )
+            ),
+        ),
+        axis=0,
     )
 
 
-def render_projected_gradient_cosine_heatmaps(matrices, timesteps):
+def render_projected_gradient_heatmaps(matrices, timesteps):
     """Render host-side RGBA images for WandB without retaining figures."""
     import matplotlib
 
@@ -296,39 +327,71 @@ def render_projected_gradient_cosine_heatmaps(matrices, timesteps):
 
     matrices = np.asarray(matrices)
     timesteps = tuple(int(t) for t in timesteps)
-    expected_prefix = (2, len(timesteps))
-    if matrices.shape[:2] != expected_prefix:
+    expected_prefix = (2, 2, len(timesteps))
+    if matrices.shape[:3] != expected_prefix:
         raise ValueError(
             f"expected matrix prefix {expected_prefix}, got {matrices.shape}"
         )
 
     images = {}
-    for loss_index, loss_name in enumerate(("actor", "value")):
-        for time_index, timestep in enumerate(timesteps):
-            matrix = matrices[loss_index, time_index]
-            fig, axis = plt.subplots(figsize=(6.4, 5.6), dpi=120)
-            image = axis.imshow(
-                matrix,
-                cmap="coolwarm",
-                vmin=-1.0,
-                vmax=1.0,
-                interpolation="nearest",
-                origin="upper",
-            )
-            axis.set_title(
-                "Projected normalized gradient Gram matrix\n"
-                f"{loss_name}, t={timestep}; one joint sample per env"
-            )
-            axis.set_xlabel("environment slot j")
-            axis.set_ylabel("environment slot i")
-            fig.colorbar(image, ax=axis, label="projected cosine similarity")
-            fig.tight_layout()
-            fig.canvas.draw()
-            rgba = np.asarray(fig.canvas.buffer_rgba()).copy()
-            plt.close(fig)
-            images[
-                f"gradient_covariance_projected/{loss_name}/t_{timestep}"
-            ] = rgba
+    for matrix_index, matrix_name in enumerate(("cosine", "dot_product")):
+        for loss_index, loss_name in enumerate(("actor", "value")):
+            for time_index, timestep in enumerate(timesteps):
+                matrix = matrices[matrix_index, loss_index, time_index]
+                fig, axis = plt.subplots(figsize=(6.4, 5.6), dpi=120)
+                image_kwargs = {
+                    "cmap": "coolwarm",
+                    "interpolation": "nearest",
+                    "origin": "upper",
+                }
+                if matrix_name == "cosine":
+                    image_kwargs.update(vmin=-1.0, vmax=1.0)
+                    title = "Projected normalized gradient Gram matrix"
+                    colorbar_label = "projected cosine similarity"
+                    wandb_namespace = "gradient_covariance_projected"
+                else:
+                    finite_values = matrix[np.isfinite(matrix)]
+                    max_abs = (
+                        float(np.max(np.abs(finite_values)))
+                        if finite_values.size
+                        else 0.0
+                    )
+                    if max_abs > 0.0:
+                        nonzero_abs = np.abs(
+                            finite_values[finite_values != 0.0]
+                        )
+                        linthresh = max(
+                            float(np.percentile(nonzero_abs, 10.0)),
+                            max_abs * 1e-6,
+                        )
+                        image_kwargs["norm"] = matplotlib.colors.SymLogNorm(
+                            linthresh=linthresh,
+                            linscale=1.0,
+                            vmin=-max_abs,
+                            vmax=max_abs,
+                            base=10,
+                        )
+                    else:
+                        image_kwargs.update(vmin=-1.0, vmax=1.0)
+                    title = "Projected gradient dot-product Gram matrix"
+                    colorbar_label = "projected gradient dot product (symlog)"
+                    wandb_namespace = "gradient_dot_product_projected"
+
+                image = axis.imshow(matrix, **image_kwargs)
+                axis.set_title(
+                    f"{title}\n"
+                    f"{loss_name}, t={timestep}; one joint sample per env"
+                )
+                axis.set_xlabel("environment slot j")
+                axis.set_ylabel("environment slot i")
+                fig.colorbar(image, ax=axis, label=colorbar_label)
+                fig.tight_layout()
+                fig.canvas.draw()
+                rgba = np.asarray(fig.canvas.buffer_rgba()).copy()
+                plt.close(fig)
+                images[
+                    f"{wandb_namespace}/{loss_name}/t_{timestep}"
+                ] = rgba
     return images
 
 

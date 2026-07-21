@@ -31,9 +31,9 @@ import yaml
 from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
 from gradient_conflict_utils import (
     compute_gradient_conflict_metrics,
-    compute_projected_gradient_cosine_matrices,
+    compute_projected_gradient_matrices,
     empty_gradient_conflict_metrics,
-    render_projected_gradient_cosine_heatmaps,
+    render_projected_gradient_heatmaps,
 )
 from representation_metrics import (
     compute_penultimate_metrics,
@@ -1115,7 +1115,7 @@ def make_train(
                             )
 
                     if projected_gradient_matrices is not None:
-                        heatmaps = render_projected_gradient_cosine_heatmaps(
+                        heatmaps = render_projected_gradient_heatmaps(
                             projected_gradient_matrices,
                             gradient_covariance_timesteps,
                         )
@@ -1143,9 +1143,9 @@ def make_train(
 
             # Heatmaps are calculated and transferred only at diagnostic updates.
             # They never enter `metric`, so the outer update scan cannot stack a
-            # NUM_UPDATES x 2 x 3 x NUM_ENVS x NUM_ENVS tensor.
+            # NUM_UPDATES x 2 x 2 x 3 x NUM_ENVS x NUM_ENVS tensor.
             def _callback_with_gradient_matrices(_):
-                projected_matrices = compute_projected_gradient_cosine_matrices(
+                projected_matrices = compute_projected_gradient_matrices(
                     network=network,
                     original_params=original_params,
                     initial_hstate=initial_hstate,

@@ -155,7 +155,7 @@ def feature_metrics(features, cutoff=0.01):
         jnp.exp(-jnp.sum(entropy_terms)),
         jnp.asarray(0.0, dtype=feature_matrix.dtype),
     )
-    lambda_1_ratio = jnp.where(
+    sigma_1_ratio = jnp.where(
         nonzero_spectrum,
         singular_value_distribution[0],
         jnp.asarray(0.0, dtype=feature_matrix.dtype),
@@ -208,9 +208,8 @@ def feature_metrics(features, cutoff=0.01):
         "srank_kumar": srank_kumar,
         "approximate_rank_pca": approximate_rank_pca,
         "matrix_rank": matrix_rank,
-        "lambda_1": normalized_singular_values[0],
-        "lambda_1_ratio": lambda_1_ratio,
-        "lambda_N": normalized_singular_values[-1],
+        "normalized_sigma_1": normalized_singular_values[0],
+        "sigma_1_ratio": sigma_1_ratio,
     }
     return metrics
 
@@ -329,13 +328,11 @@ def empty_penultimate_metrics(dtype=jnp.float32):
         "representation_weight/actor_weighted_rms_norm",
         "representation_weight/critic_weighted_rms_norm",
         "representation_feature/actor_feature_norm",
-        "representation_feature/actor_lambda_1",
-        "representation_feature/actor_lambda_1_ratio",
-        "representation_feature/actor_lambda_N",
+        "representation_feature/actor_normalized_sigma_1",
+        "representation_feature/actor_sigma_1_ratio",
         "representation_feature/critic_feature_norm",
-        "representation_feature/critic_lambda_1",
-        "representation_feature/critic_lambda_1_ratio",
-        "representation_feature/critic_lambda_N",
+        "representation_feature/critic_normalized_sigma_1",
+        "representation_feature/critic_sigma_1_ratio",
         "representation_rank/actor_feature_rank",
         "representation_rank/actor_effective_rank_vetterli",
         "representation_rank/actor_srank_kumar",

@@ -74,4 +74,4 @@
   "argmax": False
 
 # Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
-"map_name": "empty"  # empty, wall_a, wall_b, wall_c
+"map_name": "empty"  # empty, wall_a, wall_b, wall_c, mixed

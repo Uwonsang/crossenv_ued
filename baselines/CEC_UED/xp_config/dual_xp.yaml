@@ -38,12 +38,12 @@
 "SEEDS": [0, 1, 2, 3, 4, 5]
 "PARTNER_SEEDS": [0, 1, 2, 3, 4, 5]
 "IPPO_POP_STAGES": ["progress_33", "progress_67", "progress_100"]
-"model_name": "IPPO" # IPPO, FCP, CEC, IPPO_POP
+"model_name": "IPPO" # IPPO, FCP, CEC, CEC_MIXED, IPPO_POP
 "partner_model_name": null # null means same as model_name
 
 "ENTITY": "overcooked_ai"
-"PROJECT": "crossenv_ued_toycoop"
-"WANDB_MODE": "disabled" # disabled, online, offline
+"PROJECT": "crossenv_ued_dual_destination"
+"WANDB_MODE": "online" # disabled, online, offline
 
 # Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
-"map_name": "empty" # empty, wall_a, wall_b, wall_c
+"map_name": "empty" # empty, wall_a, wall_b, wall_c, mixed

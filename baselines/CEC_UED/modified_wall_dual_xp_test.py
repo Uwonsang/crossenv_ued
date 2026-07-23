@@ -34,21 +34,22 @@ def latest_match(patterns):
 
 
 def model_patterns(root, model_name, seed, stage=None):
-    if model_name == "IPPO":
+    checkpoint_model_name = "CEC" if model_name == "CEC_MIXED" else model_name
+    if checkpoint_model_name == "IPPO":
         return [
             f"{root}/ikFalse/reset_all/ippo/**/seed{seed}_progress_100.pkl",
         ]
-    if model_name == "IPPO_POP":
+    if checkpoint_model_name == "IPPO_POP":
         if stage is None:
             raise ValueError("IPPO_POP requires a checkpoint stage")
         return [
             f"{root}/ikFalse/reset_all/ippo/**/seed{seed}_{stage}.pkl",
         ]
-    if model_name == "CEC":
+    if checkpoint_model_name == "CEC":
         return [
             f"{root}/ikTrue/reset_all/cec/**/seed{seed}_ckpt0_improved_updates*.pkl",
         ]
-    if model_name == "FCP":
+    if checkpoint_model_name == "FCP":
         return [
             f"{root}/ikFalse/reset_all/fcp/**/fcp_seed{seed}_best.pkl",
         ]
@@ -97,10 +98,12 @@ def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
 
 
-def resolve_model_root(config):
+def resolve_model_root(config, model_name):
     root = Path(config["MODEL_ROOT"])
     map_name = get_wall_map_name(config)
     if config["ENV_NAME"] == "ToyCoop" and root.name == "ToyCoop":
+        if model_name == "CEC_MIXED":
+            map_name = "mixed"
         root = root / "modified_wall" / map_name
     return resolve_path(str(root))
 
@@ -303,13 +306,14 @@ def main(config):
     seeds = [int(s) for s in config["SEEDS"]]
     partner_seeds = [int(s) for s in config.get("PARTNER_SEEDS", config["SEEDS"])]
     ippo_pop_stages = list(config.get("IPPO_POP_STAGES", ["progress_33", "progress_67", "progress_100"]))
-    model_root = resolve_model_root(config)
+    model_root = resolve_model_root(config, model_name)
     param_stack_1, label_list_1, path_list_1 = load_params(model_root, model_name, seeds, ippo_pop_stages)
     if model_name == partner_model_name and seeds == partner_seeds:
         param_stack_2, label_list_2, path_list_2 = param_stack_1, label_list_1, path_list_1
     else:
+        partner_model_root = resolve_model_root(config, partner_model_name)
         param_stack_2, label_list_2, path_list_2 = load_params(
-            model_root,
+            partner_model_root,
             partner_model_name,
             partner_seeds,
             ippo_pop_stages,

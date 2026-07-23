@@ -29,6 +29,7 @@ class State:
 
 class ModifiedWallToyCoop(MultiAgentEnv):
     """Simple 5x5 cooperative gridworld with named fixed wall layouts."""
+    LAYOUT_CHOICES = ("empty", "wall_a")
     LAYOUTS = {
         "empty": ("CCGCC", "CCCCC", "ACCCA", "CCCCC", "CCGCC"),
         "wall_a": ("CCGCC", "CBCCC", "ACBCA", "CCCBC", "CCGCC"),
@@ -68,18 +69,29 @@ class ModifiedWallToyCoop(MultiAgentEnv):
         self.held_out_agent_pos = None
         self.held_out_goal_pos = None
         self.held_out_other_goal_pos = None
+        self.held_out_wall_map = None
         self.partial_obs = partial_obs
         self.incentivize_strat = incentivize_strat
         self.map_name = map_name
-        self.wall_map, self.default_agent_pos, self.default_goal_pos = self._parse_layout(map_name)
+        layout_names = self.LAYOUT_CHOICES if map_name == "mixed" else (map_name,)
+        parsed_layouts = [self._parse_layout(name) for name in layout_names]
+        self.wall_maps = jnp.stack([layout[0] for layout in parsed_layouts], axis=0)
+        self.default_agent_positions = jnp.stack([layout[1] for layout in parsed_layouts], axis=0)
+        self.default_goal_positions = jnp.stack([layout[2] for layout in parsed_layouts], axis=0)
+        self.free_masks = ~self.wall_maps.reshape((len(layout_names), self.height * self.width))
+        self.wall_map = self.wall_maps[0]
+        self.default_agent_pos = self.default_agent_positions[0]
+        self.default_goal_pos = self.default_goal_positions[0]
         self.free_pos = jnp.array(
             [[x, y] for x in range(self.width) for y in range(self.height) if not bool(self.wall_map[y, x])],
             dtype=jnp.int32,
         )
+        self.mixed_layout = map_name == "mixed"
+        self.num_layouts = len(layout_names)
 
     def _parse_layout(self, map_name):
         if map_name not in self.LAYOUTS:
-            valid = ", ".join(sorted(self.LAYOUTS))
+            valid = ", ".join(sorted((*self.LAYOUTS.keys(), "mixed")))
             raise ValueError(f"Unknown ModifiedWallToyCoop map_name={map_name!r}. Valid map names: {valid}")
 
         rows = self.LAYOUTS[map_name]
@@ -99,6 +111,7 @@ class ModifiedWallToyCoop(MultiAgentEnv):
                     goal_pos.append([x, y])
                 elif token not in ("A", "B", "C", "G"):
                     raise ValueError(f"Unsupported token {token!r} in layout {map_name!r}.")
+            wall_rows.append(wall_row)
 
         if len(agent_pos) != 2:
             raise ValueError(f"Layout {map_name!r} must contain exactly two A tokens.")
@@ -119,11 +132,13 @@ class ModifiedWallToyCoop(MultiAgentEnv):
             agent_match = lambda a_pos: jnp.all(a_pos == state.agent_pos)
             goal_match = lambda g_pos: jnp.all(g_pos == state.goal_pos)
             other_goal_match = lambda g_pos: jnp.all(g_pos == state.other_goal_pos)
+            wall_match = lambda wall_map: jnp.all(wall_map == state.wall_map)
 
             some_agent_match = jax.vmap(agent_match)(self.held_out_agent_pos)
             some_goal_match = jax.vmap(goal_match)(self.held_out_goal_pos)
             some_other_goal_match = jax.vmap(other_goal_match)(self.held_out_other_goal_pos)
-            temp = jnp.stack([some_agent_match, some_goal_match, some_other_goal_match], axis=0)  # 2 x num_held_out
+            some_wall_match = jax.vmap(wall_match)(self.held_out_wall_map)
+            temp = jnp.stack([some_agent_match, some_goal_match, some_other_goal_match, some_wall_match], axis=0)
             some_match = jnp.all(temp, axis=0).any()
             return some_match
         
@@ -142,20 +157,28 @@ class ModifiedWallToyCoop(MultiAgentEnv):
         return obs, state
     
     def custom_reset_fn(self, key, random_reset=False, debug=False):
-        key1, key2 = jax.random.split(key)
+        key1, key2, key3 = jax.random.split(key, 3)
+        sampled_layout_idx = jax.random.randint(key2, (), minval=0, maxval=self.num_layouts)
+        layout_idx = jnp.where(jnp.logical_and(self.mixed_layout, random_reset), sampled_layout_idx, 0)
+        wall_map = self.wall_maps[layout_idx]
+        default_agent_pos = self.default_agent_positions[layout_idx]
+        default_goal_pos = self.default_goal_positions[layout_idx]
         
         og_locations_2 = jnp.concatenate(
-            [self.default_agent_pos, self.default_goal_pos, self.default_goal_pos],
+            [default_agent_pos, default_goal_pos, default_goal_pos],
             axis=0,
         )
         og_locations_3 = og_locations_2
         og_locations = jnp.where(self.incentivize_strat == 3, og_locations_3, og_locations_2)
 
         # Randomly place agents and goals
-        indices = jax.random.permutation(key1, len(self.free_pos))[:6]
-        rand_agent_pos = self.free_pos[indices[:2]]
-        rand_goal_pos = self.free_pos[indices[2:4]]
-        rand_other_goal_pos = self.free_pos[indices[4:]]
+        scores = jax.random.uniform(key3, (self.height * self.width,))
+        scores = jnp.where(self.free_masks[layout_idx], scores, -1.0)
+        indices = jnp.argsort(scores)[-6:]
+        rand_locations = self.all_pos[indices]
+        rand_agent_pos = rand_locations[:2]
+        rand_goal_pos = rand_locations[2:4]
+        rand_other_goal_pos = rand_locations[4:]
 
         agent_pos = jnp.where(random_reset, rand_agent_pos, og_locations[:2])
         green_goal_default = jnp.where(debug, og_locations[:2], og_locations[2:4])
@@ -167,7 +190,7 @@ class ModifiedWallToyCoop(MultiAgentEnv):
             agent_pos=agent_pos,
             goal_pos=goal_pos,
             other_goal_pos=other_goal_pos,
-            wall_map=self.wall_map,
+            wall_map=wall_map,
             time=0,
             terminal=False
         )

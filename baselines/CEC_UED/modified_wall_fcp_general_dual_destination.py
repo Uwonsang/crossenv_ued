@@ -35,7 +35,19 @@ def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
 
 def make_modified_wall_env(config):
-    env_kwargs = dict(config["ENV_KWARGS"])
+    valid_env_keys = {
+        "max_steps",
+        "random_reset",
+        "debug",
+        "check_held_out",
+        "partial_obs",
+        "incentivize_strat",
+    }
+    env_kwargs = {
+        key: value
+        for key, value in config["ENV_KWARGS"].items()
+        if key in valid_env_keys
+    }
     env_kwargs["map_name"] = get_wall_map_name(config)
     config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
     return ModifiedWallToyCoop(**env_kwargs)
@@ -140,7 +152,7 @@ class ActorCriticRNN(nn.Module):
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
-                reshaped_obs = obs.reshape(-1, 5,5,4)
+                reshaped_obs = obs.reshape(-1, 5,5,5)
 
             embedding = nn.Conv(
                 features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],

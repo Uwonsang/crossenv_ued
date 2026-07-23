@@ -40,7 +40,19 @@ def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
 
 def make_modified_wall_env(config):
-    env_kwargs = dict(config["ENV_KWARGS"])
+    valid_env_keys = {
+        "max_steps",
+        "random_reset",
+        "debug",
+        "check_held_out",
+        "partial_obs",
+        "incentivize_strat",
+    }
+    env_kwargs = {
+        key: value
+        for key, value in config["ENV_KWARGS"].items()
+        if key in valid_env_keys
+    }
     env_kwargs["map_name"] = get_wall_map_name(config)
     config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
     return ModifiedWallToyCoop(**env_kwargs)
@@ -108,17 +120,18 @@ def initialize_environment(config):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
+            res = (state.agent_pos, state.goal_pos, state.other_goal_pos, state.wall_map)
             carry = (i+1,)
             return carry, res
         
         carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
-        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
+        ho_agent_pos, ho_goal_pos, ho_other_goal_pos, ho_wall_map = res
         
         # Set the held-out states in the environment
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
         env.held_out_other_goal_pos = ho_other_goal_pos
+        env.held_out_wall_map = ho_wall_map
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
@@ -164,7 +177,7 @@ class ActorCriticRNN(nn.Module):
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
-                reshaped_obs = obs.reshape(-1, 5,5,4)
+                reshaped_obs = obs.reshape(-1, 5,5,5)
 
             embedding = nn.Conv(
                 # features=64 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked")else 2 * self.config["FC_DIM_SIZE"],

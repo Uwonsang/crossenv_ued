@@ -7,7 +7,9 @@ export PYTHONPATH="$REPO_ROOT/baselines/CEC_UED:$REPO_ROOT:${PYTHONPATH:-}"
 
 GPU_ID="${1:-}"
 MAPS="${MAPS:-wall_a}"
-MODELS="${MODELS:-IPPO FCP}"
+# To sweep all wall maps, run with:
+# MAPS="wall_a wall_b wall_c" bash baselines/CEC_UED/shell/modified_wall_run_dual_xp_all.sh
+MODELS="${MODELS:-IPPO CEC}"
 
 if [[ -n "$GPU_ID" ]]; then
   export CUDA_VISIBLE_DEVICES="$GPU_ID"

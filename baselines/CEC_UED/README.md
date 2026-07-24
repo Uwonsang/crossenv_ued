@@ -301,16 +301,49 @@ $$
 | `representation_weight/weight_norm` | 전체 parameter tree의 global L2 norm |
 | `representation_weight/actor_weight_norm` | shared와 actor branch/output의 global L2 norm |
 | `representation_weight/critic_weight_norm` | shared와 critic branch/output의 global L2 norm |
+| `representation_weight/shared_weight_norm` | shared encoder/RNN parameter의 global L2 norm |
 | `representation_weight/weighted_rms_norm` | 전체 parameter tree의 weighted RMS |
 | `representation_weight/actor_weighted_rms_norm` | shared와 actor branch/output |
 | `representation_weight/critic_weighted_rms_norm` | shared와 critic branch/output |
+| `representation_weight/shared_weighted_rms_norm` | shared encoder/RNN parameter의 weighted RMS |
 
 PopArt는 output-preserving rescaling을 critic output layer에 적용하므로 일반
 CEC와 PopArt CEC의 `critic_weight_norm`을 직접 비교할 때 주의해야 한다.
 
+## Gradient kurtosis
+
+각 PPO minibatch의 gradient clipping 및 Adam 적용 전 raw gradient 원소
+$G_i$를 다음과 같이 변환한다.
+
+$$
+L_i=\log(|G_i|+\epsilon),\qquad \epsilon=10^{-8}.
+$$
+
+기록하는 값은 excess kurtosis가 아닌 Pearson kurtosis다.
+
+$$
+K=
+\frac{\mathbb{E}[(L_i-\mu_L)^4]}
+{\left(\mathbb{E}[(L_i-\mu_L)^2]\right)^2+10^{-12}}.
+$$
+
+```text
+gradient_kurtosis/global
+gradient_kurtosis/actor
+gradient_kurtosis/critic
+gradient_kurtosis/shared
+```
+
+Actor와 critic은 각각 shared trunk와 해당 branch/output을 포함한다. Shared는
+`Conv_0`, `Conv_1`, `Dense_0`, `Dense_1`, `ScannedRNN_0`만 포함한다.
+값이 클수록 log-absolute gradient 분포의 tail이 무겁거나 극단적인 gradient
+원소가 존재한다는 의미다. 다른 optimizer-update 지표와 마찬가지로 interval
+동안 수행된 PPO minibatch들의 평균을 W&B에 기록한다.
+
 ## Penultimate feature metrics
 
-Actor와 critic의 마지막 output layer 직전 activation으로 $\Phi$를 구성한다.
+Shared recurrent trunk와 actor/critic의 마지막 output layer 직전 activation으로
+$\Phi$를 각각 구성한다.
 Feature를 mean-center하지 않으므로 아래 spectrum은 centered covariance가 아니라
 uncentered feature matrix의 spectrum이다. SimBaV2의 별도 metric replay batch에
 대응하여, CEC에서는 diagnostic logging update에서 첫 PPO epoch의 첫 minibatch가
@@ -338,6 +371,7 @@ $$
 $$
 
 ```text
+representation_feature/shared_feature_norm
 representation_feature/actor_feature_norm
 representation_feature/critic_feature_norm
 ```
@@ -352,8 +386,10 @@ $$
 $$
 
 ```text
+representation_feature/shared_normalized_sigma_1
 representation_feature/actor_normalized_sigma_1
 representation_feature/critic_normalized_sigma_1
+representation_feature/shared_sigma_1_ratio
 representation_feature/actor_sigma_1_ratio
 representation_feature/critic_sigma_1_ratio
 ```
@@ -370,7 +406,15 @@ $$
 F_q=\frac{1}{M}\sum_m\|h_m^{(q)}\|_2.
 $$
 
-Actor와 critic total은 shared path와 해당 branch의 layer norm들을 단순 합산한다.
+Shared total은 shared path의 layer norm들을 단순 합산한다.
+
+$$
+F_{\mathrm{shared,total}}=
+\sum_{q\in\mathrm{shared}}F_q.
+$$
+
+Actor와 critic total은 이 shared total과 해당 branch의 layer norm들을
+단순 합산한다.
 
 $$
 F_{\mathrm{actor,total}}=
@@ -385,6 +429,7 @@ F_{\mathrm{critic,total}}=
 $$
 
 ```text
+representation_feature_total/shared_feature_norm
 representation_feature_total/actor_feature_norm
 representation_feature_total/critic_feature_norm
 ```
@@ -404,6 +449,7 @@ $$
 $$
 
 ```text
+representation_rank/shared_feature_rank
 representation_rank/actor_feature_rank
 representation_rank/critic_feature_rank
 ```
@@ -420,6 +466,7 @@ p_j=\frac{\sigma_j}{\sum_k\sigma_k},
 $$
 
 ```text
+representation_rank/shared_effective_rank_vetterli
 representation_rank/actor_effective_rank_vetterli
 representation_rank/critic_effective_rank_vetterli
 ```
@@ -438,6 +485,7 @@ $$
 $$
 
 ```text
+representation_rank/shared_srank_kumar
 representation_rank/actor_srank_kumar
 representation_rank/critic_srank_kumar
 ```
@@ -453,6 +501,7 @@ $$
 $$
 
 ```text
+representation_rank/shared_approximate_rank_pca
 representation_rank/actor_approximate_rank_pca
 representation_rank/critic_approximate_rank_pca
 ```
@@ -467,6 +516,7 @@ $$
 $$
 
 ```text
+representation_rank/shared_matrix_rank
 representation_rank/actor_matrix_rank
 representation_rank/critic_matrix_rank
 ```

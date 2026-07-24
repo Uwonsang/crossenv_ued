@@ -35,13 +35,12 @@ from gradient_conflict_utils import (
     empty_gradient_conflict_metrics,
 )
 from representation_metrics import (
+    compute_gradient_kurtosis_metrics,
+    compute_gradient_norm_metrics,
     compute_minibatch_penultimate_metrics,
     compute_weight_metrics,
     empty_penultimate_metrics,
     first_epoch_first_minibatch_indices,
-    tree_global_l2_norm,
-    tree_group_leaf_count_weighted_rms_norm,
-    tree_leaf_count_weighted_rms_norm,
 )
 
 
@@ -54,6 +53,9 @@ ACTOR_TRUNK_KEYS = (
 VALUE_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
+)
+SHARED_TRUNK_KEYS = (
+    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
 )
 
 
@@ -264,6 +266,9 @@ class ActorCriticRNN(nn.Module):
             embedding = nn.relu(embedding)
         embedding = embedding.reshape((batch_size, num_envs, -1))
         record_feature_norm("shared_recurrent", embedding)
+
+        if not self.is_initializing():
+            self.sow("intermediates", "shared_penultimate", embedding)
 
         #########
         # Actor
@@ -748,21 +753,11 @@ def make_train(
                         train_state.params, init_hstate, traj_batch, advantages, targets
                     )
 
-                    # weight_norm
-                    gradient_global_norm = tree_global_l2_norm(grads)
-                    gradient_weighted_rms_norm = (
-                        tree_leaf_count_weighted_rms_norm(grads)
-                    )
-                    actor_gradient_weighted_rms_norm = (
-                        tree_group_leaf_count_weighted_rms_norm(
+                    minibatch_gradient_norm_metrics = (
+                        compute_gradient_norm_metrics(
                             grads,
-                            ACTOR_TRUNK_KEYS,
-                        )
-                    )
-                    critic_gradient_weighted_rms_norm = (
-                        tree_group_leaf_count_weighted_rms_norm(
-                            grads,
-                            VALUE_TRUNK_KEYS,
+                            actor_param_keys=ACTOR_TRUNK_KEYS,
+                            critic_param_keys=VALUE_TRUNK_KEYS,
                         )
                     )
                     # Match SimBaV2's optimizer-update semantics: measure the
@@ -772,25 +767,24 @@ def make_train(
                         train_state.params,
                         actor_param_keys=ACTOR_TRUNK_KEYS,
                         critic_param_keys=VALUE_TRUNK_KEYS,
+                        shared_param_keys=SHARED_TRUNK_KEYS,
                     )
+                    minibatch_gradient_kurtosis = (
+                        compute_gradient_kurtosis_metrics(
+                            grads,
+                            actor_param_keys=ACTOR_TRUNK_KEYS,
+                            critic_param_keys=VALUE_TRUNK_KEYS,
+                            shared_param_keys=SHARED_TRUNK_KEYS,
+                        )
+                    )
+                    minibatch_diagnostics = {
+                        **minibatch_gradient_norm_metrics,
+                        **minibatch_weight_metrics,
+                        **minibatch_gradient_kurtosis,
+                    }
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
-                    return train_state, (
-                        loss,
-                        (
-                            *loss_aux,
-                            gradient_global_norm,
-                            gradient_weighted_rms_norm,
-                            actor_gradient_weighted_rms_norm,
-                            critic_gradient_weighted_rms_norm,
-                            minibatch_weight_metrics["representation_weight/weight_norm"],
-                            minibatch_weight_metrics["representation_weight/actor_weight_norm"],
-                            minibatch_weight_metrics["representation_weight/critic_weight_norm"],
-                            minibatch_weight_metrics["representation_weight/weighted_rms_norm"],
-                            minibatch_weight_metrics["representation_weight/actor_weighted_rms_norm"],
-                            minibatch_weight_metrics["representation_weight/critic_weighted_rms_norm"],
-                        ),
-                    )
+                    return train_state, (loss, loss_aux, minibatch_diagnostics)
 
                 (
                     train_state,
@@ -882,16 +876,7 @@ def make_train(
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
-                "gradient_norm/global_norm": loss_info[1][6],
-                "gradient_norm/weighted_rms_norm": loss_info[1][7],
-                "gradient_norm/actor_weighted_rms_norm": loss_info[1][8],
-                "gradient_norm/critic_weighted_rms_norm": loss_info[1][9],
-                "representation_weight/weight_norm": loss_info[1][10],
-                "representation_weight/actor_weight_norm": loss_info[1][11],
-                "representation_weight/critic_weight_norm": loss_info[1][12],
-                "representation_weight/weighted_rms_norm": loss_info[1][13],
-                "representation_weight/actor_weighted_rms_norm": loss_info[1][14],
-                "representation_weight/critic_weighted_rms_norm": loss_info[1][15],
+                **loss_info[2],
                 **target_stats,
             }
             metric["gradient_conflict"] = grad_conflict

@@ -660,15 +660,27 @@ def make_train(
                 jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
             )
 
+            gradient_conflict_window_steps = int(
+                config["GRAD_CONFLICT_WINDOW_STEPS"]
+            )
+
             def _compute_gradient_conflict(_):
+                gradient_conflict_traj = jax.tree.map(
+                    lambda x: x[:gradient_conflict_window_steps],
+                    traj_batch,
+                )
                 return compute_gradient_conflict_metrics(
                     network=network,
                     original_params=original_params,
                     initial_hstate=initial_hstate,
-                    traj_batch=traj_batch,
-                    advantages=advantages,
-                    value_targets=_targets_norm,
-                    layout_ids_full=_layout_ids_full,
+                    traj_batch=gradient_conflict_traj,
+                    advantages=advantages[:gradient_conflict_window_steps],
+                    value_targets=(
+                        _targets_norm[:gradient_conflict_window_steps]
+                    ),
+                    layout_ids_full=(
+                        _layout_ids_full[:gradient_conflict_window_steps]
+                    ),
                     layout_names=_LAYOUT_NAMES,
                     config=config,
                     num_agents=env.num_agents,

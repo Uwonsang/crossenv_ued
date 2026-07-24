@@ -136,6 +136,9 @@ $$
 
 ## Layout-family gradient
 
+Gradient conflict 진단에는 rollout 전체가 아니라 앞쪽
+`GRAD_CONFLICT_WINDOW_STEPS` 구간을 사용한다.
+
 Layout $l$에서 관측된 sample 수를 $n_l$, 전체 sample 수를
 $n=\sum_l n_l$, layout 평균 gradient를 $g_l$이라 한다. 두 agent는 같은
 environment layout에 속하며 gradient 계산에는 두 agent가 모두 포함된다.
@@ -198,8 +201,9 @@ Layout이 해당 rollout에 존재하지 않으면 관련 layout metric은
 
 ## Environment-sample gradient conflict
 
-하나의 sample은 한 environment slot의 전체 `NUM_STEPS` trajectory이며 두 actor를
-함께 포함한다. Episode reset을 통과하면 `done`이 recurrent state를 reset한다.
+하나의 sample은 한 environment slot의 앞쪽
+`GRAD_CONFLICT_WINDOW_STEPS` trajectory이며 두 actor를 함께 포함한다. Episode
+reset을 통과하면 `done`이 recurrent state를 reset한다.
 Actor와 value gradient는 별도로 측정한다.
 
 정규화된 gradient를 다음과 같이 둔다.

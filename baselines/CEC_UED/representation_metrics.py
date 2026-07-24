@@ -87,9 +87,10 @@ def compute_gradient_norm_metrics(
     gradients,
     actor_param_keys,
     critic_param_keys,
+    shared_param_keys,
 ):
     """Measure global and parameter-group RMS norms of PPO gradients."""
-    gradient_norm_metrics = {
+    gradients_norm = {
         "gradient_norm/global_norm": tree_global_l2_norm(gradients),
         "gradient_norm/weighted_rms_norm": (
             tree_leaf_count_weighted_rms_norm(gradients)
@@ -104,9 +105,14 @@ def compute_gradient_norm_metrics(
                 gradients, critic_param_keys
             )
         ),
+        "gradient_norm/shared_weighted_rms_norm": (
+            tree_group_leaf_count_weighted_rms_norm(
+                gradients, shared_param_keys
+            )
+        ),
     }
 
-    return gradient_norm_metrics
+    return gradients_norm
 
 
 def gradient_kurtosis(gradients, epsilon=1e-8):
@@ -132,20 +138,19 @@ def compute_gradient_kurtosis_metrics(
     shared_param_keys,
 ):
     """Measure log-absolute-gradient kurtosis for PPO parameter groups."""
-    gradient_tree = (gradients["params"] if "params" in gradients else gradients)
-
+    gradient_tree = gradients["params"] if "params" in gradients else gradients
     actor_gradients = {name: gradient_tree[name] for name in actor_param_keys}
     critic_gradients = {name: gradient_tree[name] for name in critic_param_keys}
     shared_gradients = {name: gradient_tree[name] for name in shared_param_keys}
 
-    gradient_kurtosis_metrics = {
+    gradient_kurtosis = {
         "gradient_kurtosis/global": gradient_kurtosis(gradients),
         "gradient_kurtosis/actor": gradient_kurtosis(actor_gradients),
         "gradient_kurtosis/critic": gradient_kurtosis(critic_gradients),
         "gradient_kurtosis/shared": gradient_kurtosis(shared_gradients),
     }
 
-    return gradient_kurtosis_metrics
+    return gradient_kurtosis
 
 
 def compute_weight_metrics(
@@ -187,7 +192,29 @@ def compute_weight_metrics(
         ),
     }
 
-    return representation_weight
+    return representation_weight 
+    
+
+def compute_optimizer_update_metrics(
+    gradients,
+    params,
+    actor_param_keys,
+    critic_param_keys,
+    shared_param_keys,
+):
+    group_keys = {
+        "actor_param_keys": actor_param_keys,
+        "critic_param_keys": critic_param_keys,
+        "shared_param_keys": shared_param_keys,
+    }
+
+    optimizer_metrics = {
+        **compute_gradient_norm_metrics(gradients, **group_keys),
+        **compute_gradient_kurtosis_metrics(gradients, **group_keys),
+        **compute_weight_metrics(params, **group_keys),
+    }
+
+    return optimizer_metrics 
 
 
 def feature_scale_metrics(feature_matrix, singular_values):

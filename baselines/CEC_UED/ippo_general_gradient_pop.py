@@ -35,10 +35,8 @@ from gradient_conflict_utils import (
     empty_gradient_conflict_metrics,
 )
 from representation_metrics import (
-    compute_gradient_kurtosis_metrics,
-    compute_gradient_norm_metrics,
     compute_minibatch_penultimate_metrics,
-    compute_weight_metrics,
+    compute_optimizer_update_metrics,
     empty_penultimate_metrics,
     first_epoch_first_minibatch_indices,
 )
@@ -780,38 +778,19 @@ def make_train(
                     total_loss, grads = grad_fn(
                         train_state.params, init_hstate, traj_batch, advantages, targets
                     )
-                    minibatch_gradient_norm_metrics = (
-                        compute_gradient_norm_metrics(
-                            grads,
-                            actor_param_keys=ACTOR_TRUNK_KEYS,
-                            critic_param_keys=VALUE_TRUNK_KEYS,
-                        )
-                    )
                     # Match SimBaV2's optimizer-update semantics: measure the
                     # parameter state used by this minibatch immediately before
                     # applying its gradient, then average across minibatches.
-                    minibatch_weight_metrics = compute_weight_metrics(
-                        train_state.params,
+                    optimizer_update_metrics = compute_optimizer_update_metrics(
+                        gradients=grads,
+                        params=train_state.params,
                         actor_param_keys=ACTOR_TRUNK_KEYS,
                         critic_param_keys=VALUE_TRUNK_KEYS,
                         shared_param_keys=SHARED_TRUNK_KEYS,
                     )
-                    minibatch_gradient_kurtosis = (
-                        compute_gradient_kurtosis_metrics(
-                            grads,
-                            actor_param_keys=ACTOR_TRUNK_KEYS,
-                            critic_param_keys=VALUE_TRUNK_KEYS,
-                            shared_param_keys=SHARED_TRUNK_KEYS,
-                        )
-                    )
-                    minibatch_diagnostics = {
-                        **minibatch_gradient_norm_metrics,
-                        **minibatch_weight_metrics,
-                        **minibatch_gradient_kurtosis,
-                    }
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
-                    return train_state, (loss, loss_aux, minibatch_diagnostics)
+                    return train_state, (loss, loss_aux, optimizer_update_metrics)
 
                 (
                     train_state,

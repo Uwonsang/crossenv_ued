@@ -82,6 +82,7 @@ $\sqrt{\sum_k\|g_k\|_2^2/\sum_k n_k}$와 다르며, 큰 leaf에 더 큰 가중�
 | `gradient_norm/weighted_rms_norm` | 전체 parameter tree |
 | `gradient_norm/actor_weighted_rms_norm` | shared trunk와 actor branch/output |
 | `gradient_norm/critic_weighted_rms_norm` | shared trunk와 critic branch/output |
+| `gradient_norm/shared_weighted_rms_norm` | shared trunk |
 
 Actor와 critic 값에는 같은 shared trunk가 각각 포함된다. 또한 total PPO
 gradient에서 module만 선택하므로 순수 actor-loss gradient와 순수 value-loss

@@ -1217,6 +1217,7 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
+    config['model_name'] = "CEC_const"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:

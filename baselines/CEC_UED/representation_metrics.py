@@ -143,14 +143,14 @@ def compute_gradient_kurtosis_metrics(
     critic_gradients = {name: gradient_tree[name] for name in critic_param_keys}
     shared_gradients = {name: gradient_tree[name] for name in shared_param_keys}
 
-    gradient_kurtosis = {
+    gradient_kurtosis_metrics = {
         "gradient_kurtosis/global": gradient_kurtosis(gradients),
         "gradient_kurtosis/actor": gradient_kurtosis(actor_gradients),
         "gradient_kurtosis/critic": gradient_kurtosis(critic_gradients),
         "gradient_kurtosis/shared": gradient_kurtosis(shared_gradients),
     }
 
-    return gradient_kurtosis
+    return gradient_kurtosis_metrics
 
 
 def compute_weight_metrics(

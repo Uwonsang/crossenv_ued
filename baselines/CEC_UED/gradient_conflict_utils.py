@@ -4,397 +4,6 @@ import jax
 import jax.numpy as jnp
 
 
-def compute_projected_gradient_matrices(
-    *,
-    network,
-    original_params,
-    initial_hstate,
-    traj_batch,
-    advantages,
-    value_targets,
-    config,
-    num_agents,
-    value_trunk_keys,
-    actor_trunk_keys,
-):
-    """Compute memory-bounded per-environment gradient heatmap matrices.
-
-    At each configured time, one sample is one environment's joint transition:
-    the two agents' losses are averaged before differentiating. Full gradients
-    are computed one environment at a time and immediately reduced to a fixed
-    signed feature-hash sketch, so no ``NUM_ENVS x NUM_PARAMS`` tensor is kept.
-
-    Returns:
-        Array with shape ``(2, 2, num_times, NUM_ENVS, NUM_ENVS)``. Axis 0 is
-        ``(cosine, dot_product)`` and axis 1 is ``(actor, value)``. These are
-        projected Gram matrices, not statistically centered covariances.
-    """
-    timesteps = tuple(
-        int(t) for t in config["GRADIENT_COVARIANCE_TIMESTEPS"]
-    )
-    sketch_dim = int(config["GRADIENT_COVARIANCE_SKETCH_DIM"])
-    sketch_seed = int(config["GRADIENT_COVARIANCE_SKETCH_SEED"])
-    num_envs = int(config["NUM_ENVS"])
-    num_actors = num_envs * int(num_agents)
-    if int(traj_batch.obs.shape[1]) != num_actors:
-        raise ValueError(
-            "trajectory actor axis does not match NUM_ENVS * num_agents"
-        )
-
-    value_keys = tuple(value_trunk_keys)
-    actor_keys = tuple(actor_trunk_keys)
-
-    def _select_params(params, keys):
-        return {key: params["params"][key] for key in keys}
-
-    value_params = _select_params(original_params, value_keys)
-    actor_params = _select_params(original_params, actor_keys)
-    other_value_params = {
-        key: value
-        for key, value in original_params["params"].items()
-        if key not in value_keys
-    }
-    other_actor_params = {
-        key: value
-        for key, value in original_params["params"].items()
-        if key not in actor_keys
-    }
-
-    def _rebuild_value_params(selected):
-        merged = dict(other_value_params)
-        merged.update(selected)
-        return {"params": merged}
-
-    def _rebuild_actor_params(selected):
-        merged = dict(other_actor_params)
-        merged.update(selected)
-        return {"params": merged}
-
-    # Match the existing actor diagnostic's common advantage normalization.
-    diagnostic_steps = int(config["GRAD_CONFLICT_WINDOW_STEPS"])
-    diagnostic_advantages = advantages[:diagnostic_steps]
-    advantage_mean = jnp.mean(diagnostic_advantages)
-    advantage_std = jnp.sqrt(
-        jnp.mean((diagnostic_advantages - advantage_mean) ** 2) + 1e-8
-    )
-
-    def _value_loss(
-        selected_params, hstate, obs, done, positions, old_value, target
-    ):
-        _, _, value = jax.checkpoint(network.apply)(
-            _rebuild_value_params(selected_params),
-            hstate,
-            (obs, done, positions),
-        )
-        value_clipped = old_value + (value - old_value).clip(
-            -config["CLIP_EPS"], config["CLIP_EPS"]
-        )
-        # obs has shape (1, num_agents, ...), so mean() first combines the two
-        # actors into one environment-level loss and then grad() is applied.
-        return 0.5 * jnp.maximum(
-            jnp.square(value - target),
-            jnp.square(value_clipped - target),
-        ).mean()
-
-    def _actor_loss(
-        selected_params, hstate, obs, done, positions, action, old_log_prob,
-        advantage,
-    ):
-        _, policy, _ = jax.checkpoint(network.apply)(
-            _rebuild_actor_params(selected_params),
-            hstate,
-            (obs, done, positions),
-        )
-        ratio = jnp.exp(policy.log_prob(action) - old_log_prob)
-        normalized_advantage = (
-            (advantage - advantage_mean) / (advantage_std + 1e-8)
-        )
-        return -jnp.minimum(
-            ratio * normalized_advantage,
-            jnp.clip(
-                ratio,
-                1.0 - config["CLIP_EPS"],
-                1.0 + config["CLIP_EPS"],
-            )
-            * normalized_advantage,
-        ).mean()
-
-    value_grad = jax.grad(_value_loss)
-    actor_grad = jax.grad(_actor_loss)
-
-    def _make_sign_tree(params, ordered_keys, salt):
-        base_key = jax.random.fold_in(
-            jax.random.PRNGKey(sketch_seed), int(salt)
-        )
-        signs = {}
-        for module_index, key in enumerate(ordered_keys):
-            leaves, treedef = jax.tree_util.tree_flatten(params[key])
-            module_key = jax.random.fold_in(base_key, module_index)
-            module_signs = [
-                jax.random.bernoulli(
-                    jax.random.fold_in(module_key, leaf_index),
-                    p=0.5,
-                    shape=leaf.shape,
-                )
-                for leaf_index, leaf in enumerate(leaves)
-            ]
-            signs[key] = jax.tree_util.tree_unflatten(
-                treedef, module_signs
-            )
-        return signs
-
-    # Use the supplied logical module order rather than JAX's sorted dict-key
-    # order. This keeps the projection aligned between the standard critic's
-    # Dense_11 and PopArt's equivalently positioned critic_output module.
-    value_signs = _make_sign_tree(value_params, value_keys, salt=0)
-    actor_signs = _make_sign_tree(actor_params, actor_keys, salt=1)
-
-    def _signed_feature_hash(gradient, signs, ordered_keys):
-        """Balanced CountSketch-style projection without a dense P x r map."""
-        sketch = jnp.zeros((sketch_dim,), dtype=jnp.float32)
-        global_offset = 0
-        for key in ordered_keys:
-            gradient_leaves = jax.tree_util.tree_leaves(gradient[key])
-            sign_leaves = jax.tree_util.tree_leaves(signs[key])
-            for grad_leaf, sign_leaf in zip(gradient_leaves, sign_leaves):
-                flat_gradient = jnp.asarray(
-                    grad_leaf, dtype=jnp.float32
-                ).reshape(-1)
-                flat_sign = sign_leaf.reshape(-1)
-                signed_gradient = jnp.where(
-                    flat_sign, flat_gradient, -flat_gradient
-                )
-
-                # Coordinate i is assigned to bucket i mod sketch_dim.
-                # Independent Rademacher signs make cross-bucket collisions
-                # cancel in expectation.
-                front_pad = global_offset % sketch_dim
-                end_pad = (-(front_pad + int(grad_leaf.size))) % sketch_dim
-                padded = jnp.pad(signed_gradient, (front_pad, end_pad))
-                sketch = sketch + padded.reshape(
-                    (-1, sketch_dim)
-                ).sum(axis=0)
-                global_offset += int(grad_leaf.size)
-        return sketch
-
-    def _env_major_transition(x, timestep):
-        # batchify is agent-major: (agents * envs, ...) -> (envs, 1, agents, ...)
-        x_t = x[timestep].reshape(
-            (num_agents, num_envs) + x.shape[2:]
-        )
-        return jnp.moveaxis(x_t, 1, 0)[:, None, ...]
-
-    def _env_major_hstate(hstate):
-        return jax.tree.map(
-            lambda h: jnp.moveaxis(
-                h.reshape((num_agents, num_envs) + h.shape[1:]), 1, 0
-            ),
-            hstate,
-        )
-
-    # Recover the actual recurrent carry before each selected transition by
-    # replaying only the required prefix segments. Carries are treated as fixed
-    # inputs to the independent-transition gradient, matching the paper's
-    # per-data-point view without storing the full rollout carry history.
-    hstates_at_time = {}
-    current_hstate = initial_hstate
-    previous_timestep = 0
-    for timestep in timesteps:
-        if timestep > previous_timestep:
-            current_hstate, _, _ = network.apply(
-                original_params,
-                current_hstate,
-                (
-                    traj_batch.obs[previous_timestep:timestep],
-                    traj_batch.done[previous_timestep:timestep],
-                    traj_batch.agent_positions[previous_timestep:timestep],
-                ),
-            )
-        current_hstate = jax.tree.map(jax.lax.stop_gradient, current_hstate)
-        hstates_at_time[timestep] = current_hstate
-        previous_timestep = timestep
-
-    actor_cosine_matrices = []
-    value_cosine_matrices = []
-    actor_dot_product_matrices = []
-    value_dot_product_matrices = []
-    for timestep in timesteps:
-        env_data = (
-            _env_major_hstate(hstates_at_time[timestep]),
-            _env_major_transition(traj_batch.obs, timestep),
-            _env_major_transition(traj_batch.done, timestep),
-            _env_major_transition(traj_batch.agent_positions, timestep),
-            _env_major_transition(traj_batch.value, timestep),
-            _env_major_transition(value_targets, timestep),
-            _env_major_transition(traj_batch.action, timestep),
-            _env_major_transition(traj_batch.log_prob, timestep),
-            _env_major_transition(advantages, timestep),
-        )
-
-        def _project_one_environment(_, sample):
-            (
-                hstate, obs, done, positions, old_value, target,
-                action, old_log_prob, advantage,
-            ) = sample
-            gradient_value = value_grad(
-                value_params,
-                hstate,
-                obs,
-                done,
-                positions,
-                old_value,
-                target,
-            )
-            value_sketch = _signed_feature_hash(
-                gradient_value, value_signs, value_keys
-            )
-
-            gradient_actor = actor_grad(
-                actor_params,
-                hstate,
-                obs,
-                done,
-                positions,
-                action,
-                old_log_prob,
-                advantage,
-            )
-            actor_sketch = _signed_feature_hash(
-                gradient_actor, actor_signs, actor_keys
-            )
-            return None, (actor_sketch, value_sketch)
-
-        _, (actor_sketches, value_sketches) = jax.lax.scan(
-            _project_one_environment, None, env_data
-        )
-
-        def _matrix_pair(sketches):
-            row_norm = jnp.linalg.norm(sketches, axis=1)
-            valid = row_norm > 1e-12
-            # One Gram matmul serves both views.  The raw projected dot product
-            # retains gradient magnitude, while division by the outer product
-            # of norms gives the direction-only cosine matrix.
-            dot_product_matrix = sketches @ sketches.T
-            valid_pairs = valid[:, None] & valid[None, :]
-            dot_product_matrix = jnp.where(
-                valid_pairs, dot_product_matrix, jnp.nan
-            )
-            cosine_matrix = jnp.clip(
-                dot_product_matrix
-                / (row_norm[:, None] * row_norm[None, :] + 1e-12),
-                -1.0,
-                1.0,
-            )
-            diagonal = jnp.arange(num_envs)
-            cosine_matrix = cosine_matrix.at[diagonal, diagonal].set(
-                jnp.where(valid, 1.0, jnp.nan)
-            )
-            return cosine_matrix, dot_product_matrix
-
-        actor_cosine, actor_dot_product = _matrix_pair(actor_sketches)
-        value_cosine, value_dot_product = _matrix_pair(value_sketches)
-        actor_cosine_matrices.append(actor_cosine)
-        value_cosine_matrices.append(value_cosine)
-        actor_dot_product_matrices.append(actor_dot_product)
-        value_dot_product_matrices.append(value_dot_product)
-
-    return jnp.stack(
-        (
-            jnp.stack(
-                (
-                    jnp.stack(actor_cosine_matrices),
-                    jnp.stack(value_cosine_matrices),
-                )
-            ),
-            jnp.stack(
-                (
-                    jnp.stack(actor_dot_product_matrices),
-                    jnp.stack(value_dot_product_matrices),
-                )
-            ),
-        ),
-        axis=0,
-    )
-
-
-def render_projected_gradient_heatmaps(matrices, timesteps):
-    """Render host-side RGBA images for WandB without retaining figures."""
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    matrices = np.asarray(matrices)
-    timesteps = tuple(int(t) for t in timesteps)
-    expected_prefix = (2, 2, len(timesteps))
-    if matrices.shape[:3] != expected_prefix:
-        raise ValueError(
-            f"expected matrix prefix {expected_prefix}, got {matrices.shape}"
-        )
-
-    images = {}
-    for matrix_index, matrix_name in enumerate(("cosine", "dot_product")):
-        for loss_index, loss_name in enumerate(("actor", "value")):
-            for time_index, timestep in enumerate(timesteps):
-                matrix = matrices[matrix_index, loss_index, time_index]
-                fig, axis = plt.subplots(figsize=(6.4, 5.6), dpi=120)
-                image_kwargs = {
-                    "cmap": "coolwarm",
-                    "interpolation": "nearest",
-                    "origin": "upper",
-                }
-                if matrix_name == "cosine":
-                    image_kwargs.update(vmin=-1.0, vmax=1.0)
-                    title = "Projected normalized gradient Gram matrix"
-                    colorbar_label = "projected cosine similarity"
-                    wandb_namespace = "gradient_covariance_projected"
-                else:
-                    finite_values = matrix[np.isfinite(matrix)]
-                    max_abs = (
-                        float(np.max(np.abs(finite_values)))
-                        if finite_values.size
-                        else 0.0
-                    )
-                    if max_abs > 0.0:
-                        nonzero_abs = np.abs(
-                            finite_values[finite_values != 0.0]
-                        )
-                        linthresh = max(
-                            float(np.percentile(nonzero_abs, 10.0)),
-                            max_abs * 1e-6,
-                        )
-                        image_kwargs["norm"] = matplotlib.colors.SymLogNorm(
-                            linthresh=linthresh,
-                            linscale=1.0,
-                            vmin=-max_abs,
-                            vmax=max_abs,
-                            base=10,
-                        )
-                    else:
-                        image_kwargs.update(vmin=-1.0, vmax=1.0)
-                    title = "Projected gradient dot-product Gram matrix"
-                    colorbar_label = "projected gradient dot product (symlog)"
-                    wandb_namespace = "gradient_dot_product_projected"
-
-                image = axis.imshow(matrix, **image_kwargs)
-                axis.set_title(
-                    f"{title}\n"
-                    f"{loss_name}, t={timestep}; one joint sample per env"
-                )
-                axis.set_xlabel("environment slot j")
-                axis.set_ylabel("environment slot i")
-                fig.colorbar(image, ax=axis, label=colorbar_label)
-                fig.tight_layout()
-                fig.canvas.draw()
-                rgba = np.asarray(fig.canvas.buffer_rgba()).copy()
-                plt.close(fig)
-                images[
-                    f"{wandb_namespace}/{loss_name}/t_{timestep}"
-                ] = rgba
-    return images
-
-
 def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
     """Shape-compatible skipped output for interval-only diagnostics."""
     names = []
@@ -418,15 +27,6 @@ def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
                 names.append(
                     f"grad_conflict_{loss_type}/{layout_i}_vs_{layout_j}"
                 )
-                names.append(
-                    f"grad_neg_dot_{loss_type}/{layout_i}_vs_{layout_j}"
-                )
-
-        for layout_name in layout_names:
-            names.append(f"grad_conflict_{loss_type}/alignment/{layout_name}")
-            names.append(
-                f"grad_conflict_{loss_type}/alignment_loo/{layout_name}"
-            )
 
         for metric_name in (
             "avg_pairwise_cosine",
@@ -443,7 +43,6 @@ def empty_gradient_conflict_metrics(layout_names, dtype=jnp.float32):
 
 
 def compute_gradient_conflict_metrics(
-    *,
     network,
     original_params,
     initial_hstate,
@@ -456,492 +55,573 @@ def compute_gradient_conflict_metrics(
     num_agents,
     pairing_key,
     value_trunk_keys,
-    actor_trunk_keys,
-):
-    _num_layouts = len(layout_names)
-    # subsample: use only the first _GC_STEPS steps to reduce activation memory
-    _GC_STEPS = config["GRAD_CONFLICT_WINDOW_STEPS"]
-    _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
-    _gc_adv  = advantages[:_GC_STEPS]
-    _gc_tgt  = value_targets[:_GC_STEPS]
-    # Use one common normalization for every layout so count-weighted layout
-    # gradients reconstruct the gradient of the combined GC-window loss.
-    _gc_adv_mean = jnp.mean(_gc_adv)
-    _gc_adv_std = jnp.sqrt(
-        jnp.mean((_gc_adv - _gc_adv_mean) ** 2) + 1e-8
-    )
-    
-    # Reuse environment-level classification for the conflict subsample.
-    _layout_ids = layout_ids_full[:_GC_STEPS]
-    
-    def _tdot(g1, g2):
+    actor_trunk_keys):
+
+    num_layouts = len(layout_names)
+    advantage_mean = jnp.mean(advantages)
+    advantage_std = jnp.std(advantages)
+
+    def _tree_dot_product(tree_a, tree_b):
         return sum(
-            jnp.sum(a * b)
-            for a, b in zip(jax.tree_util.tree_leaves(g1), jax.tree_util.tree_leaves(g2))
-        )
-    
-    def _tnorm2(g):
-        return sum(jnp.sum(a ** 2) for a in jax.tree_util.tree_leaves(g))
-    
-    # Per-loss-type scalar accumulators: norms_sq[lid], dots[(i,j)], prev[lid]
-    # actor and value are logged; entropy is excluded (less interpretable).
-    _gc_state = {
-        'actor': {'norms_sq': [], 'dots': {}, 'prev': []},
-        'value': {'norms_sq': [], 'dots': {}, 'prev': []},
-    }
-    
-    _sample_counts = []
-    for _lid in range(_num_layouts):
-        # Classify at the environment level first, then include all agents from
-        # that environment in the family loss. batchify is agent-major, so
-        # tiling reproduces the (agent_0 envs, agent_1 envs, ...) actor order.
-        _env_mask = (_layout_ids == _lid).astype(jnp.float32)  # (T, NUM_ENVS)
-        _mask = jnp.tile(_env_mask, (1, num_agents))       # (T, NUM_ACTORS)
-        _cnt = _mask.sum() + 1e-8
-        _sample_counts.append(_env_mask.sum())
-    
-        # Single forward pass per layout; 2 backward passes via vjp cotangents.
-        def _fwd(p, mask=_mask, cnt=_cnt):
-            _, pi, value = jax.checkpoint(network.apply)(
-                p, initial_hstate,
-                (_gc_traj.obs, _gc_traj.done, _gc_traj.agent_positions),
+            jnp.sum(leaf_a * leaf_b)
+            for leaf_a, leaf_b in zip(
+                jax.tree_util.tree_leaves(tree_a),
+                jax.tree_util.tree_leaves(tree_b),
             )
-            lp = pi.log_prob(_gc_traj.action)
-            gae = (_gc_adv - _gc_adv_mean) / (_gc_adv_std + 1e-8)
-            ratio = jnp.exp(lp - _gc_traj.log_prob)
-            al = -(jnp.minimum(
-                ratio * gae,
-                jnp.clip(ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]) * gae,
-            ) * mask).sum() / cnt
-            vpc = _gc_traj.value + (value - _gc_traj.value).clip(
-                -config["CLIP_EPS"], config["CLIP_EPS"]
-            )
-            vl = 0.5 * (jnp.maximum(
-                jnp.square(value - _gc_tgt), jnp.square(vpc - _gc_tgt)
-            ) * mask).sum() / cnt
-            return al, vl
-    
-        _, _vjp_fn = jax.vjp(_fwd, original_params)
-        # cotangent (1, 0) → actor gradient; (0, 1) → value gradient
-        _g_actor, = _vjp_fn((1.0, 0.0))
-        _g_value, = _vjp_fn((0.0, 1.0))
-    
-        for _loss_type, _g in [('actor', _g_actor), ('value', _g_value)]:
-            _s = _gc_state[_loss_type]
-            _s['norms_sq'].append(_tnorm2(_g))
-            for _prev_lid, _g_prev in enumerate(_s['prev']):
-                _s['dots'][(_prev_lid, _lid)] = _tdot(_g_prev, _g)
-            _s['prev'].append(_g)
-    
-    grad_conflict = {}
-    _sample_counts_arr = jnp.stack(_sample_counts)
-    _sample_total = _sample_counts_arr.sum() + 1e-8
-    for _i in range(_num_layouts):
-        grad_conflict[f"sample_share/{layout_names[_i]}"] = _sample_counts_arr[_i] / _sample_total
-    
-    for _loss_type, _s in _gc_state.items():
-        _valid_layout = _sample_counts_arr > 0
-        _norm_role = "actor" if _loss_type == "actor" else "critic"
-        # per-layout gradient norms
-        for _i in range(_num_layouts):
-            grad_conflict[f"grad_norm_{_norm_role}/{layout_names[_i]}"] = (
-                jnp.where(
-                    _valid_layout[_i],
-                    jnp.sqrt(_s['norms_sq'][_i]),
-                    jnp.nan,
-                )
-            )
-        # pairwise cosine similarities
-        for _i in range(_num_layouts):
-            for _j in range(_i + 1, _num_layouts):
-                _pair_valid = _valid_layout[_i] & _valid_layout[_j]
-                cos = jnp.where(_pair_valid, _s['dots'][(_i, _j)] / (
-                    jnp.sqrt(_s['norms_sq'][_i] * _s['norms_sq'][_j]) + 1e-8
-                ), jnp.nan)
-                grad_conflict[
-                    f"grad_conflict_{_loss_type}/{layout_names[_i]}_vs_{layout_names[_j]}"
-                ] = cos
-                # neg_dot_ij = max(0, -g_i · g_j): magnitude of conflict, 0 when aligned
-                neg_dot = jnp.where(
-                    _pair_valid,
-                    jnp.maximum(0.0, -_s['dots'][(_i, _j)]),
-                    jnp.nan,
-                )
-                grad_conflict[
-                    f"grad_neg_dot_{_loss_type}/{layout_names[_i]}_vs_{layout_names[_j]}"
-                ] = neg_dot
-        # Count-weighted combined direction. Each g_i is a per-layout mean,
-        # so count_i * g_i is proportional to that layout's contribution to
-        # the combined GC-window gradient.
-        _g_all = jax.tree.map(
-            lambda *gs: sum(
-                _sample_counts_arr[i] * g for i, g in enumerate(gs)
-            ),
-            *_s['prev'],
-        )
-        _norm_all_sq = _tnorm2(_g_all)
-        # `_g_all` is the count-weighted sum of per-layout mean gradients.
-        # Divide by the total count so this norm is directly comparable with
-        # each per-layout mean-gradient norm above.
-        grad_conflict[f"grad_norm_{_norm_role}/total"] = (
-            jnp.sqrt(_norm_all_sq) / _sample_total
-        )
-        for _i in range(_num_layouts):
-            _dot_i_all = _tdot(_s['prev'][_i], _g_all)
-            _align = jnp.where(
-                _valid_layout[_i],
-                _dot_i_all / (
-                    jnp.sqrt(_s['norms_sq'][_i] * _norm_all_sq) + 1e-8
-                ),
-                jnp.nan,
-            )
-            grad_conflict[f"grad_conflict_{_loss_type}/alignment/{layout_names[_i]}"] = _align
-            # Two complementary layout-update signals:
-            #   magnitude = sample_share_i * ||mean_gradient_i||
-            #   signed = magnitude * cos(mean_gradient_i, combined_gradient)
-            # The first ignores direction; the second is signed and measures
-            # the component along the actual combined update direction.
-            _sample_share_i = _sample_counts_arr[_i] / _sample_total
-            _weighted_magnitude = jnp.where(
-                _valid_layout[_i],
-                _sample_share_i * jnp.sqrt(_s['norms_sq'][_i]),
-                jnp.nan,
-            )
-            grad_conflict[
-                f"grad_contribution_magnitude_{_norm_role}/{layout_names[_i]}"
-            ] = _weighted_magnitude
-            grad_conflict[
-                f"grad_contribution_signed_{_norm_role}/{layout_names[_i]}"
-            ] = jnp.where(
-                _valid_layout[_i], _weighted_magnitude * _align, jnp.nan
-            )
-            # Remove the layout's full count-weighted contribution.
-            _g_others = jax.tree.map(
-                lambda ga, gi: ga - _sample_counts_arr[_i] * gi,
-                _g_all,
-                _s['prev'][_i],
-            )
-            _norm_others_sq = _tnorm2(_g_others)
-            _dot_i_others = _tdot(_s['prev'][_i], _g_others)
-            _others_valid = (_sample_total - _sample_counts_arr[_i]) > 1e-8
-            _align_loo = jnp.where(
-                _valid_layout[_i] & _others_valid,
-                _dot_i_others / (
-                    jnp.sqrt(_s['norms_sq'][_i] * _norm_others_sq) + 1e-8
-                ),
-                jnp.nan,
-            )
-            grad_conflict[f"grad_conflict_{_loss_type}/alignment_loo/{layout_names[_i]}"] = _align_loo
-    # ── end gradient conflict ──────────────────────────────────────
-    
-    # ── sample-level (per-environment) gradient conflict ─────────────────────
-    # One sample is one environment slot's GC-window batch slice containing all
-    # agents. It may cross an episode reset; `done` correctly resets the RNN
-    # state. Gradients are compared across NUM_ENVS without separating layouts.
-    _VALUE_TRUNK_KEYS = tuple(value_trunk_keys)
-    _ACTOR_TRUNK_KEYS = tuple(actor_trunk_keys)
-    
-    def _select_keys(g, keys):
-        return {k: g['params'][k] for k in keys}
-    
-    def _restricted_normsq(g, keys):
-        selected = _select_keys(g, keys)
-        return sum(jnp.sum(x ** 2) for x in jax.tree_util.tree_leaves(selected))
-    
-    _other_value_params = {
-        k: v for k, v in original_params['params'].items()
-        if k not in _VALUE_TRUNK_KEYS
-    }
-    _value_trunk_params = _select_keys(original_params, _VALUE_TRUNK_KEYS)
-    _other_actor_params = {
-        k: v for k, v in original_params['params'].items()
-        if k not in _ACTOR_TRUNK_KEYS
-    }
-    _actor_trunk_params = _select_keys(original_params, _ACTOR_TRUNK_KEYS)
-    
-    def _rebuild_value_params(vp):
-        merged = dict(_other_value_params)
-        merged.update(vp)
-        return {'params': merged}
-    
-    def _rebuild_actor_params(ap):
-        merged = dict(_other_actor_params)
-        merged.update(ap)
-        return {'params': merged}
-    
-    def _per_env_value_loss(vp, hstate_i, obs_i, done_i, pos_i, value_i, tgt_i):
-        _, _, value = jax.checkpoint(network.apply)(
-            _rebuild_value_params(vp), hstate_i, (obs_i, done_i, pos_i)
-        )
-        vpc = value_i + (value - value_i).clip(
-            -config["CLIP_EPS"], config["CLIP_EPS"]
-        )
-        return 0.5 * jnp.maximum(
-            jnp.square(value - tgt_i), jnp.square(vpc - tgt_i)
-        ).mean()
-    
-    def _per_env_value_grad(vp, hstate_i, obs_i, done_i, pos_i, value_i, tgt_i):
-        return jax.grad(_per_env_value_loss)(
-            vp, hstate_i, obs_i, done_i, pos_i, value_i, tgt_i
-        )
-    
-    def _per_env_actor_loss(
-        ap, hstate_i, obs_i, done_i, pos_i, action_i, logprob_i, adv_i
-    ):
-        _, pi, _ = jax.checkpoint(network.apply)(
-            _rebuild_actor_params(ap), hstate_i, (obs_i, done_i, pos_i)
-        )
-        ratio = jnp.exp(pi.log_prob(action_i) - logprob_i)
-        gae_i = (adv_i - _gc_adv_mean) / (_gc_adv_std + 1e-8)
-        return -jnp.minimum(
-            ratio * gae_i,
-            jnp.clip(
-                ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]
-            ) * gae_i,
-        ).mean()
-    
-    def _per_env_actor_grad(
-        ap, hstate_i, obs_i, done_i, pos_i, action_i, logprob_i, adv_i
-    ):
-        return jax.grad(_per_env_actor_loss)(
-            ap, hstate_i, obs_i, done_i, pos_i,
-            action_i, logprob_i, adv_i,
-        )
-    
-    # The global mean uses exactly the same loss definition as every env sample.
-    def _global_sample_fwd(p):
-        _, pi, value = jax.checkpoint(network.apply)(
-            p, initial_hstate,
-            (_gc_traj.obs, _gc_traj.done, _gc_traj.agent_positions),
-        )
-        ratio = jnp.exp(pi.log_prob(_gc_traj.action) - _gc_traj.log_prob)
-        gae = (_gc_adv - _gc_adv_mean) / (_gc_adv_std + 1e-8)
-        actor_loss = -jnp.minimum(
-            ratio * gae,
-            jnp.clip(
-                ratio, 1 - config["CLIP_EPS"], 1 + config["CLIP_EPS"]
-            ) * gae,
-        ).mean()
-        vpc = _gc_traj.value + (value - _gc_traj.value).clip(
-            -config["CLIP_EPS"], config["CLIP_EPS"]
-        )
-        value_loss = 0.5 * jnp.maximum(
-            jnp.square(value - _gc_tgt), jnp.square(vpc - _gc_tgt)
-        ).mean()
-        return actor_loss, value_loss
-    
-    _, _global_vjp = jax.vjp(_global_sample_fwd, original_params)
-    _global_actor_grad, = _global_vjp((1.0, 0.0))
-    _global_value_grad, = _global_vjp((0.0, 1.0))
-    
-    _CHUNK = config["GRAD_CONFLICT_CHUNK_SIZE"]
-    _n_envs = config["NUM_ENVS"]
-    _n_agents = num_agents
-    _n_chunks = _n_envs // _CHUNK
-    # Form a new random perfect matching at every diagnostic update.  After
-    # permutation, adjacent slots make NUM_ENVS / 2 disjoint unordered pairs.
-    # This keeps the streaming memory footprint while avoiding a fixed
-    # environment-slot pairing bias.
-    _env_permutation = jax.random.permutation(pairing_key, _n_envs)
-    
-    # batchify is agent-major:
-    # (T, agents * envs, ...) -> (chunks, chunk, T, agents, ...)
-    def _to_env_chunks(x):
-        x = x.reshape(
-            (x.shape[0], _n_agents, _n_envs) + x.shape[2:]
-        )
-        x = jnp.moveaxis(x, 2, 0)
-        x = jnp.take(x, _env_permutation, axis=0)
-        return x.reshape((_n_chunks, _CHUNK) + x.shape[1:])
-    
-    _obs_ec = _to_env_chunks(_gc_traj.obs)
-    _done_ec = _to_env_chunks(_gc_traj.done)
-    _pos_ec = _to_env_chunks(_gc_traj.agent_positions)
-    _value_ec = _to_env_chunks(_gc_traj.value)
-    _tgt_ec = _to_env_chunks(_gc_tgt)
-    _action_ec = _to_env_chunks(_gc_traj.action)
-    _logprob_ec = _to_env_chunks(_gc_traj.log_prob)
-    _adv_ec = _to_env_chunks(_gc_adv)
-    def _hstate_to_env_chunks(h):
-        h = jnp.moveaxis(
-            h.reshape((_n_agents, _n_envs) + h.shape[1:]), 1, 0
-        )
-        h = jnp.take(h, _env_permutation, axis=0)
-        return h.reshape(
-            (_n_chunks, _CHUNK, _n_agents) + h.shape[2:]
         )
 
-    _hstate_ec = jax.tree.map(_hstate_to_env_chunks, initial_hstate)
-    
-    def _accumulate_env_gradients(carry, env_data):
-        (
-            _sum_unit_value, _sum_unit_actor,
-            _sum_sqnorm_value, _sum_sqnorm_actor,
-            _sum_unit_sqnorm_value, _sum_unit_sqnorm_actor,
-            _pending_unit_value, _pending_unit_actor, _has_pending,
-            _conflict_count_value, _conflict_count_actor,
-            _negative_cosine_sum_value, _negative_cosine_sum_actor,
-            _pair_count,
-        ) = carry
-        (
-            hstate_i, obs_i, done_i, pos_i, value_i, tgt_i,
-            action_i, logprob_i, adv_i,
-        ) = env_data
-        _g_value = _per_env_value_grad(
-            _value_trunk_params, hstate_i, obs_i, done_i,
-            pos_i, value_i, tgt_i,
-        )
-        _g_actor = _per_env_actor_grad(
-            _actor_trunk_params, hstate_i, obs_i, done_i,
-            pos_i, action_i, logprob_i, adv_i,
-        )
-    
-        _sq_value = _tnorm2(_g_value)
-        _sq_actor = _tnorm2(_g_actor)
-        _denom_value = jnp.sqrt(_sq_value) + 1e-8
-        _denom_actor = jnp.sqrt(_sq_actor) + 1e-8
-        _unit_value = jax.tree.map(
-            lambda g: g / _denom_value, _g_value
-        )
-        _unit_actor = jax.tree.map(
-            lambda g: g / _denom_actor, _g_actor
-        )
-        _sum_unit_value = jax.tree.map(
-            lambda total, unit: total + unit,
-            _sum_unit_value,
-            _unit_value,
-        )
-        _sum_unit_actor = jax.tree.map(
-            lambda total, unit: total + unit,
-            _sum_unit_actor,
-            _unit_actor,
+    def _tree_squared_l2_norm(tree):
+        return sum(
+            jnp.sum(leaf ** 2)
+            for leaf in jax.tree_util.tree_leaves(tree)
         )
 
-        # Estimate sign-sensitive pair statistics without retaining all
-        # NUM_ENVS gradients. Adjacent slots in the randomized order form a
-        # perfect matching, giving NUM_ENVS / 2 pair samples per update.
-        _pair_cosine_value = _tdot(_pending_unit_value, _unit_value)
-        _pair_cosine_actor = _tdot(_pending_unit_actor, _unit_actor)
-        _pair_weight = _has_pending.astype(jnp.float32)
-        _conflict_count_value += _pair_weight * (
-            _pair_cosine_value < 0
-        ).astype(jnp.float32)
-        _conflict_count_actor += _pair_weight * (
-            _pair_cosine_actor < 0
-        ).astype(jnp.float32)
-        _negative_cosine_sum_value += _pair_weight * jnp.maximum(
-            0.0, -_pair_cosine_value
-        )
-        _negative_cosine_sum_actor += _pair_weight * jnp.maximum(
-            0.0, -_pair_cosine_actor
-        )
-        _pair_count += _pair_weight
-        _pending_unit_value = jax.tree.map(
-            lambda pending, unit: jnp.where(
-                _has_pending, jnp.zeros_like(pending), unit
-            ),
-            _pending_unit_value,
-            _unit_value,
-        )
-        _pending_unit_actor = jax.tree.map(
-            lambda pending, unit: jnp.where(
-                _has_pending, jnp.zeros_like(pending), unit
-            ),
-            _pending_unit_actor,
-            _unit_actor,
-        )
+    def _normalize_rollout_advantages(unnormalized_advantages):
         return (
-            _sum_unit_value,
-            _sum_unit_actor,
-            _sum_sqnorm_value + _sq_value,
-            _sum_sqnorm_actor + _sq_actor,
-            _sum_unit_sqnorm_value + _sq_value / (_denom_value ** 2),
-            _sum_unit_sqnorm_actor + _sq_actor / (_denom_actor ** 2),
-            _pending_unit_value,
-            _pending_unit_actor,
-            ~_has_pending,
-            _conflict_count_value,
-            _conflict_count_actor,
-            _negative_cosine_sum_value,
-            _negative_cosine_sum_actor,
-            _pair_count,
-        ), None
-    
-    def _chunk_body(carry, chunk_data):
-        return jax.lax.scan(_accumulate_env_gradients, carry, chunk_data)[0], None
-    
-    _sample_accum_init = (
-        jax.tree.map(jnp.zeros_like, _value_trunk_params),
-        jax.tree.map(jnp.zeros_like, _actor_trunk_params),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jax.tree.map(jnp.zeros_like, _value_trunk_params),
-        jax.tree.map(jnp.zeros_like, _actor_trunk_params),
-        jnp.array(False),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jnp.array(0.0),
-        jnp.array(0.0),
+            (unnormalized_advantages - advantage_mean)
+            / (advantage_std + 1e-8)
+        )
+
+    def _ppo_value_loss(predicted_values, old_values, targets):
+
+        clipped_values = old_values + (
+            predicted_values - old_values
+        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+        value_losses = jnp.square(predicted_values - targets)
+        value_losses_clipped = jnp.square(clipped_values - targets)
+
+        return  0.5 * jnp.maximum(value_losses, value_losses_clipped) 
+
+    def _ppo_actor_loss(new_log_probs, old_log_probs, normalized_advantages):
+
+        probability_ratio = jnp.exp(new_log_probs - old_log_probs)
+        loss_actor1 = probability_ratio * normalized_advantages
+        loss_actor2 = (jnp.clip(
+                probability_ratio,
+                1.0 - config["CLIP_EPS"],
+                1.0 + config["CLIP_EPS"],
+            )
+            * normalized_advantages
+        ) 
+
+        return -jnp.minimum(loss_actor1, loss_actor2)
+
+    layout_gradient_state = {
+        "actor": {
+            "squared_norms": [],
+            "pairwise_dot_products": {},
+            "gradients": [],
+        },
+        "value": {
+            "squared_norms": [],
+            "pairwise_dot_products": {},
+            "gradients": [],
+        },
+    }
+
+    # Compute squared_norm, dot_products, gradient per layouts
+    layout_sample_counts = []
+    for layout_id in range(num_layouts):
+        # Classification is environment-level. Repeat the mask for every agent
+        environment_mask = (layout_ids_full == layout_id).astype(jnp.float32)
+        actor_mask = jnp.tile(environment_mask, (1, num_agents))
+        actor_sample_count = actor_mask.sum() + 1e-8
+        layout_sample_counts.append(environment_mask.sum())
+
+        def _layout_losses(params, mask=actor_mask, sample_count=actor_sample_count):
+
+            _, policy, value = jax.checkpoint(network.apply)(
+                params,
+                initial_hstate,
+                (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+            )
+            log_prob = policy.log_prob(traj_batch.action)
+
+            value_loss_per_sample = _ppo_value_loss(
+                value,
+                traj_batch.value,
+                value_targets,
+            )
+            value_loss = (
+                (value_loss_per_sample * mask).sum() / sample_count
+            )
+
+            actor_loss_per_sample = _ppo_actor_loss(
+                log_prob,
+                traj_batch.log_prob,
+                _normalize_rollout_advantages(advantages),
+            )
+            actor_loss = (
+                actor_loss_per_sample * mask
+            ).sum() / sample_count
+
+            return value_loss, actor_loss 
+
+        _, layout_loss_vjp = jax.vjp(_layout_losses, original_params)
+        # Two VJP calls then select the actor and value gradients without running two independent forwards.
+        # Cotangent (1, 0) selects value loss, (0, 1) selects actor loss.
+        value_gradient, = layout_loss_vjp((1.0, 0.0))
+        actor_gradient, = layout_loss_vjp((0.0, 1.0))
+        
+        for loss_type, gradient in (
+            ("actor", actor_gradient),
+            ("value", value_gradient),
+        ):
+            state = layout_gradient_state[loss_type]
+            state["squared_norms"].append(_tree_squared_l2_norm(gradient))
+            for previous_layout_id, previous_gradient in enumerate(state["gradients"]):
+                state["pairwise_dot_products"][
+                    (previous_layout_id, layout_id)
+                ] = _tree_dot_product(previous_gradient, gradient)
+            state["gradients"].append(gradient)
+
+    metrics = {}
+    layout_sample_counts_array = jnp.stack(layout_sample_counts)
+    total_layout_samples = layout_sample_counts_array.sum() + 1e-8
+    valid_layouts = layout_sample_counts_array > 0
+
+    # sample_share about layout
+    for layout_id, layout_name in enumerate(layout_names):
+        metrics[f"sample_share/{layout_name}"] = (
+            layout_sample_counts_array[layout_id] / total_layout_samples
+        )
+
+    for loss_type, state in layout_gradient_state.items():
+        parameter_role = "actor" if loss_type == "actor" else "critic"
+
+        # gradient norm = the square root of the squared norm
+        for layout_id, layout_name in enumerate(layout_names):
+            metrics[f"grad_norm_{parameter_role}/{layout_name}"] = jnp.where(
+                valid_layouts[layout_id],
+                jnp.sqrt(state["squared_norms"][layout_id]),
+                jnp.nan,
+            )
+
+        # Cosine similarity using pairwise dot product and gradient norms
+        for layout_i in range(num_layouts):
+            for layout_j in range(layout_i + 1, num_layouts):
+                pair_is_valid = valid_layouts[layout_i] & valid_layouts[layout_j]
+                pair_dot_product = state["pairwise_dot_products"][
+                    (layout_i, layout_j)
+                ]
+                pair_norm_product = jnp.sqrt(
+                    state["squared_norms"][layout_i]
+                    * state["squared_norms"][layout_j]
+                )
+                cosine_similarity = jnp.where(
+                    pair_is_valid,
+                    pair_dot_product / (pair_norm_product + 1e-8),
+                    jnp.nan,
+                )
+                layout_pair_name = (
+                    f"{layout_names[layout_i]}_vs_{layout_names[layout_j]}"
+                )
+                metrics[
+                    f"grad_conflict_{loss_type}/{layout_pair_name}"
+                ] = cosine_similarity
+
+        # Each stored gradient is a within-layout mean.
+        # Weighting it by the layout count reconstructs the complete-rollout gradient sum.
+        count_weighted_gradient_sum = jax.tree.map(
+            lambda *layout_gradients: sum(
+                layout_sample_counts_array[index] * gradient
+                for index, gradient in enumerate(layout_gradients)
+            ),
+            *state["gradients"],
+        )
+        combined_gradient_squared_norm = _tree_squared_l2_norm(
+            count_weighted_gradient_sum
+        )
+        metrics[f"grad_norm_{parameter_role}/total"] = (
+            jnp.sqrt(combined_gradient_squared_norm) / total_layout_samples
+        )
+
+        # grad_contribution_magnitude & grad_contribution_signed
+        for layout_id, layout_name in enumerate(layout_names):
+            layout_gradient = state["gradients"][layout_id]
+
+            layout_combined_dot_product = _tree_dot_product(
+                layout_gradient, count_weighted_gradient_sum)
+
+            # cosine simliarity between gradient of layout and average gradient    
+            alignment_with_combined_gradient = jnp.where(
+                valid_layouts[layout_id],
+                layout_combined_dot_product
+                / (
+                    jnp.sqrt(
+                        state["squared_norms"][layout_id]
+                        * combined_gradient_squared_norm
+                    )
+                    + 1e-8
+                ),
+                jnp.nan,
+            )
+
+            sample_share = (
+                layout_sample_counts_array[layout_id] / total_layout_samples
+                )
+
+            weighted_gradient_magnitude = jnp.where(
+                valid_layouts[layout_id],
+                sample_share * jnp.sqrt(
+                    state["squared_norms"][layout_id]
+                ),
+                jnp.nan,
+            )
+
+            metrics[
+                f"grad_contribution_magnitude_{parameter_role}/{layout_name}"
+            ] = weighted_gradient_magnitude
+
+            metrics[
+                f"grad_contribution_signed_{parameter_role}/{layout_name}"
+            ] = jnp.where(
+                valid_layouts[layout_id],
+                weighted_gradient_magnitude
+                * alignment_with_combined_gradient,
+                jnp.nan,
+            )
+
+    # Sample-level (per-environment) gradient conflict.
+    # One sample is one environment slot's complete rollout and contains every
+    # agent in that slot.
+
+    def _select_parameter_group(parameter_tree, parameter_keys):
+        return {
+            key: parameter_tree["params"][key]
+            for key in parameter_keys
+        }
+
+    # Compute the complete-rollout mean gradients with the same two losses used
+    # for each environment sample. They are needed for the alignment statistic.
+    def _global_losses(params):
+        _, policy, predicted_values = jax.checkpoint(network.apply)(
+            params,
+            initial_hstate,
+            (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+        )
+
+        actor_loss = _ppo_actor_loss(
+            policy.log_prob(traj_batch.action),
+            traj_batch.log_prob,
+            _normalize_rollout_advantages(advantages),
+        ).mean()
+
+        value_loss = _ppo_value_loss(
+            predicted_values,
+            traj_batch.value,
+            value_targets,
+        ).mean()
+
+        return value_loss, actor_loss
+
+    _, global_loss_vjp = jax.vjp(_global_losses, original_params)
+    global_value_gradient, = global_loss_vjp((1.0, 0.0))
+    global_actor_gradient, = global_loss_vjp((0.0, 1.0))
+
+    num_environment_chunks = config["NUM_ENVS"] // config["GRAD_CONFLICT_CHUNK_SIZE"]
+    if config["NUM_ENVS"] % config["GRAD_CONFLICT_CHUNK_SIZE"] != 0:
+        raise ValueError(
+            "GRAD_CONFLICT_CHUNK_SIZE must evenly divide NUM_ENVS"
+        )
+
+    # A fresh permutation creates NUM_ENVS / 2 disjoint random pairs. Chunking
+    # changes peak memory only; it does not change the permutation or pair set.
+    environment_permutation = jax.random.permutation(pairing_key, config["NUM_ENVS"])
+
+    def _to_environment_chunks(array, actor_axis):
+        actor_environment_shape = (
+            *array.shape[:actor_axis],
+            num_agents,
+            config["NUM_ENVS"],
+            *array.shape[actor_axis + 1:],
+        )
+        actor_environment_view = array.reshape(actor_environment_shape)
+
+        environment_axis = actor_axis + 1
+        environment_major = jnp.moveaxis(
+            actor_environment_view,
+            environment_axis,
+            0,
+        )
+        shuffled_environments = jnp.take(
+            environment_major, environment_permutation, axis=0
+        )
+        chunked_environment_shape = (
+            num_environment_chunks,
+            config["GRAD_CONFLICT_CHUNK_SIZE"],
+            *shuffled_environments.shape[1:],
+        )
+        return shuffled_environments.reshape(chunked_environment_shape)
+
+    # Rollout arrays have shape [T, NUM_ACTORS, ...], so their combined
+    # actor-environment axis is 1. Initial hidden-state leaves have no time
+    # axis and use [NUM_ACTORS, ...], so their combined axis is 0.
+    environment_chunks = {
+        "observations": _to_environment_chunks(traj_batch.obs, actor_axis=1),
+        "dones": _to_environment_chunks(traj_batch.done, actor_axis=1),
+        "agent_positions": _to_environment_chunks(traj_batch.agent_positions, actor_axis=1),
+        "old_values": _to_environment_chunks(traj_batch.value, actor_axis=1),
+        "targets": _to_environment_chunks(value_targets, actor_axis=1),
+        "actions": _to_environment_chunks(traj_batch.action, actor_axis=1),
+        "old_log_probs": _to_environment_chunks(traj_batch.log_prob, actor_axis=1),
+        "advantages": _to_environment_chunks(advantages, actor_axis=1),
+        "initial_hstate": jax.tree.map(lambda hidden_state: _to_environment_chunks(
+                hidden_state, actor_axis=0),initial_hstate),
+    }
+
+    def _accumulate_environment_gradient(accumulator, environment_sample):
+        def _environment_losses(params):
+            _, policy, predicted_values = jax.checkpoint(network.apply)(
+                params,
+                environment_sample["initial_hstate"],
+                (
+                    environment_sample["observations"],
+                    environment_sample["dones"],
+                    environment_sample["agent_positions"],
+                ),
+            )
+            value_loss = _ppo_value_loss(
+                predicted_values,
+                environment_sample["old_values"],
+                environment_sample["targets"],
+            ).mean()
+            actor_loss = _ppo_actor_loss(
+                policy.log_prob(environment_sample["actions"]),
+                environment_sample["old_log_probs"],
+                _normalize_rollout_advantages(
+                    environment_sample["advantages"]
+                ),
+            ).mean()
+            return value_loss, actor_loss
+
+        _, environment_loss_vjp = jax.vjp(
+            _environment_losses, original_params
+        )
+
+        full_value_gradient, = environment_loss_vjp((1.0, 0.0))
+        full_actor_gradient, = environment_loss_vjp((0.0, 1.0))
+
+        value_gradient = _select_parameter_group(
+            full_value_gradient, value_trunk_keys
+        )
+        actor_gradient = _select_parameter_group(
+            full_actor_gradient, actor_trunk_keys
+        )
+
+        value_squared_norm = _tree_squared_l2_norm(value_gradient)
+        actor_squared_norm = _tree_squared_l2_norm(actor_gradient)
+        value_norm_denominator = jnp.sqrt(value_squared_norm) + 1e-8
+        actor_norm_denominator = jnp.sqrt(actor_squared_norm) + 1e-8
+        normalized_value_gradient = jax.tree.map(
+            lambda gradient: gradient / value_norm_denominator,
+            value_gradient,
+        )
+        normalized_actor_gradient = jax.tree.map(
+            lambda gradient: gradient / actor_norm_denominator,
+            actor_gradient,
+        )
+
+        value_pair_cosine = _tree_dot_product(
+            accumulator["pending_value_gradient"],
+            normalized_value_gradient,
+        )
+        actor_pair_cosine = _tree_dot_product(
+            accumulator["pending_actor_gradient"],
+            normalized_actor_gradient,
+        )
+        next_pending_value_gradient = jax.tree.map(
+            lambda pending, current: jnp.where(
+                accumulator["has_pending_gradient"],
+                jnp.zeros_like(pending),
+                current,
+            ),
+            accumulator["pending_value_gradient"],
+            normalized_value_gradient,
+        )
+        next_pending_actor_gradient = jax.tree.map(
+            lambda pending, current: jnp.where(
+                accumulator["has_pending_gradient"],
+                jnp.zeros_like(pending),
+                current,
+            ),
+            accumulator["pending_actor_gradient"],
+            normalized_actor_gradient,
+        )
+
+        return {
+            "value_normalized_gradient_sum": jax.tree.map(
+                lambda total, current: total + current,
+                accumulator["value_normalized_gradient_sum"],
+                normalized_value_gradient,
+            ),
+            "actor_normalized_gradient_sum": jax.tree.map(
+                lambda total, current: total + current,
+                accumulator["actor_normalized_gradient_sum"],
+                normalized_actor_gradient,
+            ),
+            "value_squared_norm_sum": (
+                accumulator["value_squared_norm_sum"]
+                + value_squared_norm
+            ),
+            "actor_squared_norm_sum": (
+                accumulator["actor_squared_norm_sum"]
+                + actor_squared_norm
+            ),
+            "value_normalized_squared_norm_sum": (
+                accumulator["value_normalized_squared_norm_sum"]
+                + value_squared_norm / (value_norm_denominator ** 2)
+            ),
+            "actor_normalized_squared_norm_sum": (
+                accumulator["actor_normalized_squared_norm_sum"]
+                + actor_squared_norm / (actor_norm_denominator ** 2)
+            ),
+            "pending_value_gradient": next_pending_value_gradient,
+            "pending_actor_gradient": next_pending_actor_gradient,
+            "has_pending_gradient": jnp.logical_not(
+                accumulator["has_pending_gradient"]
+            ),
+            "value_conflict_count": (
+                accumulator["value_conflict_count"]
+                + accumulator["has_pending_gradient"]
+                * (value_pair_cosine < 0)
+            ),
+            "actor_conflict_count": (
+                accumulator["actor_conflict_count"]
+                + accumulator["has_pending_gradient"]
+                * (actor_pair_cosine < 0)
+            ),
+            "value_negative_cosine_sum": (
+                accumulator["value_negative_cosine_sum"]
+                + accumulator["has_pending_gradient"]
+                * jnp.maximum(0.0, -value_pair_cosine)
+            ),
+            "actor_negative_cosine_sum": (
+                accumulator["actor_negative_cosine_sum"]
+                + accumulator["has_pending_gradient"]
+                * jnp.maximum(0.0, -actor_pair_cosine)
+            ),
+            "matched_pair_count": (
+                accumulator["matched_pair_count"]
+                + accumulator["has_pending_gradient"]
+            ),
+        }, None
+
+    def _accumulate_environment_chunk(accumulator, environment_chunk):
+        updated_accumulator, _ = jax.lax.scan(
+            _accumulate_environment_gradient,
+            accumulator,
+            environment_chunk,
+        )
+        return updated_accumulator, None
+
+    value_gradient_template = _select_parameter_group(
+        original_params, value_trunk_keys
     )
-    (
-        _sum_unit_value, _sum_unit_actor,
-        _sum_sqnorm_value, _sum_sqnorm_actor,
-        _sum_unit_sqnorm_value, _sum_unit_sqnorm_actor,
-        _pending_unit_value, _pending_unit_actor, _has_pending,
-        _conflict_count_value, _conflict_count_actor,
-        _negative_cosine_sum_value, _negative_cosine_sum_actor,
-        _pair_count,
-    ), _ = jax.lax.scan(
-        _chunk_body,
-        _sample_accum_init,
+    actor_gradient_template = _select_parameter_group(
+        original_params, actor_trunk_keys
+    )
+    initial_accumulator = {
+        "value_normalized_gradient_sum": jax.tree.map(
+            jnp.zeros_like, value_gradient_template
+        ),
+        "actor_normalized_gradient_sum": jax.tree.map(
+            jnp.zeros_like, actor_gradient_template
+        ),
+        "value_squared_norm_sum": jnp.array(0.0),
+        "actor_squared_norm_sum": jnp.array(0.0),
+        "value_normalized_squared_norm_sum": jnp.array(0.0),
+        "actor_normalized_squared_norm_sum": jnp.array(0.0),
+        "pending_value_gradient": jax.tree.map(
+            jnp.zeros_like, value_gradient_template
+        ),
+        "pending_actor_gradient": jax.tree.map(
+            jnp.zeros_like, actor_gradient_template
+        ),
+        "has_pending_gradient": jnp.array(False),
+        "value_conflict_count": jnp.array(0.0),
+        "actor_conflict_count": jnp.array(0.0),
+        "value_negative_cosine_sum": jnp.array(0.0),
+        "actor_negative_cosine_sum": jnp.array(0.0),
+        "matched_pair_count": jnp.array(0.0),
+    }
+    accumulated, _ = jax.lax.scan(
+        _accumulate_environment_chunk,
+        initial_accumulator,
+        environment_chunks,
+    )
+
+    loss_summaries = (
         (
-            _hstate_ec, _obs_ec, _done_ec, _pos_ec, _value_ec,
-            _tgt_ec, _action_ec, _logprob_ec, _adv_ec,
+            "value",
+            accumulated["value_squared_norm_sum"],
+            accumulated["value_normalized_gradient_sum"],
+            accumulated["value_normalized_squared_norm_sum"],
+            global_value_gradient,
+            value_trunk_keys,
+            accumulated["value_conflict_count"],
+            accumulated["value_negative_cosine_sum"],
+        ),
+        (
+            "actor",
+            accumulated["actor_squared_norm_sum"],
+            accumulated["actor_normalized_gradient_sum"],
+            accumulated["actor_normalized_squared_norm_sum"],
+            global_actor_gradient,
+            actor_trunk_keys,
+            accumulated["actor_conflict_count"],
+            accumulated["actor_negative_cosine_sum"],
         ),
     )
-    
+
     for (
-        _loss_type, _sum_indiv_sqnorm, _sum_unit,
-        _sum_unit_indiv_sqnorm, _global_grad, _keys,
-        _conflict_count, _negative_cosine_sum,
-    ) in (
-        (
-            'value', _sum_sqnorm_value, _sum_unit_value,
-            _sum_unit_sqnorm_value, _global_value_grad, _VALUE_TRUNK_KEYS,
-            _conflict_count_value, _negative_cosine_sum_value,
-        ),
-        (
-            'actor', _sum_sqnorm_actor, _sum_unit_actor,
-            _sum_unit_sqnorm_actor, _global_actor_grad, _ACTOR_TRUNK_KEYS,
-            _conflict_count_actor, _negative_cosine_sum_actor,
-        ),
-    ):
-        _mean_grad_normsq = _restricted_normsq(_global_grad, _keys)
-        _sum_all_sqnorm = (_n_envs ** 2) * _mean_grad_normsq
-        _alignment = (
-            _sum_all_sqnorm / (_n_envs * _sum_indiv_sqnorm + 1e-8)
+        loss_type,
+        individual_squared_norm_sum,
+        normalized_gradient_sum,
+        normalized_squared_norm_sum,
+        global_gradient,
+        parameter_keys,
+        conflict_count,
+        negative_cosine_sum,
+    ) in loss_summaries:
+        selected_global_gradient = _select_parameter_group(
+            global_gradient, parameter_keys
+        )
+        global_mean_gradient_squared_norm = _tree_squared_l2_norm(
+            selected_global_gradient
+        )
+        all_gradient_sum_squared_norm = (
+            config["NUM_ENVS"] ** 2
+        ) * global_mean_gradient_squared_norm
+        alignment = (
+            all_gradient_sum_squared_norm
+            / (
+                config["NUM_ENVS"] * individual_squared_norm_sum
+                + 1e-8
+            )
         )
         # For u_i = g_i / (||g_i|| + eps):
         # sum_{i != j} cos(g_i, g_j) = ||sum_i u_i||^2 - sum_i ||u_i||^2.
-        _avg_pairwise_cosine = (
-            (_tnorm2(_sum_unit) - _sum_unit_indiv_sqnorm)
-            / (_n_envs * (_n_envs - 1) + 1e-8)
+        average_pairwise_cosine = (
+            _tree_squared_l2_norm(normalized_gradient_sum)
+            - normalized_squared_norm_sum
+        ) / (
+            config["NUM_ENVS"] * (config["NUM_ENVS"] - 1) + 1e-8
         )
-        grad_conflict[
-            f"grad_conflict_sample_{_loss_type}/avg_pairwise_cosine"
-        ] = _avg_pairwise_cosine
-        grad_conflict[
-            f"grad_conflict_sample_{_loss_type}/conflict_rate"
-        ] = _conflict_count / (_pair_count + 1e-8)
-        grad_conflict[
-            f"grad_conflict_sample_{_loss_type}/avg_negative_cosine"
-        ] = _negative_cosine_sum / (_pair_count + 1e-8)
-        grad_conflict[
-            f"grad_conflict_sample_{_loss_type}/alignment"
-        ] = _alignment
-    # ── end sample-level gradient conflict ──────────────────────────
-    
-    return grad_conflict
+
+        metrics[
+            f"grad_conflict_sample_{loss_type}/avg_pairwise_cosine"
+        ] = average_pairwise_cosine
+        metrics[
+            f"grad_conflict_sample_{loss_type}/conflict_rate"
+        ] = conflict_count / (accumulated["matched_pair_count"] + 1e-8)
+        metrics[
+            f"grad_conflict_sample_{loss_type}/avg_negative_cosine"
+        ] = negative_cosine_sum / (
+            accumulated["matched_pair_count"] + 1e-8
+        )
+        metrics[
+            f"grad_conflict_sample_{loss_type}/alignment"
+        ] = alignment
+
+    return metrics

@@ -24,7 +24,7 @@ $$
 |---|---|
 | PPO loss, entropy, ratio, optimizer gradient norm, parameter weight norm, `returns` | interval 동안 finite 값의 평균 |
 | target, critic RMSE, TD-error RMSE | 해당 logging update의 rollout snapshot |
-| gradient conflict, representation feature/rank, gradient heatmap | 해당 logging update에서만 계산한 pre-update snapshot |
+| gradient conflict, representation feature/rank | 해당 logging update에서만 계산한 pre-update snapshot |
 | evaluation | 가장 최근 diagnostic evaluation 결과 |
 | layout별 training return | interval에서 종료된 episode들의 평균 |
 
@@ -36,8 +36,6 @@ parameter에서 계산하지만 W&B 값은 interval 동안 평균한다.
 ## 표기법
 
 - $N$: environment sample 수. 기본 설정에서는 `NUM_ENVS=256`.
-- $T_d$: gradient conflict에 사용하는 rollout 앞부분의 길이
-  (`GRAD_CONFLICT_WINDOW_STEPS`).
 - $T$: `NUM_STEPS`.
 - $A$: `NUM_ACTORS`. 기본 Overcooked 설정에서는 environment당 두 actor이므로
   $A=2N$이다.
@@ -182,7 +180,7 @@ $$
 `magnitude`는 항상 0 이상이다. `signed`가 음수이면 해당 layout gradient가
 전체 combined gradient 방향을 방해한다.
 
-### Layout 간 conflict와 alignment
+### Layout 간 conflict
 
 $$
 \cos(g_i,g_j)=
@@ -193,31 +191,15 @@ $$
 |---|---|
 | `grad_conflict_actor/<layout_i>_vs_<layout_j>` | actor layout gradient cosine |
 | `grad_conflict_value/<layout_i>_vs_<layout_j>` | value layout gradient cosine |
-| `grad_neg_dot_actor/<layout_i>_vs_<layout_j>` | $\max(0,-g_i^\top g_j)$ |
-| `grad_neg_dot_value/<layout_i>_vs_<layout_j>` | value gradient의 $\max(0,-g_i^\top g_j)$ |
-| `grad_conflict_actor/alignment/<layout>` | $\cos(g_l,G)$ |
-| `grad_conflict_value/alignment/<layout>` | value gradient의 $\cos(g_l,G)$ |
 
-Leave-one-out combined gradient를
-$G_{-l}=G-n_lg_l$라 하면 다음도 기록한다.
-
-$$
-\operatorname{alignment\_loo}_l=\cos(g_l,G_{-l}).
-$$
-
-```text
-grad_conflict_actor/alignment_loo/<layout>
-grad_conflict_value/alignment_loo/<layout>
-```
-
-Layout이 해당 diagnostic window에 존재하지 않으면 관련 layout metric은
+Layout이 해당 rollout에 존재하지 않으면 관련 layout metric은
 `NaN`이다.
 
 ## Environment-sample gradient conflict
 
-하나의 sample은 한 environment slot의 `GRAD_CONFLICT_WINDOW_STEPS` trajectory이며
-두 actor를 함께 포함한다. Episode reset을 통과하면 `done`이 recurrent state를
-reset한다. Actor와 value gradient는 별도로 측정한다.
+하나의 sample은 한 environment slot의 전체 `NUM_STEPS` trajectory이며 두 actor를
+함께 포함한다. Episode reset을 통과하면 `done`이 recurrent state를 reset한다.
+Actor와 value gradient는 별도로 측정한다.
 
 정규화된 gradient를 다음과 같이 둔다.
 
@@ -291,64 +273,6 @@ $$
 값이 1에 가까우면 environment gradient들이 집단적으로 같은 방향이고, 0에
 가까우면 상쇄되거나 서로 다른 방향이다. 이 값은 random matching이 아니라
 전체 $N$개 gradient를 반영한다.
-
-## Projected gradient heatmaps
-
-### Cosine: 방향만 비교
-
-```text
-gradient_covariance_projected/actor/t_<timestep>
-gradient_covariance_projected/value/t_<timestep>
-```
-
-기본 timestep은 YAML의 `GRADIENT_COVARIANCE_TIMESTEPS`에 지정된
-`[0, 16, 31]`이다. 각 timestep에서 environment별 joint gradient를 계산하고
-CountSketch 형태의 signed feature hashing $S$로
-`GRADIENT_COVARIANCE_SKETCH_DIM` 차원에 투영한다.
-
-$$
-\tilde g_i=Sg_i,
-\qquad
-\hat C_{ij}=
-\frac{\tilde g_i^\top\tilde g_j}
-{\|\tilde g_i\|_2\|\tilde g_j\|_2+\epsilon}.
-$$
-
-따라서 이름에 covariance가 들어가지만 실제 이미지는 projected normalized
-gradient cosine/Gram matrix이다. 행과 열은 environment slot이며 layout이나
-latent state 기준으로 재정렬하지 않는다. Sketch는 메모리를 크게 줄이지만
-cosine이 0에 가까운 pair의 값이나 부호에는 근사 오차가 생길 수 있다.
-
-### Dot product: 방향과 크기를 함께 비교
-
-```text
-gradient_dot_product_projected/actor/t_<timestep>
-gradient_dot_product_projected/value/t_<timestep>
-```
-
-동일한 projected gradient를 정규화하지 않고 내적한다.
-
-$$
-\hat D_{ij}
-=\tilde g_i^\top\tilde g_j
-=\|\tilde g_i\|_2\|\tilde g_j\|_2\cos(\tilde g_i,\tilde g_j)
-\approx g_i^\top g_j.
-$$
-
-양수는 두 gradient가 같은 방향 성분을, 음수는 충돌하는 방향 성분을 갖는다는
-뜻이다. 절댓값은 방향 관계뿐 아니라 두 gradient의 크기에도 커진다. 대각 원소
-$\hat D_{ii}=\|\tilde g_i\|_2^2$는 각 environment gradient의 projected squared
-norm이다.
-
-크기 범위가 넓어 작은 off-diagonal 값이 사라지지 않도록 이미지는 0을 중심으로
-한 symmetric-log 색상 축을 사용한다. 각 이미지의 색상 범위는 자체 데이터로
-정해지므로 서로 다른 update나 run의 색만 직접 비교하면 안 되며, 반드시 각
-colorbar의 수치를 함께 확인해야 한다. 이 값 역시 CountSketch의 근사 내적이며
-정확한 full-parameter dot product는 아니다.
-
-cosine과 dot-product 행렬은 하나의 projected Gram matrix에서 함께 계산한다.
-따라서 큰 matrix multiplication 횟수는 증가하지 않지만, callback 시점의 행렬
-출력과 W&B 이미지 수는 기존의 두 배가 된다.
 
 ## Representation weight metrics
 

@@ -32,9 +32,7 @@ from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_pro
 
 from gradient_conflict_utils import (
     compute_gradient_conflict_metrics,
-    compute_projected_gradient_matrices,
     empty_gradient_conflict_metrics,
-    render_projected_gradient_heatmaps,
 )
 from representation_metrics import (
     compute_minibatch_penultimate_metrics,
@@ -367,9 +365,6 @@ def make_train(
     env = initialize_environment(config)
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
-    gradient_covariance_timesteps = tuple(
-        int(t) for t in config["GRADIENT_COVARIANCE_TIMESTEPS"]
-    )
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -396,7 +391,7 @@ def make_train(
     eval_xp_enabled = (
         config["ENV_NAME"] == "overcooked"
         and len(eval_envs) > 0
-        and bool(config["EVAL_KWARGS"].get("eval_xp", False))
+        and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
     human_proxy_params = {}
     if eval_xp_enabled:
@@ -752,6 +747,8 @@ def make_train(
                     total_loss, grads = grad_fn(
                         train_state.params, init_hstate, traj_batch, advantages, targets
                     )
+
+                    # weight_norm
                     gradient_global_norm = tree_global_l2_norm(grads)
                     gradient_weighted_rms_norm = (
                         tree_leaf_count_weighted_rms_norm(grads)
@@ -786,24 +783,12 @@ def make_train(
                             gradient_weighted_rms_norm,
                             actor_gradient_weighted_rms_norm,
                             critic_gradient_weighted_rms_norm,
-                            minibatch_weight_metrics[
-                                "representation_weight/weight_norm"
-                            ],
-                            minibatch_weight_metrics[
-                                "representation_weight/actor_weight_norm"
-                            ],
-                            minibatch_weight_metrics[
-                                "representation_weight/critic_weight_norm"
-                            ],
-                            minibatch_weight_metrics[
-                                "representation_weight/weighted_rms_norm"
-                            ],
-                            minibatch_weight_metrics[
-                                "representation_weight/actor_weighted_rms_norm"
-                            ],
-                            minibatch_weight_metrics[
-                                "representation_weight/critic_weighted_rms_norm"
-                            ],
+                            minibatch_weight_metrics["representation_weight/weight_norm"],
+                            minibatch_weight_metrics["representation_weight/actor_weight_norm"],
+                            minibatch_weight_metrics["representation_weight/critic_weight_norm"],
+                            minibatch_weight_metrics["representation_weight/weighted_rms_norm"],
+                            minibatch_weight_metrics["representation_weight/actor_weighted_rms_norm"],
+                            minibatch_weight_metrics["representation_weight/critic_weighted_rms_norm"],
                         ),
                     )
 
@@ -1067,7 +1052,7 @@ def make_train(
 
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
 
-            def callback(metric, projected_gradient_matrices=None):
+            def callback(metric):
                 step = int(metric["update_steps"])
                 snapshot_prefixes = (
                     "target_raw/",
@@ -1154,14 +1139,6 @@ def make_train(
                                 _log_accum["layout_sum"][name] / c if c > 0 else float("nan")
                             )
 
-                    if projected_gradient_matrices is not None:
-                        heatmaps = render_projected_gradient_heatmaps(
-                            projected_gradient_matrices,
-                            gradient_covariance_timesteps,
-                        )
-                        for key, rgba in heatmaps.items():
-                            log_dict[key] = wandb.Image(rgba)
-
                     # Use the actual PPO update as WandB's global x-axis, rather than
                     # the number of times logging has occurred.
                     wandb.log(log_dict, step=step)
@@ -1181,40 +1158,8 @@ def make_train(
                 "layout_ids": _layout_ids_full,
             }
 
-            # Heatmaps are calculated and transferred only at diagnostic updates.
-            # They never enter `metric`, so the outer update scan cannot stack a
-            # NUM_UPDATES x 2 x 2 x 3 x NUM_ENVS x NUM_ENVS tensor.
-            def _callback_with_gradient_matrices(_):
-                projected_matrices = compute_projected_gradient_matrices(
-                    network=network,
-                    original_params=original_params,
-                    initial_hstate=initial_hstate,
-                    traj_batch=traj_batch,
-                    advantages=advantages,
-                    value_targets=targets,
-                    config=config,
-                    num_agents=env.num_agents,
-                    value_trunk_keys=VALUE_TRUNK_KEYS,
-                    actor_trunk_keys=ACTOR_TRUNK_KEYS,
-                )
-                return jax.experimental.io_callback(
-                    callback,
-                    None,
-                    callback_metric,
-                    projected_matrices,
-                    ordered=True,
-                )
-
-            def _callback_without_gradient_matrices(_):
-                return jax.experimental.io_callback(
-                    callback, None, callback_metric, ordered=True
-                )
-
-            jax.lax.cond(
-                run_eval,
-                _callback_with_gradient_matrices,
-                _callback_without_gradient_matrices,
-                operand=None,
+            jax.experimental.io_callback(
+                callback, None, callback_metric, ordered=True
             )
 
             def ckpt_callback(
@@ -1336,7 +1281,7 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
-    resume_xpid = config.get("RESUME_XPID", "")
+    resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
     filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"

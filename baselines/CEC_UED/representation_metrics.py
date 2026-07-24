@@ -45,21 +45,11 @@ def tree_global_l2_norm(tree):
     return jnp.sqrt(squared_norm)
 
 
-def weight_l2_norm(params):
-    """Global L2 norm over every parameter leaf.
-
-    Dense/Conv/RNN kernels, biases, and any 1-D learned scale/shift parameters
-    are all included. This is equivalent to flattening and concatenating the
-    complete parameter pytree before taking one L2 norm.
-    """
-    return tree_global_l2_norm(params)
-
-
 def parameter_group_l2_norm(params, module_names):
     """All-leaf global L2 norm for selected Flax parameter modules."""
     param_tree = params["params"] if "params" in params else params
     selected = {name: param_tree[name] for name in module_names}
-    return weight_l2_norm(selected)
+    return tree_global_l2_norm(selected)
 
 
 def tree_leaf_count_weighted_rms_norm(tree):
@@ -80,16 +70,6 @@ def tree_leaf_count_weighted_rms_norm(tree):
     )
 
 
-def parameter_count_weighted_rms(params):
-    """SimbaV2-style parameter-count weighted RMS of leaf L2 norms.
-
-    For leaves ``theta_i`` with ``n_i`` elements, this computes
-    ``sqrt(sum_i n_i * ||theta_i||_2^2 / sum_i n_i)``. All leaves, including
-    biases and learned 1-D scale/shift parameters, participate.
-    """
-    return tree_leaf_count_weighted_rms_norm(params)
-
-
 def tree_group_leaf_count_weighted_rms_norm(tree, module_names):
     """Leaf-size-weighted RMS for selected Flax parameter modules."""
     module_tree = tree["params"] if "params" in tree else tree
@@ -97,15 +77,10 @@ def tree_group_leaf_count_weighted_rms_norm(tree, module_names):
     return tree_leaf_count_weighted_rms_norm(selected)
 
 
-def parameter_group_count_weighted_rms(params, module_names):
-    """Weighted RMS for all leaves in selected Flax parameter modules."""
-    return tree_group_leaf_count_weighted_rms_norm(params, module_names)
-
-
 def compute_weight_metrics(params, actor_param_keys, critic_param_keys):
     """Measure SimBaV2-style parameter norms at one optimizer-update state."""
     return {
-        "representation_weight/weight_norm": weight_l2_norm(params),
+        "representation_weight/weight_norm": tree_global_l2_norm(params),
         "representation_weight/actor_weight_norm": parameter_group_l2_norm(
             params, actor_param_keys
         ),
@@ -113,180 +88,89 @@ def compute_weight_metrics(params, actor_param_keys, critic_param_keys):
             params, critic_param_keys
         ),
         "representation_weight/weighted_rms_norm": (
-            parameter_count_weighted_rms(params)
+            tree_leaf_count_weighted_rms_norm(params)
         ),
         "representation_weight/actor_weighted_rms_norm": (
-            parameter_group_count_weighted_rms(params, actor_param_keys)
+            tree_group_leaf_count_weighted_rms_norm(
+                params, actor_param_keys
+            )
         ),
         "representation_weight/critic_weighted_rms_norm": (
-            parameter_group_count_weighted_rms(params, critic_param_keys)
+            tree_group_leaf_count_weighted_rms_norm(
+                params, critic_param_keys
+            )
         ),
     }
 
 
-def feature_metrics(features, cutoff=0.01):
-    """Compute norm and singular-spectrum ranks for (..., feature_dim).
-
-    ``effective_rank_vetterli`` is the entropy-based continuous effective
-    rank. ``srank_kumar`` is the number of leading singular values needed to
-    explain ``1 - cutoff`` of their sum. ``approximate_rank_pca`` uses the
-    same threshold on the squared singular values, while ``matrix_rank`` uses
-    the standard NumPy/PyTorch numerical-rank tolerance.
-    """
-    feature_matrix = features.reshape((-1, features.shape[-1]))
+def feature_scale_metrics(feature_matrix, singular_values):
+    """Compute feature magnitude and leading-spectrum scale metrics."""
     n_samples = feature_matrix.shape[0]
-
-    # Mean per-sample representation norm. This is independent of batch size.
-    mean_feature_norm = jnp.mean(jnp.linalg.norm(feature_matrix, axis=-1))
-
-    # Lyle et al. (2022): singular values of Phi / sqrt(N) above epsilon. (https://arxiv.org/pdf/2204.09560.pdf)
-    singular_values = jnp.linalg.svd(feature_matrix, compute_uv=False)
     normalized_singular_values = singular_values / jnp.sqrt(
         jnp.asarray(n_samples, dtype=feature_matrix.dtype)
     )
-    feature_rank = jnp.sum(normalized_singular_values > cutoff).astype(
-        feature_matrix.dtype
-    )
+
+    return {
+        "feature_norm": jnp.mean(
+            jnp.linalg.norm(feature_matrix, axis=-1)
+        ),
+        "normalized_sigma_1": normalized_singular_values[0],
+        "sigma_1_ratio": singular_values[0] / jnp.sum(singular_values),
+    }
+
+
+# source: https://github.com/DAVIAN-Robotics/SimbaV2/blob/86899c277cdc697b2b02d827243de1ea93f20a1d/scale_rl/agents/jax_utils/metrics.py#L135
+def feature_metrics(features, cutoff=0.01):
+
+    threshold = 1 - cutoff
+    feature_matrix = features.reshape((-1, features.shape[-1]))
 
     # Roy & Vetterli (2007): exp(entropy) of the normalized singular-value
     # distribution. Unlike the threshold feature rank, this is invariant to a
     # uniform rescaling of all features.
-    singular_value_sum = jnp.sum(singular_values)
-    nonzero_spectrum = singular_value_sum > 0
-    singular_value_distribution = jnp.where(
-        nonzero_spectrum,
-        singular_values / jnp.where(
-            nonzero_spectrum,
-            singular_value_sum,
-            jnp.ones_like(singular_value_sum),
-        ),
-        jnp.zeros_like(singular_values),
-    )
-    entropy_terms = jnp.where(
-        singular_value_distribution > 0,
-        singular_value_distribution
-        * jnp.log(jnp.where(
-            singular_value_distribution > 0,
-            singular_value_distribution,
-            jnp.ones_like(singular_value_distribution),
-        )),
-        jnp.zeros_like(singular_value_distribution),
-    )
-    effective_rank_vetterli = jnp.where(
-        nonzero_spectrum,
-        jnp.exp(-jnp.sum(entropy_terms)),
-        jnp.asarray(0.0, dtype=feature_matrix.dtype),
-    )
-    sigma_1_ratio = jnp.where(
-        nonzero_spectrum,
-        singular_value_distribution[0],
-        jnp.asarray(0.0, dtype=feature_matrix.dtype),
-    )
+    svals = jnp.linalg.svdvals(feature_matrix)
 
-    # Kumar et al. (2021): smallest k whose leading singular values explain
-    # 1 - cutoff of the nuclear norm. Return zero for an all-zero feature
-    # matrix, for which no direction is active.
-    cumulative_singular_values = jnp.cumsum(singular_values)
-    srank_kumar = jnp.where(
-        nonzero_spectrum,
-        jnp.sum(
-            cumulative_singular_values
-            < (1.0 - cutoff) * singular_value_sum
-        )
-        + 1,
-        0,
-    ).astype(feature_matrix.dtype)
-
+    sval_sum = jnp.sum(svals)
+    sval_dist = svals / sval_sum
+    # Replace 0 with 1. This is a safe trick to avoid log(0) = -inf
+    # as Roy & Vetterli assume 0*log(0) = 0 = 1*log(1).
+    sval_dist_fixed = jnp.where(sval_dist == 0, jnp.ones_like(sval_dist), sval_dist)
+    effective_rank_vetterli = jnp.exp(-jnp.sum(sval_dist_fixed * jnp.log(sval_dist_fixed)))
+        
     # Yang et al. (2020): smallest k explaining 1 - cutoff of the PCA
     # variance, i.e. the squared singular-value sum.
-    squared_singular_values = jnp.square(singular_values)
-    squared_singular_value_sum = jnp.sum(squared_singular_values)
-    nonzero_variance = squared_singular_value_sum > 0
-    approximate_rank_pca = jnp.where(
-        nonzero_variance,
-        jnp.sum(
-            jnp.cumsum(squared_singular_values)
-            < (1.0 - cutoff) * squared_singular_value_sum
-        )
-        + 1,
-        0,
-    ).astype(feature_matrix.dtype)
+    sval_squares = svals**2
+    sval_squares_sum = jnp.sum(sval_squares)
+    cumsum_squares = jnp.cumsum(sval_squares)
+    threshold_crossed = cumsum_squares >= (threshold * sval_squares_sum)
+    approximate_rank_pca = (~threshold_crossed).sum() + 1
 
-    # NumPy/PyTorch default matrix-rank threshold. Reuse the SVD above rather
-    # than computing it again through jnp.linalg.matrix_rank.
-    matrix_rank_tolerance = (
-        max(feature_matrix.shape)
-        * jnp.finfo(feature_matrix.dtype).eps
-        * singular_values[0]
-    )
-    matrix_rank = jnp.sum(
-        singular_values > matrix_rank_tolerance
-    ).astype(feature_matrix.dtype)
+    # Kumar et al. (2020): smallest k whose leading singular values explain
+    # 1 - cutoff of the nuclear norm. Return zero for an all-zero feature
+    # matrix, for which no direction is active.
+    cumsum_svals = jnp.cumsum(svals)
+    threshold_crossed = cumsum_svals >= threshold * sval_sum
+    srank_kumar = (~threshold_crossed).sum() + 1
+
+    # Lyle et al. (2022): singular values of Phi / sqrt(N) above epsilon.
+    n_obs = feature_matrix.shape[0]
+    svals_of_normalized = svals / jnp.sqrt(n_obs)
+    over_cutoff = svals_of_normalized > cutoff
+    feature_rank = over_cutoff.sum()
+
+    # Note that this determines the matrix rank same with (4), but some reasonable tau is chosen automatically based on the floating point precision of the input.
+    jnp_ranks = jnp.linalg.matrix_rank(feature_matrix)
 
     metrics = {
-        "feature_norm": mean_feature_norm,
         "feature_rank": feature_rank,
         "effective_rank_vetterli": effective_rank_vetterli,
         "srank_kumar": srank_kumar,
         "approximate_rank_pca": approximate_rank_pca,
-        "matrix_rank": matrix_rank,
-        "normalized_sigma_1": normalized_singular_values[0],
-        "sigma_1_ratio": sigma_1_ratio,
+        "matrix_rank": jnp_ranks,
     }
-    return metrics
 
+    metrics.update(feature_scale_metrics(feature_matrix, svals))
 
-def _assemble_penultimate_metrics(
-    actor_features,
-    critic_features,
-    layer_norms,
-    cutoff,
-):
-    """Build W&B metrics from sampled actor/critic feature matrices."""
-    actor_metrics = feature_metrics(actor_features, cutoff=cutoff)
-    critic_metrics = feature_metrics(critic_features, cutoff=cutoff)
-
-    metrics = {}
-    rank_names = {
-        "feature_rank",
-        "effective_rank_vetterli",
-        "srank_kumar",
-        "approximate_rank_pca",
-        "matrix_rank",
-    }
-    for role, role_metrics in (
-        ("actor", actor_metrics),
-        ("critic", critic_metrics),
-    ):
-        for name, value in role_metrics.items():
-            namespace = (
-                "representation_rank"
-                if name in rank_names
-                else "representation_feature"
-            )
-            metrics[f"{namespace}/{role}_{name}"] = value
-
-    def _sum_present(group):
-        return sum(
-            (
-                layer_norms[name]
-                for name in INTERMEDIATE_FEATURE_GROUPS[group]
-                if name in layer_norms
-            ),
-            jnp.asarray(0.0, dtype=actor_features.dtype),
-        )
-
-    # Match SimbaV2's featnorm_total: sum the mean per-sample feature norm of
-    # each layer. Actor/critic totals both include the shared feature path.
-    shared_total = _sum_present("shared")
-    actor_branch_total = _sum_present("actor")
-    critic_branch_total = _sum_present("critic")
-    metrics["representation_feature_total/actor_feature_norm"] = (
-        shared_total + actor_branch_total
-    )
-    metrics["representation_feature_total/critic_feature_norm"] = (
-        shared_total + critic_branch_total
-    )
     return metrics
 
 
@@ -334,20 +218,49 @@ def compute_minibatch_penultimate_metrics(
         network_inputs,
         mutable=["intermediates"],
     )
-    captured = intermediates["intermediates"]
-    actor_features = captured["actor_penultimate"][0]
-    critic_features = captured["critic_penultimate"][0]
+
+    actor_features = intermediates["intermediates"]["actor_penultimate"][0]
+    critic_features = intermediates["intermediates"]["critic_penultimate"][0]
     layer_norms = {
-        name: jnp.mean(captured[f"feature_norm_{name}"][0])
+        name: jnp.mean(intermediates["intermediates"][f"feature_norm_{name}"][0])
         for name in INTERMEDIATE_FEATURE_NAMES
-        if f"feature_norm_{name}" in captured
     }
-    return _assemble_penultimate_metrics(
-        actor_features,
-        critic_features,
-        layer_norms,
-        cutoff,
-    )
+
+    actor_metrics = feature_metrics(actor_features, cutoff=cutoff)
+    critic_metrics = feature_metrics(critic_features, cutoff=cutoff)
+
+    metrics = {}
+    rank_names = {
+        "feature_rank",
+        "effective_rank_vetterli",
+        "srank_kumar",
+        "approximate_rank_pca",
+        "matrix_rank",
+    }
+    for role, role_metrics in (("actor", actor_metrics), ("critic", critic_metrics)):
+        for name, value in role_metrics.items():
+            namespace = (
+                "representation_rank"
+                if name in rank_names
+                else "representation_feature"
+            )
+            metrics[f"{namespace}/{role}_{name}"] = value
+
+    def _sum_group(group):
+        return sum(
+            layer_norms[name]
+            for name in INTERMEDIATE_FEATURE_GROUPS[group]
+        )
+
+    # Match SimbaV2's featnorm_total: sum the mean per-sample feature norm of
+    # each layer. Actor/critic totals both include the shared feature path.
+    shared_total = _sum_group("shared")
+    actor_branch_total = _sum_group("actor")
+    critic_branch_total = _sum_group("critic")
+    metrics["representation_feature_total/actor_feature_norm"] = (shared_total + actor_branch_total)
+    metrics["representation_feature_total/critic_feature_norm"] = (shared_total + critic_branch_total)
+
+    return metrics
 
 
 def empty_penultimate_metrics(dtype=jnp.float32):

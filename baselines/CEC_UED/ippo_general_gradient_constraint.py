@@ -699,7 +699,19 @@ def make_train(
                 def _update_minbatch(train_state, batch_info):
                     init_hstate, traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                    def _family_means(per_sample_values, layout_ids):
+                        """Return within-family means and a present-family mask."""
+                        family_ids = jnp.arange(len(_LAYOUT_NAMES))[:, jnp.newaxis, jnp.newaxis] # 5, 1, 1
+                        family_masks = (layout_ids[jnp.newaxis, ...] == family_ids).astype(per_sample_values.dtype) # mask (5, time, actor)
+                        family_counts = family_masks.sum(axis=(1, 2))
+                        family_sums = (family_masks * per_sample_values[jnp.newaxis, ...]).sum(axis=(1, 2))
+                        family_is_present = family_counts > 0
+
+                        family_means = family_sums / jnp.maximum(family_counts, 1.0)
+
+                        return family_means, family_is_present
+
+                    def _family_losses_fn(params):
                         # RERUN NETWORK
                         _, pi, value = network.apply(
                             params,
@@ -714,14 +726,20 @@ def make_train(
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
+                        # loss by layout family
+                        family_value_losses, family_is_present = _family_means(
+                            0.5 * jnp.maximum(
+                                value_losses, value_losses_clipped
+                            ),
+                            traj_batch.layout_id,
+                        )
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        gae = (
+                            advantages - advantages.mean()
+                        ) / (advantages.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -731,24 +749,92 @@ def make_train(
                             )
                             * gae
                         )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
+                        family_actor_losses, _ = _family_means(
+                            -jnp.minimum(loss_actor1, loss_actor2),
+                            traj_batch.layout_id)
+
+                        family_entropies, _ = _family_means(
+                            pi.entropy(),
+                            traj_batch.layout_id)
+
+                        present_family_count = jnp.maximum(family_is_present.sum(), 1)
+
+                        family_total_losses = (
+                            family_actor_losses
+                            + config["VF_COEF"] * family_value_losses
+                            - config["ENT_COEF"] * family_entropies
+                        ) * family_is_present
+
+                        total_loss = (family_total_losses.sum() / present_family_count)
+
+                        value_loss = (family_value_losses * family_is_present).sum() / present_family_count
+                        loss_actor = (family_actor_losses * family_is_present).sum() / present_family_count
+                        entropy = (family_entropies * family_is_present).sum() / present_family_count
 
                         # debug
                         approx_kl = ((ratio - 1) - logratio).mean()
                         clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
 
-                        total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
+                        return family_total_losses, (
+                            total_loss,
+                            (
+                                value_loss,
+                                loss_actor,
+                                entropy,
+                                ratio,
+                                approx_kl,
+                                clip_frac,
+                            ),
+                            family_is_present,
                         )
-                        return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac)
 
-                    grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, init_hstate, traj_batch, advantages, targets
+                    (
+                        family_total_losses,
+                        family_loss_vjp,
+                        (loss, loss_aux, family_is_present)
+                        ) = jax.vjp(_family_losses_fn, train_state.params, has_aux=True)
+
+                    family_gradients = []
+                    for family_id in range(len(_LAYOUT_NAMES)):
+                        family_cotangent = jax.nn.one_hot(family_id, len(_LAYOUT_NAMES),)
+                        family_gradient, = family_loss_vjp(family_cotangent)
+                        family_gradients.append(family_gradient)
+
+                    def _gradient_l2_norm(gradient):
+                        squared_norm = sum(
+                            jnp.sum(leaf ** 2)
+                            for leaf in jax.tree_util.tree_leaves(gradient)
+                        )
+                        return jnp.sqrt(squared_norm)
+
+                    family_gradient_norms = jnp.stack([_gradient_l2_norm(family_gradient) for family_gradient in family_gradients])
+                    present_family_count = jnp.maximum(family_is_present.sum(), 1)
+                    target_gradient_norm = jax.lax.stop_gradient((family_gradient_norms * family_is_present).sum() / present_family_count)
+
+                    equalized_family_gradients = [
+                        jax.tree.map(
+                            lambda gradient: (
+                                gradient * family_is_present[family_id] * target_gradient_norm
+                                / (family_gradient_norms[family_id] + 1e-8)
+                            ),
+                            family_gradient,
+                        )
+                        for family_id, family_gradient in enumerate(
+                            family_gradients
+                        )
+                    ]
+                    grads = jax.tree.map(
+                        lambda *family_gradient_leaves: (
+                            sum(family_gradient_leaves)
+                            / present_family_count
+                        ),
+                        *equalized_family_gradients,
+                    )
+                    equalized_family_gradient_norms = jnp.stack(
+                        [
+                            _gradient_l2_norm(family_gradient)
+                            for family_gradient in equalized_family_gradients
+                        ]
                     )
 
                     # Match SimBaV2's optimizer-update semantics: measure the
@@ -761,8 +847,24 @@ def make_train(
                         critic_param_keys=VALUE_TRUNK_KEYS,
                         shared_param_keys=SHARED_TRUNK_KEYS,
                     )
+
+                    optimizer_update_metrics["family_gradient_norm/target"] = target_gradient_norm
+                    for family_id, family_name in enumerate(_LAYOUT_NAMES):
+                        optimizer_update_metrics[
+                            f"family_gradient_norm/raw/{family_name}"
+                        ] = jnp.where(
+                            family_is_present[family_id],
+                            family_gradient_norms[family_id],
+                            jnp.nan,
+                        )
+                        optimizer_update_metrics[
+                            f"family_gradient_norm/equalized/{family_name}"
+                        ] = jnp.where(
+                            family_is_present[family_id],
+                            equalized_family_gradient_norms[family_id],
+                            jnp.nan,
+                        )
                     train_state = train_state.apply_gradients(grads=grads)
-                    loss, loss_aux = total_loss
                     return train_state, (loss, loss_aux, optimizer_update_metrics)
 
                 (

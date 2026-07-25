@@ -199,6 +199,29 @@ $$
 Layout이 해당 rollout에 존재하지 않으면 관련 layout metric은
 `NaN`이다.
 
+### Family gradient norm equalization
+
+`ippo_general_gradient_constraint.py`는 PPO minibatch에서 각 layout family의
+total-loss gradient를 별도로 계산한다. Minibatch에 존재하는 family들의 raw
+gradient norm 평균을 목표 norm으로 사용한다.
+
+$$
+\bar n=\frac{1}{|\mathcal F|}\sum_{f\in\mathcal F}\|g_f\|_2,
+\qquad
+\tilde g_f=g_f\frac{\bar n}{\|g_f\|_2+\epsilon},
+\qquad
+g_{\mathrm{update}}=\frac{1}{|\mathcal F|}\sum_{f\in\mathcal F}\tilde g_f.
+$$
+
+방향은 유지하고 family별 gradient 크기만 동일하게 맞춘다. Minibatch에 없는
+family는 결합에서 제외한다.
+
+```text
+family_gradient_norm/target
+family_gradient_norm/raw/<layout>
+family_gradient_norm/equalized/<layout>
+```
+
 ## Environment-sample gradient conflict
 
 하나의 sample은 한 environment slot의 앞쪽

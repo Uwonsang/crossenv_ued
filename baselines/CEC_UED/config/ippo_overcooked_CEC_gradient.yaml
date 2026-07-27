@@ -75,4 +75,5 @@
 "GRAD_CONFLICT_WINDOW_STEPS": 32  # rollout prefix used by gradient diagnostics
 "GRAD_CONFLICT_CHUNK_SIZE": 64  # must evenly divide NUM_ENVS (one sample contains both actors)
 "POPART_ALPHA": 0.01
+"FIXED_TARGET_SCALE": 30.0  # critic learns raw value / this fixed positive scale
 "RESUME_XPID": ""  # set to xpid string (e.g. "lr-20240608-143022") to resume that run

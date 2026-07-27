@@ -1395,7 +1395,7 @@ def main(config):
             tags=["IPPO", "RNN", "SP"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
+            name=f"CEC_gradient_const_{layout_name}_seed{config['SEED']}"
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

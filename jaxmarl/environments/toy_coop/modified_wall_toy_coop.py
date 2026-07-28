@@ -37,7 +37,7 @@ class ModifiedWallToyCoop(MultiAgentEnv):
         "wall_c": ("CCGCC", "CCCBC", "ACBCA", "CBCCC", "CCGCC"),
     }
 
-    def __init__(self, max_steps: int = 100, random_reset: bool = False, debug: bool = False, check_held_out: bool = False, partial_obs: bool = False, incentivize_strat: int = 2, map_name: str = "empty"):
+    def __init__(self, max_steps: int = 100, random_reset: bool = False, debug: bool = False, check_held_out: bool = False, partial_obs: bool = False, incentivize_strat: int = 2, map_name: str = "empty", layout_names=None):
         super().__init__(num_agents=2)
         self.width = 5
         self.height = 5
@@ -73,7 +73,9 @@ class ModifiedWallToyCoop(MultiAgentEnv):
         self.partial_obs = partial_obs
         self.incentivize_strat = incentivize_strat
         self.map_name = map_name
-        layout_names = self.LAYOUT_CHOICES if map_name == "mixed" else (map_name,)
+        layout_names = tuple(layout_names) if map_name == "mixed" and layout_names is not None else (
+            self.LAYOUT_CHOICES if map_name == "mixed" else (map_name,)
+        )
         parsed_layouts = [self._parse_layout(name) for name in layout_names]
         self.wall_maps = jnp.stack([layout[0] for layout in parsed_layouts], axis=0)
         self.default_agent_positions = jnp.stack([layout[1] for layout in parsed_layouts], axis=0)

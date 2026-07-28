@@ -9,6 +9,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import distrax
+import flax.core
 import hydra
 import jax
 import jax.numpy as jnp
@@ -35,6 +36,7 @@ def latest_match(patterns):
 
 def model_patterns(root, model_name, seed, stage=None):
     checkpoint_model_name = "CEC" if model_name == "CEC_MIXED" else model_name
+    checkpoint_model_name = "CEC_POPART" if model_name == "CEC_POPART_MIXED" else checkpoint_model_name
     if checkpoint_model_name == "IPPO":
         return [
             f"{root}/ikFalse/reset_all/ippo/**/seed{seed}_progress_100.pkl",
@@ -48,12 +50,26 @@ def model_patterns(root, model_name, seed, stage=None):
     if checkpoint_model_name == "CEC":
         return [
             f"{root}/ikTrue/reset_all/cec/**/seed{seed}_ckpt0_improved_updates*.pkl",
+            f"{root}/ikTrue/reset_all/cec_layout_eval/**/seed{seed}_ckpt0_improved_updates*.pkl",
+        ]
+    if checkpoint_model_name == "CEC_POPART":
+        return [
+            f"{root}/ikTrue/reset_all/cec_popart/**/seed{seed}_ckpt0_improved_pop_updates*.pkl",
+            f"{root}/ikTrue/reset_all/cec_popart_layout_eval/**/seed{seed}_ckpt0_improved_pop_updates*.pkl",
         ]
     if checkpoint_model_name == "FCP":
         return [
             f"{root}/ikFalse/reset_all/fcp/**/fcp_seed{seed}_best.pkl",
         ]
     raise ValueError(f"Unknown model_name: {model_name}")
+
+
+def adapt_popart_params_for_xp(params):
+    mutable_params = flax.core.unfreeze(params)
+    root = mutable_params.get("params", mutable_params)
+    if "critic_output" in root and "Dense_8" not in root:
+        root["Dense_8"] = root.pop("critic_output")
+    return flax.core.freeze(mutable_params)
 
 
 def load_params(root, model_name, seeds, stages=None):
@@ -74,13 +90,40 @@ def load_params(root, model_name, seeds, stages=None):
             continue
         with open(path, "rb") as f:
             ckpt = pickle.load(f)
-        params.append(ckpt["params"])
+        ckpt_params = ckpt["params"]
+        if model_name == "CEC_POPART_MIXED":
+            ckpt_params = adapt_popart_params_for_xp(ckpt_params)
+        params.append(ckpt_params)
         labels.append(label)
         paths.append(path)
         print(f"Loaded {model_name} {label}: {path}")
     if not params:
         raise FileNotFoundError(f"No {model_name} checkpoints found under {root}")
-    return jax.tree.map(lambda *x: jnp.stack(x), *params), labels, paths
+    try:
+        stacked_params = jax.tree.map(lambda *x: jnp.stack(x), *params)
+    except ValueError as exc:
+        print(f"Failed to stack {model_name} checkpoints because parameter shapes differ.")
+        flat_with_paths = [jax.tree_util.tree_flatten_with_path(p)[0] for p in params]
+        max_leaves = max(len(flat) for flat in flat_with_paths)
+        for leaf_idx in range(max_leaves):
+            leaf_shapes = []
+            leaf_names = []
+            for label, path, flat in zip(labels, paths, flat_with_paths):
+                if leaf_idx >= len(flat):
+                    leaf_names.append("<missing>")
+                    leaf_shapes.append((label, path, None, None))
+                    continue
+                key_path, value = flat[leaf_idx]
+                name = "/".join(str(part.key if hasattr(part, "key") else part.idx if hasattr(part, "idx") else part) for part in key_path)
+                leaf_names.append(name)
+                leaf_shapes.append((label, path, getattr(value, "shape", None), getattr(value, "dtype", None)))
+            if len({(shape, dtype) for _, _, shape, dtype in leaf_shapes}) > 1 or len(set(leaf_names)) > 1:
+                print(f"First mismatched leaf: {leaf_names[0]}")
+                for label, path, shape, dtype in leaf_shapes:
+                    print(f"  {model_name} {label}: shape={shape}, dtype={dtype}, path={path}")
+                break
+        raise exc
+    return stacked_params, labels, paths
 
 
 def resolve_path(path):
@@ -98,13 +141,23 @@ def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
 
 
+def get_toy_layout_names(config):
+    return list(config.get("layout_names", ["empty", "wall_a"]))
+
+
+def get_wall_map_dir_name(config, map_name):
+    if map_name != "mixed":
+        return map_name
+    return "mixed_" + "_".join(get_toy_layout_names(config))
+
+
 def resolve_model_root(config, model_name):
     root = Path(config["MODEL_ROOT"])
     map_name = get_wall_map_name(config)
     if config["ENV_NAME"] == "ToyCoop" and root.name == "ToyCoop":
-        if model_name == "CEC_MIXED":
+        if model_name in ("CEC_MIXED", "CEC_POPART_MIXED"):
             map_name = "mixed"
-        root = root / "modified_wall" / map_name
+        root = root / "modified_wall" / get_wall_map_dir_name(config, map_name)
     return resolve_path(str(root))
 
 

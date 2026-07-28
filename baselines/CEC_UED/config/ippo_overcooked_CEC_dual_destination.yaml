@@ -75,3 +75,7 @@
 
 # Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
 "map_name": "empty"  # empty, wall_a, wall_b, wall_c, mixed
+"layout_names":  # used only when map_name=mixed
+  - "empty"
+  - "wall_a"
+  - "wall_b"

@@ -36,8 +36,19 @@ import chex
 import imageio
 from algo_utils import init_hdf5, save_to_hdf5, make_eval_envs_overcooked, classify_layout, EVAL_LAYOUTS_9
 
+TOY_LAYOUT_NAMES = ["empty", "wall_a"]
+
 def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
+
+def get_toy_layout_names(config):
+    return list(config.get("layout_names", TOY_LAYOUT_NAMES))
+
+def get_wall_map_dir_name(config):
+    map_name = get_wall_map_name(config)
+    if map_name != "mixed":
+        return map_name
+    return "mixed_" + "_".join(get_toy_layout_names(config))
 
 def make_modified_wall_env(config):
     valid_env_keys = {
@@ -54,11 +65,13 @@ def make_modified_wall_env(config):
         if key in valid_env_keys
     }
     env_kwargs["map_name"] = get_wall_map_name(config)
+    if env_kwargs["map_name"] == "mixed":
+        env_kwargs["layout_names"] = get_toy_layout_names(config)
     config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
     return ModifiedWallToyCoop(**env_kwargs)
 
 def toy_ckpt_root(config):
-    return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_name(config)}"
+    return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]

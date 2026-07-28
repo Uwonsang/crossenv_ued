@@ -24,7 +24,7 @@
 
 "DEBUG_GIFS":
   "enabled": False
-  "max_pairs": 4
+  "max_pairs": 40
   "pairs": []
   "only_cross_play": True
   "traj_seed": 0

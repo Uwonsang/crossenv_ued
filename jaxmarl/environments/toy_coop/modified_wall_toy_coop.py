@@ -148,12 +148,19 @@ class ModifiedWallToyCoop(MultiAgentEnv):
         state = self.custom_reset_fn(key1, random_reset=self.random_reset, debug=self.debug)
         
         key2, key3 = jax.random.split(key2)
-        state = jax.lax.cond(  # only reset once to avoid infinite recursion compilation issues in jax
-            jnp.logical_and(self.check_held_out, check_match(state)),
-            lambda k: self.custom_reset_fn(k, random_reset=self.random_reset, debug=self.debug),
-            lambda k: state,
-            key3
+        has_held_out = (
+            self.held_out_agent_pos is not None
+            and self.held_out_goal_pos is not None
+            and self.held_out_other_goal_pos is not None
+            and self.held_out_wall_map is not None
         )
+        if self.check_held_out and has_held_out:
+            state = jax.lax.cond(  # only reset once to avoid infinite recursion compilation issues in jax
+                check_match(state),
+                lambda k: self.custom_reset_fn(k, random_reset=self.random_reset, debug=self.debug),
+                lambda k: state,
+                key3
+            )
         
         obs = self.get_obs(state)
         return obs, state

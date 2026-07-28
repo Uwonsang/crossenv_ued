@@ -36,24 +36,22 @@ from gradient_conflict_utils import (
 )
 from representation_metrics import (
     compute_optimizer_update_metrics,
-    compute_minibatch_penultimate_metrics,
-    empty_penultimate_metrics,
+    compute_separate_trunk_penultimate_metrics,
+    empty_separate_trunk_penultimate_metrics,
     first_epoch_first_minibatch_indices,
 )
 
 
-# Parameter groups used consistently by gradient diagnostics and norm metrics.
-# Each group contains the shared encoder/RNN, its branch, and its output head.
+# Actor and critic use independent encoder/RNN trunks with identical topology.
 ACTOR_TRUNK_KEYS = (
-    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
-    "Dense_2", "Dense_3", "Dense_4", "Dense_5", "Dense_6",
+    "actor_trunk",
+    "actor_hidden_0", "actor_hidden_1", "actor_hidden_2",
+    "actor_hidden_3", "actor_output",
 )
 VALUE_TRUNK_KEYS = (
-    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
-    "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
-)
-SHARED_TRUNK_KEYS = (
-    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
+    "critic_trunk",
+    "critic_hidden_0", "critic_hidden_1", "critic_hidden_2",
+    "critic_hidden_3", "critic_output",
 )
 
 
@@ -182,35 +180,25 @@ class ScannedRNN(nn.Module):
         )
 
 
-class ActorCriticRNN(nn.Module):
-    action_dim: Sequence[int]
+class RecurrentFeatureTrunk(nn.Module):
+    """CNN/Dense/RNN feature path used independently by actor and critic."""
+
     config: Dict
+    role: str
 
     @nn.compact
-    def __call__(self, hidden, x):
-        obs, dones, agent_positions = x
-        batch_size, num_envs, flattened_obs_dim = obs.shape
-
-        # Intermediate feature norms are only materialized during the
-        # diagnostic apply(..., mutable=["intermediates"]) call. Recording
-        # per-sample norms avoids retaining every Conv/Dense activation while
-        # adding no norm-computation overhead to ordinary rollout/update
-        # forwards.
-
+    def __call__(self, hidden, obs, dones):
+        time_size, actor_size, _ = obs.shape
         collect_intermediates = (
             not self.is_initializing()
             and self.is_mutable_collection("intermediates")
         )
 
-        def record_feature_norm(name, features):
+        def record_feature_norm(layer_name, features):
             if collect_intermediates:
-                feature_vectors = features.reshape(
-                    (batch_size, num_envs, -1)
-                )
+                feature_vectors = features.reshape((time_size, actor_size, -1))
                 sample_norms = jnp.linalg.norm(feature_vectors, axis=-1)
-                self.sow(
-                    "intermediates", f"feature_norm_{name}", sample_norms
-                )
+                self.sow("intermediates", f"feature_norm_{self.role}_trunk_{layer_name}", sample_norms)
 
         if self.config["CONV_NET"]:
             if self.config["ENV_NAME"] == "overcooked":
@@ -219,122 +207,162 @@ class ActorCriticRNN(nn.Module):
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                # features=64 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked")else 2 * self.config["FC_DIM_SIZE"],
                 features=64,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
+                name="conv_0",
             )(reshaped_obs)
             embedding = nn.relu(embedding)
-            record_feature_norm("shared_conv_0", embedding)
+            record_feature_norm("conv_0", embedding)
 
             embedding = nn.Conv(
-                # features=32 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked") else self.config["FC_DIM_SIZE"],
                 features=32,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
+                name="conv_1",
             )(embedding)
             embedding = nn.relu(embedding)
-            record_feature_norm("shared_conv_1", embedding)
-
-            embedding = embedding.reshape((batch_size, num_envs, -1))
+            record_feature_norm("conv_1", embedding)
+            embedding = embedding.reshape((time_size, actor_size, -1))
         else:
             embedding = obs
 
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
+            name="dense_0",
         )(embedding)
         embedding = nn.relu(embedding)
-        record_feature_norm("shared_dense_0", embedding)
+        record_feature_norm("dense_0", embedding)
 
         embedding = nn.Dense(
-            # self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], 
             self.config["FC_DIM_SIZE"] * 2,
-            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0),
+            name="dense_1",
         )(embedding)
         embedding = nn.relu(embedding)
-        record_feature_norm("shared_dense_1", embedding)
+        record_feature_norm("dense_1", embedding)
 
         if self.config["LSTM"]:
             rnn_in = (embedding, dones)
-            hidden, embedding = ScannedRNN()(hidden, rnn_in)
+            hidden, embedding = ScannedRNN(name="recurrent")(hidden, rnn_in)
         else:
-            embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0))(embedding)
+            embedding = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2), bias_init=constant(0.0), name="recurrent_dense",)(embedding)
             embedding = nn.relu(embedding)
-        embedding = embedding.reshape((batch_size, num_envs, -1))
-        record_feature_norm("shared_recurrent", embedding)
 
-        if not self.is_initializing():
-            self.sow("intermediates", "shared_penultimate", embedding)
+        embedding = embedding.reshape((time_size, actor_size, -1))
+        record_feature_norm("recurrent", embedding)
 
-        #########
-        # Actor
-        #########
-        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] , kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
+        return hidden, embedding
+
+
+class ActorCriticRNN(nn.Module):
+    action_dim: Sequence[int]
+    config: Dict
+
+    @staticmethod
+    def initialize_carry(batch_size, hidden_size):
+        actor_hidden = ScannedRNN.initialize_carry(batch_size, hidden_size)
+        critic_hidden = ScannedRNN.initialize_carry(batch_size, hidden_size)
+        return actor_hidden, critic_hidden
+
+    @nn.compact
+    def __call__(self, hidden, x):
+        obs, dones, agent_positions = x
+        actor_hidden, critic_hidden = hidden
+
+        collect_intermediates = (
+            not self.is_initializing()
+            and self.is_mutable_collection("intermediates")
+        )
+
+        def record_feature_norm(name, features):
+            if collect_intermediates:
+                sample_norms = jnp.linalg.norm(features, axis=-1)
+                self.sow("intermediates", f"feature_norm_{name}", sample_norms)
+
+        actor_hidden, actor_embedding = RecurrentFeatureTrunk(
+            config=self.config,
+            role="actor",
+            name="actor_trunk",
+        )(actor_hidden, obs, dones)
+        critic_hidden, critic_embedding = RecurrentFeatureTrunk(
+            config=self.config,
+            role="critic",
+            name="critic_trunk",
+        )(critic_hidden, obs, dones)
+
+        if collect_intermediates:
+            self.sow("intermediates", "actor_trunk_penultimate", actor_embedding)
+            self.sow("intermediates", "critic_trunk_penultimate", critic_embedding)
+
+        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="actor_hidden_0")(
+                actor_embedding
         )
         actor_mean = nn.relu(actor_mean)
         record_feature_norm("actor_hidden_0", actor_mean)
-        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            actor_mean
-        )
+        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="actor_hidden_1"
+        )(actor_mean)
         actor_mean = nn.relu(actor_mean)
         record_feature_norm("actor_hidden_1", actor_mean)
-        actor_mean = nn.Dense(
-            self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
+
+        actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="actor_hidden_2"
         )(actor_mean)
         actor_mean = nn.relu(actor_mean)
         record_feature_norm("actor_hidden_2", actor_mean)
+
         if self.config["ENV_NAME"] == "overcooked":
-            actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                actor_mean
-            )
-            actor_mean = nn.relu(actor_mean)  # extra layer 1
+            actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2),
+                bias_init=constant(0.0), name="actor_hidden_3",
+            )(actor_mean)
+            actor_mean = nn.relu(actor_mean)
             record_feature_norm("actor_hidden_3", actor_mean)
 
-        if not self.is_initializing():
+        if collect_intermediates:
             self.sow("intermediates", "actor_penultimate", actor_mean)
 
-        actor_mean = nn.Dense(
-            self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)        
-
+        actor_mean = nn.Dense(self.action_dim, kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0), name="actor_output",
+        )(actor_mean)
         pi = distrax.Categorical(logits=actor_mean)
 
-        #########
-        # Critic
-        #########
-        critic = nn.Dense(self.config["FC_DIM_SIZE"]*2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            embedding
-        )
+        critic = nn.Dense(self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="critic_hidden_0",
+        )(critic_embedding)
         critic = nn.relu(critic)
         record_feature_norm("critic_hidden_0", critic)
-        critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
-            critic
-        )
+
+        critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="critic_hidden_1",
+        )(critic)
         critic = nn.relu(critic)
         record_feature_norm("critic_hidden_1", critic)
+
         if self.config["ENV_NAME"] == "overcooked":
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 1
+            critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2),
+                bias_init=constant(0.0), name="critic_hidden_2",
+            )(critic)
+            critic = nn.relu(critic)
             record_feature_norm("critic_hidden_2", critic)
-            critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
-                critic
-            )
-            critic = nn.relu(critic)  # extra layer 2
+
+            critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2),
+                bias_init=constant(0.0), name="critic_hidden_3",
+            )(critic)
+            critic = nn.relu(critic)
             record_feature_norm("critic_hidden_3", critic)
 
-        if not self.is_initializing():
+        if collect_intermediates:
             self.sow("intermediates", "critic_penultimate", critic)
-            
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
-        )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+            name="critic_output",
+        )(critic)
+
+        return ((actor_hidden, critic_hidden), pi, jnp.squeeze(critic, axis=-1))
 
 
 class Transition(NamedTuple):
@@ -430,7 +458,7 @@ def make_train(
             jnp.zeros((1, config["NUM_ENVS"])),
             jnp.zeros((1, config["NUM_ENVS"], 2, 2)).astype(jnp.int32)
         )
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
+        init_hstate = ActorCriticRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
         network_params = network.init(_rng, init_hstate, init_x)
         if model_params is not None:
             network_params = model_params
@@ -460,7 +488,7 @@ def make_train(
             rng, _rng = jax.random.split(rng)
             reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
             obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-            init_hstate = ScannedRNN.initialize_carry(
+            init_hstate = ActorCriticRNN.initialize_carry(
                 config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
             )
             rng, runner_rng = jax.random.split(rng)
@@ -685,7 +713,7 @@ def make_train(
                     lambda x: jnp.take(x, first_minibatch_indices, axis=1),
                     traj_batch,
                 )
-                return compute_minibatch_penultimate_metrics(
+                return compute_separate_trunk_penultimate_metrics(
                     network,
                     original_params,
                     representation_hstate,
@@ -699,7 +727,7 @@ def make_train(
             representation_metrics = jax.lax.cond(
                 run_eval,
                 _compute_representation_metrics,
-                lambda _: empty_penultimate_metrics(),
+                lambda _: empty_separate_trunk_penultimate_metrics(),
                 operand=None,
             )
 
@@ -768,7 +796,6 @@ def make_train(
                         params=train_state.params,
                         actor_param_keys=ACTOR_TRUNK_KEYS,
                         critic_param_keys=VALUE_TRUNK_KEYS,
-                        shared_param_keys=SHARED_TRUNK_KEYS,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
@@ -877,7 +904,7 @@ def make_train(
                 eval_rng, reset_rng = jax.random.split(eval_rng)
                 reset_rngs = jax.random.split(reset_rng, num_eval_envs)
                 init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
-                init_hstate = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
+                init_hstate = ActorCriticRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
                 init_done = jnp.zeros((num_actors_eval,), dtype=bool)
                 init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
                 runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
@@ -931,7 +958,7 @@ def make_train(
                 eval_rng, reset_rng = jax.random.split(eval_rng)
                 reset_rngs = jax.random.split(reset_rng, num_eval_envs)
                 init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
-                init_hstate = ScannedRNN.initialize_carry(num_eval_envs, config["GRU_HIDDEN_DIM"])
+                init_hstate = ActorCriticRNN.initialize_carry(num_eval_envs, config["GRU_HIDDEN_DIM"])
                 init_done = jnp.zeros((num_eval_envs,), dtype=bool)
                 init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
                 runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
@@ -1226,6 +1253,7 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
+    config["model_name"] = "CEC_SEPARATE_TRUNK"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1292,7 +1320,7 @@ def main(config):
             tags=["IPPO", "RNN", "SP"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
+            name=f"CEC_gradient_separate_trunk_{layout_name}_seed{config['SEED']}"
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -1323,7 +1351,7 @@ def main(config):
     elif config['TRAIN_KWARGS']['finetune']:
         finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/cramped_room_9"
+            finetune_filepath += "/cramped_room_9"
         if config['FCP']:
             finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
             finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6

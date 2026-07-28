@@ -32,6 +32,33 @@ INTERMEDIATE_FEATURE_NAMES = tuple(
     for name in names
 )
 
+SEPARATE_TRUNK_FEATURE_GROUPS = {
+    "actor_trunk": (
+        "actor_trunk_conv_0",
+        "actor_trunk_conv_1",
+        "actor_trunk_dense_0",
+        "actor_trunk_dense_1",
+        "actor_trunk_recurrent",
+    ),
+    "critic_trunk": (
+        "critic_trunk_conv_0",
+        "critic_trunk_conv_1",
+        "critic_trunk_dense_0",
+        "critic_trunk_dense_1",
+        "critic_trunk_recurrent",
+    ),
+    "actor": INTERMEDIATE_FEATURE_GROUPS["actor"],
+    "critic": INTERMEDIATE_FEATURE_GROUPS["critic"],
+}
+
+
+def _sum_group(layer_norms, feature_groups, group):
+    """Sum recorded feature norms belonging to one named layer group."""
+    group_feature_norm = sum(
+        layer_norms[name]
+        for name in feature_groups[group])
+    
+    return group_feature_norm 
 
 def tree_global_l2_norm(tree):
     """Global L2 norm over every array leaf in a pytree."""
@@ -87,7 +114,7 @@ def compute_gradient_norm_metrics(
     gradients,
     actor_param_keys,
     critic_param_keys,
-    shared_param_keys,
+    shared_param_keys=None,
 ):
     """Measure global and parameter-group RMS norms of PPO gradients."""
     gradients_norm = {
@@ -105,12 +132,13 @@ def compute_gradient_norm_metrics(
                 gradients, critic_param_keys
             )
         ),
-        "gradient_norm/shared_weighted_rms_norm": (
+    }
+    if shared_param_keys is not None:
+        gradients_norm["gradient_norm/shared_weighted_rms_norm"] = (
             tree_group_leaf_count_weighted_rms_norm(
                 gradients, shared_param_keys
             )
-        ),
-    }
+        )
 
     return gradients_norm
 
@@ -135,20 +163,25 @@ def compute_gradient_kurtosis_metrics(
     gradients,
     actor_param_keys,
     critic_param_keys,
-    shared_param_keys,
+    shared_param_keys=None,
 ):
     """Measure log-absolute-gradient kurtosis for PPO parameter groups."""
     gradient_tree = gradients["params"] if "params" in gradients else gradients
     actor_gradients = {name: gradient_tree[name] for name in actor_param_keys}
     critic_gradients = {name: gradient_tree[name] for name in critic_param_keys}
-    shared_gradients = {name: gradient_tree[name] for name in shared_param_keys}
 
     gradient_kurtosis_metrics = {
         "gradient_kurtosis/global": gradient_kurtosis(gradients),
         "gradient_kurtosis/actor": gradient_kurtosis(actor_gradients),
         "gradient_kurtosis/critic": gradient_kurtosis(critic_gradients),
-        "gradient_kurtosis/shared": gradient_kurtosis(shared_gradients),
     }
+    if shared_param_keys is not None:
+        shared_gradients = {
+            name: gradient_tree[name] for name in shared_param_keys
+        }
+        gradient_kurtosis_metrics["gradient_kurtosis/shared"] = (
+            gradient_kurtosis(shared_gradients)
+        )
 
     return gradient_kurtosis_metrics
 
@@ -157,7 +190,7 @@ def compute_weight_metrics(
     params,
     actor_param_keys,
     critic_param_keys,
-    shared_param_keys,
+    shared_param_keys=None,
 ):
     """Measure SimBaV2-style parameter norms at one optimizer-update state."""
 
@@ -168,9 +201,6 @@ def compute_weight_metrics(
         ),
         "representation_weight/critic_weight_norm": parameter_group_l2_norm(
             params, critic_param_keys
-        ),
-        "representation_weight/shared_weight_norm": parameter_group_l2_norm(
-            params, shared_param_keys
         ),
         "representation_weight/weighted_rms_norm": (
             tree_leaf_count_weighted_rms_norm(params)
@@ -185,12 +215,16 @@ def compute_weight_metrics(
                 params, critic_param_keys
             )
         ),
-        "representation_weight/shared_weighted_rms_norm": (
-            tree_group_leaf_count_weighted_rms_norm(
-                params, shared_param_keys
-            )
-        ),
     }
+    if shared_param_keys is not None:
+        representation_weight["representation_weight/shared_weight_norm"] = (
+            parameter_group_l2_norm(params, shared_param_keys)
+        )
+        representation_weight[
+            "representation_weight/shared_weighted_rms_norm"
+        ] = tree_group_leaf_count_weighted_rms_norm(
+            params, shared_param_keys
+        )
 
     return representation_weight 
     
@@ -200,7 +234,7 @@ def compute_optimizer_update_metrics(
     params,
     actor_param_keys,
     critic_param_keys,
-    shared_param_keys,
+    shared_param_keys=None,
 ):
     group_keys = {
         "actor_param_keys": actor_param_keys,
@@ -348,16 +382,14 @@ def compute_minibatch_penultimate_metrics(
     )
 
     captured = intermediates["intermediates"]
-    shared_features = captured["shared_penultimate"][0]
-    actor_features = captured["actor_penultimate"][0]
-    critic_features = captured["critic_penultimate"][0]
-    layer_norms = {
-        name: jnp.mean(captured[f"feature_norm_{name}"][0])
-        for name in INTERMEDIATE_FEATURE_NAMES
-    }
+    role_features = (
+        ("shared", captured["shared_penultimate"][0]),
+        ("actor", captured["actor_penultimate"][0]),
+        ("critic", captured["critic_penultimate"][0])
+    )
+ 
 
     metrics = {}
-    role_features = (("shared", shared_features),("actor", actor_features),("critic", critic_features))
     for role, features in role_features:
         scale_metrics, rank_metrics = compute_feature_metrics(features,cutoff=cutoff)
         for name, value in scale_metrics.items():
@@ -365,19 +397,15 @@ def compute_minibatch_penultimate_metrics(
         for name, value in rank_metrics.items():
             metrics[f"representation_rank/{role}_{name}"] = value
 
-    def _sum_group(group):
-        group_feature_norm = sum(
-            layer_norms[name]
-            for name in INTERMEDIATE_FEATURE_GROUPS[group]
-        )
-
-        return group_feature_norm
-
+    layer_norms = {
+        name: jnp.mean(captured[f"feature_norm_{name}"][0])
+        for name in INTERMEDIATE_FEATURE_NAMES
+    }
     # Match SimbaV2's featnorm_total: sum the mean per-sample feature norm of
     # each layer. Actor/critic totals both include the shared feature path.
-    shared_total = _sum_group("shared")
-    actor_branch_total = _sum_group("actor")
-    critic_branch_total = _sum_group("critic")
+    shared_total = _sum_group(layer_norms, INTERMEDIATE_FEATURE_GROUPS, "shared")
+    actor_branch_total = _sum_group(layer_norms, INTERMEDIATE_FEATURE_GROUPS, "actor")
+    critic_branch_total = _sum_group(layer_norms, INTERMEDIATE_FEATURE_GROUPS, "critic")
     metrics["representation_feature_total/actor_feature_norm"] = (
         shared_total + actor_branch_total)
     metrics["representation_feature_total/critic_feature_norm"] = (
@@ -426,3 +454,97 @@ def empty_penultimate_metrics(dtype=jnp.float32):
     }
 
     return empty_metrics
+
+
+def compute_separate_trunk_penultimate_metrics(
+    network,
+    params,
+    initial_hstate,
+    network_inputs,
+    cutoff=0.01,
+):
+    """Measure actor/critic representations for independent recurrent trunks."""
+    (_, _, _), intermediates = network.apply(
+        params,
+        initial_hstate,
+        network_inputs,
+        mutable=["intermediates"],
+    )
+    captured = intermediates["intermediates"]
+
+    role_features = (
+        ("actor_trunk", captured["actor_trunk_penultimate"][0]),
+        ("critic_trunk", captured["critic_trunk_penultimate"][0]),
+        ("actor", captured["actor_penultimate"][0]),
+        ("critic", captured["critic_penultimate"][0]),
+    )
+
+    metrics = {}
+    for role, features in role_features:
+        scale_metrics, rank_metrics = compute_feature_metrics(features, cutoff=cutoff)
+        for name, value in scale_metrics.items():
+            metrics[f"representation_feature/{role}_{name}"] = value
+        for name, value in rank_metrics.items():
+            metrics[f"representation_rank/{role}_{name}"] = value
+    
+    layer_norms = {
+        name: jnp.mean(
+            captured["actor_trunk"][f"feature_norm_{name}"][0]
+        )
+        for name in SEPARATE_TRUNK_FEATURE_GROUPS["actor_trunk"]
+    }
+    layer_norms.update({
+        name: jnp.mean(
+            captured["critic_trunk"][f"feature_norm_{name}"][0]
+        )
+        for name in SEPARATE_TRUNK_FEATURE_GROUPS["critic_trunk"]
+    })
+    layer_norms.update({
+        name: jnp.mean(captured[f"feature_norm_{name}"][0])
+        for group in ("actor", "critic")
+        for name in SEPARATE_TRUNK_FEATURE_GROUPS[group]
+    })
+
+    metrics["representation_feature_total/actor_feature_norm"] = (
+        _sum_group(layer_norms, SEPARATE_TRUNK_FEATURE_GROUPS, "actor_trunk")
+        + _sum_group(layer_norms, SEPARATE_TRUNK_FEATURE_GROUPS, "actor")
+    )
+    metrics["representation_feature_total/critic_feature_norm"] = (
+        _sum_group(layer_norms, SEPARATE_TRUNK_FEATURE_GROUPS, "critic_trunk")
+        + _sum_group(layer_norms, SEPARATE_TRUNK_FEATURE_GROUPS, "critic")
+    )
+    
+    return metrics
+
+
+def empty_separate_trunk_penultimate_metrics(dtype=jnp.float32):
+    """Shape-compatible skipped output for separate-trunk representations."""
+    roles = ("actor_trunk", "critic_trunk", "actor", "critic")
+    scale_names = (
+        "feature_norm",
+        "normalized_sigma_1",
+        "sigma_1_ratio",
+    )
+    rank_names = (
+        "feature_rank",
+        "effective_rank_vetterli",
+        "srank_kumar",
+        "approximate_rank_pca",
+        "matrix_rank",
+    )
+    names = tuple(
+        f"representation_feature/{role}_{name}"
+        for role in roles
+        for name in scale_names
+    ) + tuple(
+        f"representation_rank/{role}_{name}"
+        for role in roles
+        for name in rank_names
+    ) + (
+        "representation_feature_total/actor_feature_norm",
+        "representation_feature_total/critic_feature_norm",
+    )
+    return {
+        name: jnp.asarray(jnp.nan, dtype=dtype)
+        for name in names
+    }

@@ -40,6 +40,7 @@ from representation_metrics import (
     empty_penultimate_metrics,
     first_epoch_first_minibatch_indices,
 )
+from value_diagnostics import compute_value_diagnostics
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -611,49 +612,16 @@ def make_train(
             # ── value target statistics: raw / popart-normalized ──
             _targets_norm = (targets - popart_mu) / popart_sigma
 
-            target_stats = {}
-            target_stats["target_raw/mean"] = targets.mean()
-            target_stats["target_popart/mean"] = _targets_norm.mean()
-
-            # ── critic quality: how well does the critic fit the targets it's trained on? ──
-            _value_norm = traj_batch.value
-            _err_norm = _targets_norm - _value_norm
-
-            target_stats["critic/rmse"] = jnp.sqrt((_err_norm ** 2).mean())
-
-            target_stats["td_error/rmse"] = jnp.sqrt((td_errors ** 2).mean())
-
-            for _lid, _name in enumerate(_LAYOUT_NAMES):
-                _mask = (_actor_layout_full == _lid).astype(jnp.float32)
-                _cnt_raw = _mask.sum()
-                _cnt = jnp.maximum(_cnt_raw, 1.0)
-                _valid = _cnt_raw > 0
-                target_stats[f"target_raw/{_name}/mean"] = jnp.where(
-                    _valid, (targets * _mask).sum() / _cnt, jnp.nan
-                )
-
-                _target_popart_mean = (_targets_norm * _mask).sum() / _cnt
-                _target_popart_var = (
-                    ((_targets_norm - _target_popart_mean) ** 2) * _mask
-                ).sum() / _cnt
-                target_stats[f"target_popart/{_name}/mean"] = jnp.where(
-                    _valid, _target_popart_mean, jnp.nan
-                )
-                target_stats[f"target_popart/{_name}/std"] = jnp.where(
-                    _valid, jnp.sqrt(_target_popart_var), jnp.nan
-                )
-                target_stats[f"critic/{_name}/rmse"] = jnp.where(
-                    _valid,
-                    jnp.sqrt(((_err_norm ** 2) * _mask).sum() / _cnt),
-                    jnp.nan,
-                )
-                target_stats[f"td_error/{_name}/rmse"] = jnp.where(
-                    _valid,
-                    jnp.sqrt(((td_errors ** 2) * _mask).sum() / _cnt),
-                    jnp.nan,
-                )
-
-            # ── end value target statistics ─────────────────────────────────
+            target_stats = compute_value_diagnostics(
+                raw_targets=targets,
+                critic_targets=_targets_norm,
+                critic_values=traj_batch.value,
+                td_errors=td_errors,
+                rewards=traj_batch.reward,
+                actor_layout_ids=_actor_layout_full,
+                layout_names=_LAYOUT_NAMES,
+                normalized_target_prefix="target_popart",
+            )
 
             run_eval = jnp.logical_or(
                 jnp.equal(update_steps % LOG_INTERVAL, 0),

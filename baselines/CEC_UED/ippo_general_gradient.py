@@ -40,6 +40,7 @@ from representation_metrics import (
     empty_penultimate_metrics,
     first_epoch_first_minibatch_indices,
 )
+from value_diagnostics import compute_value_diagnostics
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -598,35 +599,15 @@ def make_train(
             _actor_layout_full = traj_batch.layout_id  # (NUM_STEPS, NUM_ACTORS)
             _layout_ids_full = _actor_layout_full[:, :config["NUM_ENVS"]]  # (NUM_STEPS, NUM_ENVS)
 
-            # ── value target / critic quality statistics (raw scale, no PopArt here) ──
-            target_stats = {}
-            target_stats["target_raw/mean"] = targets.mean()
-
-            _err = targets - traj_batch.value
-            target_stats["critic/rmse"] = jnp.sqrt((_err ** 2).mean())
-
-            target_stats["td_error/rmse"] = jnp.sqrt((td_errors ** 2).mean())
-
-            for _lid, _name in enumerate(_LAYOUT_NAMES):
-                _mask = (_actor_layout_full == _lid).astype(jnp.float32)
-                _cnt_raw = _mask.sum()
-                _cnt = jnp.maximum(_cnt_raw, 1.0)
-                _valid = _cnt_raw > 0
-                target_stats[f"target_raw/{_name}/mean"] = jnp.where(
-                    _valid, (targets * _mask).sum() / _cnt, jnp.nan
-                )
-                target_stats[f"critic/{_name}/rmse"] = jnp.where(
-                    _valid,
-                    jnp.sqrt(((_err ** 2) * _mask).sum() / _cnt),
-                    jnp.nan,
-                )
-                target_stats[f"td_error/{_name}/rmse"] = jnp.where(
-                    _valid,
-                    jnp.sqrt(((td_errors ** 2) * _mask).sum() / _cnt),
-                    jnp.nan,
-                )
-
-            # ── end value target / critic quality statistics ───────────────
+            target_stats = compute_value_diagnostics(
+                raw_targets=targets,
+                critic_targets=targets,
+                critic_values=traj_batch.value,
+                td_errors=td_errors,
+                rewards=traj_batch.reward,
+                actor_layout_ids=_actor_layout_full,
+                layout_names=_LAYOUT_NAMES,
+            )
 
             run_eval = jnp.logical_or(
                 jnp.equal(update_steps % LOG_INTERVAL, 0),

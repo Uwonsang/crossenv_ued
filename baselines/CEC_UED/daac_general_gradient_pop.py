@@ -544,13 +544,15 @@ def make_train(
 
         # Each group owns its Adam state and global-norm clipping coefficient.
         # Consequently a large critic gradient cannot shrink policy updates.
-        param_labels = flax.traverse_util.path_aware_map(
-            lambda path, _: (
-                "value"
-                if any("critic" in str(key) for key in path)
-                else "policy"
-            ),
-            network_params,
+        param_labels = flax.core.freeze(
+            flax.traverse_util.path_aware_map(
+                lambda path, _: (
+                    "value"
+                    if any("critic" in str(key) for key in path)
+                    else "policy"
+                ),
+                network_params,
+            )
         )
         tx = optax.multi_transform(
             {"policy": optimizer(config["DAAC_POLICY_LR"]),

@@ -367,7 +367,7 @@ def make_train(config, update_step=0):
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
-            params=network_params,
+            params=flax.core.freeze(network_params),
             tx=tx,
         )
 

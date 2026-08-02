@@ -32,6 +32,19 @@
   "shuffle_inv_and_pot": False # if true, we shuffle pot status and inventory
   "layout": "cramped_room_9"  # relevant for overcooked, all CEC compatible envs have the "_9" in the name at the end
   "random_reset_fn": "reset_all"  # reset_all or reset_counter_circuit
+"EVAL_KWARGS":
+  "num_envs": 5
+  "num_steps": 400
+  "max_steps": 400
+  "random_reset": False
+  "check_held_out": False
+  "shuffle_inv_and_pot": False
+  "random_reset_fn": "reset_all"
+  "beta": 1.0
+  "argmax": False
+  "eval_xp": True
+  "human_proxy_ckpt_dir": "baselines/human_proxy/checkpoints"
+  "human_proxy_num_seeds": 5
 "TRAINING": True
 "TRAIN_KWARGS":
   "ckpt_id": 0 # loads from ckpt_id - 1 if available

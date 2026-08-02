@@ -29,6 +29,12 @@ from jax_tqdm import scan_tqdm
 import yaml
 from pathlib import Path
 import time
+from baselines.CEC_UED.algo_utils import (
+    BCPolicy,
+    EVAL_LAYOUTS_9,
+    load_human_proxy_params,
+    make_eval_envs_overcooked,
+)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -263,6 +269,28 @@ def make_train(config, update_step=0):
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    eval_envs = make_eval_envs_overcooked(config)
+
+    eval_xp_enabled = (
+        config["ENV_NAME"] == "overcooked"
+        and len(eval_envs) > 0
+        and bool(config["EVAL_KWARGS"]["eval_xp"])
+    )
+    layout_name = config["layout_name"]
+    if eval_xp_enabled and layout_name not in EVAL_LAYOUTS_9:
+        raise ValueError(
+            f"XP evaluation does not support layout: {layout_name}"
+        )
+
+    human_proxy_params = {}
+    if eval_xp_enabled:
+        human_proxy_params = load_human_proxy_params(
+            config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
+            int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+        )
+
+    LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
+
     def linear_schedule(count):
         frac = (
             1.0
@@ -275,6 +303,7 @@ def make_train(config, update_step=0):
     def train(rng, frozen_param_stack, model_params=None, update_step=0, num_stacked_params=1):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
+        bc_network = BCPolicy()
         rng, _rng = jax.random.split(rng)
         # get flattened obs dim
         flattened_obs_dim = 1
@@ -312,6 +341,77 @@ def make_train(config, update_step=0):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+
+        def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
+            """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
+
+            `main_agent_id` picks which env seat the main agent controls; the other seat
+            is controlled by the (stateless) BC policy.
+            """
+            other_agent_id = "agent_1" if main_agent_id == "agent_0" else "agent_0"
+            num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+
+            eval_rng, reset_rng = jax.random.split(eval_rng)
+            reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+            init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+            init_hstate = ScannedRNN.initialize_carry(num_eval_envs, config["GRU_HIDDEN_DIM"])
+            init_done = jnp.zeros((num_eval_envs,), dtype=bool)
+            init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+            runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+            def _eval_step(carry, _):
+                env_state_e, obs_e, main_done_e, hstate_e, returns_e, rng_e = carry
+                rng_e, main_rng_e, other_rng_e = jax.random.split(rng_e, 3)
+
+                agent_positions_e = env_state_e.env_state.agent_pos.reshape(num_eval_envs, -1)
+                main_ac_in = (
+                    obs_e[main_agent_id].reshape(num_eval_envs, -1)[np.newaxis, :],
+                    main_done_e[np.newaxis, :],
+                    agent_positions_e[np.newaxis, :],
+                )
+                hstate_next, main_pi, _ = network.apply(main_params, hstate_e, main_ac_in)
+                main_pi = distrax.Categorical(logits=main_pi.logits * config["EVAL_KWARGS"]["beta"])
+                main_sampled = main_pi.sample(seed=main_rng_e)[0]
+                main_greedy = jnp.argmax(main_pi.probs, axis=-1)[0]
+                main_action = jnp.where(config["EVAL_KWARGS"]["argmax"], main_greedy, main_sampled)
+
+                other_logits = bc_network.apply(bc_params, obs_e[other_agent_id].astype(jnp.float32))
+                other_pi = distrax.Categorical(logits=other_logits * config["EVAL_KWARGS"]["beta"])
+                other_sampled = other_pi.sample(seed=other_rng_e)
+                other_greedy = jnp.argmax(other_pi.probs, axis=-1)
+                other_action = jnp.where(config["EVAL_KWARGS"]["argmax"], other_greedy, other_sampled)
+
+                env_act = {main_agent_id: main_action, other_agent_id: other_action}
+
+                rng_e, _rng_e = jax.random.split(rng_e)
+                rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                obs_next, state_next, reward, done, _info = jax.vmap(
+                    eval_env.step, in_axes=(0, 0, 0)
+                )(rng_step_e, env_state_e, env_act)
+
+                returns_next = returns_e + reward["agent_0"]
+                return (state_next, obs_next, done[main_agent_id], hstate_next, returns_next, rng_e), None
+
+            runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
+            _, _, _, _, returns, _ = runner_state
+            return returns.mean()
+
+        def eval_layout_xp(
+            eval_env, main_params, bc_params_stacked, eval_rng,
+        ):
+            def _one_seed(bc_params, seed_rng):
+                rng_a, rng_b = jax.random.split(seed_rng)
+                r_main_as_0 = eval_layout_xp_direction(
+                    eval_env, main_params, bc_params, rng_a, "agent_0"
+                )
+                r_main_as_1 = eval_layout_xp_direction(
+                    eval_env, main_params, bc_params, rng_b, "agent_1"
+                )
+                return (r_main_as_0 + r_main_as_1) / 2.0
+
+            num_hp_seeds = int(config["EVAL_KWARGS"]["human_proxy_num_seeds"])
+            seed_rngs = jax.random.split(eval_rng, num_hp_seeds)
+            return jax.vmap(_one_seed)(bc_params_stacked, seed_rngs).mean()
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -575,18 +675,52 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                        **metric["loss"],
-                    }
+            if eval_xp_enabled:
+                run_eval = (
+                    (update_steps % LOG_INTERVAL == 0)
+                    | (update_steps == int(config["NUM_UPDATES"]) - 1)
                 )
+
+                def _do_eval(_):
+                    base = jax.random.fold_in(rng, update_steps)
+                    layout_return = eval_layout_xp(
+                        eval_envs[layout_name],
+                        train_state.params,
+                        human_proxy_params[layout_name],
+                        base,
+                    )
+                    return {
+                        f"{layout_name}_xp": layout_return,
+                        "mean_xp": layout_return,
+                    }
+
+                def _skip_eval(_):
+                    nan = jnp.array(jnp.nan, dtype=jnp.float32)
+                    return {
+                        f"{layout_name}_xp": nan,
+                        "mean_xp": nan,
+                    }
+
+                metric["eval_returns"] = jax.lax.cond(
+                    run_eval, _do_eval, _skip_eval, operand=None
+                )
+
+            def callback(metric):
+                log_data = {
+                    "returns": metric["returns"],
+                    "env_step": metric["update_steps"]
+                    * config["NUM_ENVS"]
+                    * config["NUM_STEPS"],
+                    **metric["loss"],
+                }
+                if "eval_returns" in metric:
+                    xp_mean = float(metric["eval_returns"]["mean_xp"])
+                    if np.isfinite(xp_mean):
+                        log_data["eval_xp/mean"] = xp_mean
+                        log_data[f"eval_xp/{layout_name}"] = float(
+                            metric["eval_returns"][f"{layout_name}_xp"]
+                        )
+                wandb.log(log_data, step=int(metric["update_steps"]))
                 current_return = float(metric["returns"])
                 if current_return > best_return[0]:
                     best_return[0] = current_return

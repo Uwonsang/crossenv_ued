@@ -29,6 +29,7 @@ import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 import time
+import flax.core
 from baselines.CEC_UED.algo_utils import (
     BCPolicy,
     EVAL_LAYOUTS_9,
@@ -247,7 +248,7 @@ class ActorCriticRNN(nn.Module):
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
-        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
+        critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0), name="critic_output")(
             critic
         )
 
@@ -334,7 +335,7 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, model_params=None, update_step=0):
+    def train(rng, model_params=None, update_step=0, init_popart_mu=None, init_popart_sigma=None):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         bc_network = BCPolicy()
@@ -375,6 +376,9 @@ def make_train(config, update_step=0):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+
+        popart_mu = init_popart_mu
+        popart_sigma = init_popart_sigma
 
         def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
             """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
@@ -453,7 +457,7 @@ def make_train(config, update_step=0):
         @scan_tqdm(int(config["NUM_UPDATES"]))
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
-            runner_state, update_steps = update_runner_state
+            runner_state, update_steps, popart_mu, popart_sigma = update_runner_state
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step, beta_agent = runner_state
@@ -540,33 +544,50 @@ def make_train(config, update_step=0):
                 agent_positions[np.newaxis, :],
             )
             _, _, last_val, _ = network.apply(train_state.params, hstate, ac_in)
-            last_val = last_val.squeeze()
+            last_val_real = last_val.squeeze() * popart_sigma + popart_mu
 
-            def _calculate_gae(traj_batch, last_val):
+            def _calculate_gae(traj_batch, last_val_real):
                 def _get_advantages(gae_and_next_value, transition):
                     gae, next_value = gae_and_next_value
-                    done, value, reward = (
+                    done, value_norm, reward = (
                         transition.global_done,
                         transition.value,
                         transition.reward,
                     )
-                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value
+                    value_real = value_norm * popart_sigma + popart_mu
+                    delta = reward + config["GAMMA"] * next_value * (1 - done) - value_real
                     gae = (
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
-                    return (gae, value), gae
+                    return (gae, value_real), gae
 
                 _, advantages = jax.lax.scan(
                     _get_advantages,
-                    (jnp.zeros_like(last_val), last_val),
+                    (jnp.zeros_like(last_val_real), last_val_real),
                     traj_batch,
                     reverse=True,
                     unroll=16,
                 )
-                return advantages, advantages + traj_batch.value
+                targets_real = advantages + traj_batch.value * popart_sigma + popart_mu
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+                return advantages, targets_real
+
+            advantages, targets = _calculate_gae(traj_batch, last_val_real)
+
+            _targets_norm = (targets - popart_mu) / popart_sigma
+            value_real = traj_batch.value * popart_sigma + popart_mu
+            target_stats = {
+                "popart/mu": popart_mu,
+                "popart/sigma": popart_sigma,
+                "target_raw/mean": targets.mean(),
+                "target_raw/std": targets.std(),
+                "target_popart/mean": _targets_norm.mean(),
+                "target_popart/std": _targets_norm.std(),
+                "critic/raw_rmse": jnp.sqrt(
+                    jnp.square(targets - value_real).mean()
+                ),
+            }
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -584,12 +605,13 @@ def make_train(config, update_step=0):
                         other_log_prob = other_pi.log_prob(traj_batch.other_action)
                         moa_nll_loss = -jnp.mean(other_log_prob)
 
-                        # CALCULATE VALUE LOSS
+                        # CALCULATE VALUE LOSS IN POPART-NORMALIZED SPACE
+                        targets_norm = (targets - popart_mu) / popart_sigma
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
+                        value_losses = jnp.square(value - targets_norm)
+                        value_losses_clipped = jnp.square(value_pred_clipped - targets_norm)
                         value_loss = 0.5 * jnp.maximum(
                             value_losses, value_losses_clipped
                         ).mean()
@@ -691,6 +713,32 @@ def make_train(config, update_step=0):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
+
+            # ── PopArt: update EMA stats and correct output layer weights ──
+            _pa_alpha = config["POPART_ALPHA"]
+            _batch_mu = targets.mean()
+            _batch_var = targets.var()
+            _mu_new = (1.0 - _pa_alpha) * popart_mu + _pa_alpha * _batch_mu
+            _sigma_new = jnp.sqrt(jnp.maximum(
+                (1.0 - _pa_alpha) * (popart_sigma ** 2 + popart_mu ** 2)
+                + _pa_alpha * (_batch_var + _batch_mu ** 2)
+                - _mu_new ** 2,
+                1e-8,
+            ))
+            # Preserve outputs precisely: rescale critic_output layer so the
+            # real-scale prediction is unchanged despite the new normalization.
+            _pa_params = flax.core.unfreeze(train_state.params)
+            _pa_params["params"]["critic_output"]["kernel"] = (
+                popart_sigma / _sigma_new
+            ) * _pa_params["params"]["critic_output"]["kernel"]
+
+            _pa_params["params"]["critic_output"]["bias"] = (
+                popart_sigma * _pa_params["params"]["critic_output"]["bias"] + popart_mu - _mu_new
+            ) / _sigma_new
+            train_state = train_state.replace(params=flax.core.freeze(_pa_params))
+            popart_mu, popart_sigma = _mu_new, _sigma_new
+            # ── end PopArt
+
             metric = traj_batch.info
             metric = jax.tree.map(
                 lambda x: x.reshape(
@@ -709,6 +757,7 @@ def make_train(config, update_step=0):
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][4],
                 "clip_frac": loss_info[1][5],
+                **target_stats,
             }
             rng = update_state[-1]
 
@@ -768,6 +817,8 @@ def make_train(config, update_step=0):
                             'params': metric["params"],
                             'returns': current_return,
                             'update_steps': int(metric['update_steps']),
+                            'popart_mu': metric["popart_mu"],
+                            'popart_sigma': metric["popart_sigma"],
                         }, f)
 
             returns = metric["returned_episode_returns"][:, :, 0][
@@ -776,10 +827,12 @@ def make_train(config, update_step=0):
             metric["returns"] = returns
             metric["update_steps"] = update_steps
             metric["params"] = train_state.params
+            metric["popart_mu"] = popart_mu
+            metric["popart_sigma"] = popart_sigma
             jax.experimental.io_callback(callback, None, metric)
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
-            return (runner_state, update_steps), metric
+            return (runner_state, update_steps, popart_mu, popart_sigma), metric
 
         best_return = [float('-inf')]
         
@@ -793,7 +846,7 @@ def make_train(config, update_step=0):
             _rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"]),
         )
         return {"runner_state": runner_state}
 
@@ -804,6 +857,7 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    config["model_name"] = "E3T_POP"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_e3t_finetune"
@@ -823,12 +877,12 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
+        tags=["E3T", "RNN", "SP", "PopArt"],
         config=config,
         mode=config["WANDB_MODE"],
-        name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
+        name=f"e3t_pop_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
     )
-    filepath = f"ckpts/e3t/{config['ENV_NAME']}"
+    filepath = f"ckpts/e3t_pop/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
@@ -842,11 +896,15 @@ def main(config):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
+    init_popart_mu = None
+    init_popart_sigma = None
     if config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
         with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
+            init_popart_mu = previous_ckpt.get('popart_mu')
+            init_popart_sigma = previous_ckpt.get('popart_sigma')
             final_update_step = previous_ckpt['final_update_step']
             rng = previous_ckpt['key']
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
@@ -870,19 +928,38 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
+    if init_popart_mu is None:
+        init_popart_mu = jnp.zeros(())
+    if init_popart_sigma is None:
+        init_popart_sigma = jnp.ones(())
+
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
+    out = train_jit(
+        rng,
+        model_params,
+        final_update_step,
+        init_popart_mu,
+        init_popart_sigma,
+    )
     runner_state = out['runner_state']
     train_state = runner_state[0]
     model_state = train_state[0]
-    rng = runner_state[-1]
+    rng = train_state[-1]
+    popart_mu = runner_state[2]
+    popart_sigma = runner_state[3]
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     
     # save model
     os.makedirs(filepath, exist_ok=True)
     with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
+        ckpt = {
+            'key': rng,
+            'params': model_state.params,
+            'update_steps': num_updates,
+            'popart_mu': popart_mu,
+            'popart_sigma': popart_sigma,
+        }
         pickle.dump(ckpt, f)
 
     print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")

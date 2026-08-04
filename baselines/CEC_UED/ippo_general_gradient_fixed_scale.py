@@ -31,8 +31,8 @@ import yaml
 from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
 
 from gradient_conflict_utils import (
-    compute_gradient_conflict_metrics,
-    empty_gradient_conflict_metrics,
+    compute_layout_gradient_metrics,
+    empty_layout_gradient_metrics,
 )
 from representation_metrics import (
     compute_optimizer_update_metrics,
@@ -677,40 +677,35 @@ def make_train(
                 jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
             )
 
-            gradient_conflict_window_steps = int(
+            layout_gradient_window_steps = int(
                 config["GRAD_CONFLICT_WINDOW_STEPS"]
             )
-            def _compute_gradient_conflict(_):
-                gradient_conflict_traj = jax.tree.map(
-                    lambda x: x[:gradient_conflict_window_steps],
+            def _compute_layout_gradient(_):
+                layout_gradient_traj = jax.tree.map(
+                    lambda x: x[:layout_gradient_window_steps],
                     traj_batch,
                 )
-                return compute_gradient_conflict_metrics(
+                return compute_layout_gradient_metrics(
                     network=network,
                     original_params=original_params,
                     initial_hstate=initial_hstate,
-                    traj_batch=gradient_conflict_traj,
-                    advantages=advantages[:gradient_conflict_window_steps],
+                    traj_batch=layout_gradient_traj,
+                    advantages=advantages[:layout_gradient_window_steps],
                     value_targets=(
-                        _targets_scaled[:gradient_conflict_window_steps]
+                        _targets_scaled[:layout_gradient_window_steps]
                     ),
                     layout_ids_full=(
-                        _layout_ids_full[:gradient_conflict_window_steps]
+                        _layout_ids_full[:layout_gradient_window_steps]
                     ),
                     layout_names=_LAYOUT_NAMES,
                     config=config,
                     num_agents=env.num_agents,
-                    pairing_key=jax.random.fold_in(
-                        jax.random.PRNGKey(config["SEED"]), update_steps
-                    ),
-                    value_trunk_keys=VALUE_TRUNK_KEYS,
-                    actor_trunk_keys=ACTOR_TRUNK_KEYS,
                 )
 
-            grad_conflict = jax.lax.cond(
+            layout_gradient_metrics = jax.lax.cond(
                 run_eval,
-                _compute_gradient_conflict,
-                lambda _: empty_gradient_conflict_metrics(_LAYOUT_NAMES),
+                _compute_layout_gradient,
+                lambda _: empty_layout_gradient_metrics(_LAYOUT_NAMES),
                 operand=None,
             )
 
@@ -916,7 +911,7 @@ def make_train(
                 **loss_info[2],
                 **target_stats,
             }
-            metric["gradient_conflict"] = grad_conflict
+            metric["layout_gradient"] = layout_gradient_metrics
             rng = update_state[-1]
 
             def eval_layout(eval_env, params, eval_rng):
@@ -1147,7 +1142,7 @@ def make_train(
 
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.
-                    for k, v in metric["gradient_conflict"].items():
+                    for k, v in metric["layout_gradient"].items():
                         log_dict[k] = float(v)
 
                     for k, v in metric["representation"].items():

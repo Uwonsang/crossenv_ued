@@ -11,7 +11,7 @@ All scripts share the same CLI flags:
 | `--project` | `crossenv_ued_gradient` | wandb project |
 | `--run-id` | (per script) | wandb run ID to plot |
 | `--smooth-window` | `50` | rolling-mean window, in samples |
-| `--x-axis` | `env_step` | `env_step` or `update_step` (`update_step = env_step / (NUM_ENVS * NUM_STEPS)`) |
+| `--x-axis` | 대부분 `env_step` | `env_step` or `update_step` (`update_step = env_step / (NUM_ENVS * NUM_STEPS)`); `absolute_contribution_graph.py`만 기본값이 `update_step` |
 
 Some scripts add an extra flag for selecting which logged variant to plot:
 
@@ -36,17 +36,31 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
 - **`train_returns_graph.py`** — training return (`train_returns/...`), per layout.
 - **`eval_graph.py`** — eval return (`eval/...`), per layout.
 
+## Current logging compatibility
+
+현재 `ippo_general_gradient.py` 계열의 새 run에는 `train_returns_graph.py`,
+`eval_graph.py`, `target_raw_graph.py`가 그대로 동작한다.
+`target_popart_graph.py`는 PopArt run에만 사용하고, `td_error_graph.py`는
+`--td-metric rmse`로 실행해야 한다.
+
+`grad_norm_graph.py`, `share_gradient_graph.py`,
+`absolute_contribution_graph.py`는 과거 run에 남아 있는
+`grad_conflict_*/norm/*`, `grad_share_weighted_*` key를 대상으로 한다. 현재
+로깅은 `grad_norm_actor/*`, `grad_norm_critic/*`,
+`grad_contribution_signed_*`를 사용하므로 이 세 스크립트는 새 run에 바로
+적용되지 않는다.
+
 ## Examples
 
 ```bash
-python3 td_error_graph.py --run-id 9g9abvem --td-metric rmse
-python3 share_gradient_graph.py --run-id 5rwobcx9 --loss-type actor --view raw
-python3 grad_norm_graph.py --run-id 5rwobcx9 --loss-type value --x-axis update_step
-python3 absolute_contribution_graph.py --run-id 5rwobcx9 --loss-type value --view stack
-python3 target_raw_graph.py --run-id 5rwobcx9
-python3 target_popart_graph.py --run-id 5rwobcx9
-python3 train_returns_graph.py --run-id 5rwobcx9 --smooth-window 20
-python3 eval_graph.py --run-id 5rwobcx9
+python baselines/CEC/figures/analysis/td_error_graph.py --run-id 9g9abvem --td-metric rmse
+python baselines/CEC/figures/analysis/share_gradient_graph.py --run-id 5rwobcx9 --loss-type actor --view raw
+python baselines/CEC/figures/analysis/grad_norm_graph.py --run-id 5rwobcx9 --loss-type value --x-axis update_step
+python baselines/CEC/figures/analysis/absolute_contribution_graph.py --run-id 5rwobcx9 --loss-type value --view stack
+python baselines/CEC/figures/analysis/target_raw_graph.py --run-id 5rwobcx9
+python baselines/CEC/figures/analysis/target_popart_graph.py --run-id 5rwobcx9
+python baselines/CEC/figures/analysis/train_returns_graph.py --run-id 5rwobcx9 --smooth-window 20
+python baselines/CEC/figures/analysis/eval_graph.py --run-id 5rwobcx9
 ```
 
 Run `python3 <script>.py --help` for the full flag list.

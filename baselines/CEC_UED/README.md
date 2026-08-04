@@ -1,8 +1,8 @@
 # CEC-UED training and diagnostic metrics
 
-이 문서는 `ippo_general_gradient.py`와
-`ippo_general_gradient_pop.py`가 Weights & Biases(W&B)에 기록하는 지표를
-정리한다. 별도 언급이 없다면 actor와 critic은 shared trunk를 포함한다.
+이 문서는 `ippo_general_gradient.py`가 Weights & Biases(W&B)에 기록하는
+지표를 기준으로 정리한다. PopArt에만 해당하는 차이는 별도로 표시한다. 별도
+언급이 없다면 actor와 critic은 shared trunk를 포함한다.
 
 ## 기록 시점
 
@@ -24,14 +24,34 @@ $$
 |---|---|
 | PPO loss, entropy, ratio, optimizer gradient norm, parameter weight norm, `returns` | interval 동안 finite 값의 평균 |
 | target, critic RMSE, TD-error RMSE | 해당 logging update의 rollout snapshot |
-| gradient conflict, representation feature/rank | 해당 logging update에서만 계산한 pre-update snapshot |
+| layout gradient, representation feature/rank | 해당 logging update에서만 계산한 pre-update snapshot |
 | evaluation | 가장 최근 diagnostic evaluation 결과 |
 | layout별 training return | interval에서 종료된 episode들의 평균 |
 
-마지막 PPO update는 interval 경계와 일치하지 않더라도 기록된다. Gradient
-conflict와 representation feature/rank는 PPO parameter update 직전의 parameter
+마지막 PPO update는 interval 경계와 일치하지 않더라도 기록된다. Layout
+gradient와 representation feature/rank는 PPO parameter update 직전의 parameter
 및 rollout로 계산된다. Weight norm은 각 PPO minibatch optimizer step 직전
 parameter에서 계산하지만 W&B 값은 interval 동안 평균한다.
+
+## 기본 학습 지표
+
+| W&B key | 의미 |
+|---|---|
+| `update_step` | 0부터 시작하는 현재 PPO update index |
+| `env_step` | `update_step * NUM_ENVS * NUM_STEPS` |
+| `returns` | rollout의 완료 episode return 평균 |
+| `total_loss` | actor loss + `VF_COEF` × value loss − `ENT_COEF` × entropy |
+| `value_loss` | clipped PPO value loss |
+| `actor_loss` | clipped PPO surrogate actor loss |
+| `entropy` | policy entropy |
+| `ratio` | 새 policy와 rollout policy의 probability ratio 평균 |
+| `ratio_0` | optimizer epoch/minibatch 평균 전 `ratio`의 첫 원소 |
+| `approx_kl` | `(ratio - 1) - logratio`의 평균 |
+| `clip_frac` | `abs(ratio - 1) > CLIP_EPS`인 sample 비율 |
+
+`returns`와 loss 계열은 logging interval 동안 finite 값만 누적해 평균한다.
+`ratio_0`은 전체 ratio 통계가 아니라, update 결과를 정리하는 과정에서 남긴
+첫 원소이므로 일반적인 모니터링에는 `ratio`가 더 적합하다.
 
 ## 표기법
 
@@ -113,6 +133,8 @@ $$
 | `critic/<layout>/rmse` | 해당 layout의 critic RMSE |
 | `td_error/rmse` | $\sqrt{\operatorname{mean}(\delta_t^2)}$ |
 | `td_error/<layout>/rmse` | 해당 layout의 TD-error RMSE |
+| `td_error/zero_reward_rmse` | `abs(reward) < 1e-8`인 transition의 TD-error RMSE |
+| `td_error/nonzero_reward_rmse` | 나머지 transition의 TD-error RMSE |
 
 ### PopArt scale
 
@@ -136,7 +158,7 @@ $$
 
 ## Layout-family gradient
 
-Gradient conflict 진단에는 rollout 전체가 아니라 앞쪽
+Layout gradient 진단에는 rollout 전체가 아니라 앞쪽
 `GRAD_CONFLICT_WINDOW_STEPS` 구간을 사용한다.
 
 Layout $l$에서 관측된 sample 수를 $n_l$, 전체 sample 수를
@@ -159,15 +181,10 @@ $$
 | `grad_norm_actor/total` | $\|G^{\mathrm{actor}}\|_2/n$ |
 | `grad_norm_critic/total` | $\|G^{\mathrm{value}}\|_2/n$ |
 
-### Layout contribution
+### Layout signed contribution
 
-방향을 무시한 sample-weighted gradient 크기는 다음과 같다.
-
-$$
-C_l^{\mathrm{magnitude}}=p_l\|g_l\|_2.
-$$
-
-전체 combined gradient 방향으로 투영한 signed contribution은 다음과 같다.
+전체 combined gradient 방향으로 투영한 sample-weighted signed contribution은
+다음과 같다.
 
 $$
 C_l^{\mathrm{signed}}=
@@ -176,28 +193,13 @@ $$
 
 | W&B key | 의미 |
 |---|---|
-| `grad_contribution_magnitude_actor/<layout>` | actor의 $C_l^{\mathrm{magnitude}}$ |
-| `grad_contribution_magnitude_critic/<layout>` | value의 $C_l^{\mathrm{magnitude}}$ |
 | `grad_contribution_signed_actor/<layout>` | actor의 $C_l^{\mathrm{signed}}$ |
 | `grad_contribution_signed_critic/<layout>` | value의 $C_l^{\mathrm{signed}}$ |
 
-`magnitude`는 항상 0 이상이다. `signed`가 음수이면 해당 layout gradient가
-전체 combined gradient 방향을 방해한다.
-
-### Layout 간 conflict
-
-$$
-\cos(g_i,g_j)=
-\frac{g_i^\top g_j}{\|g_i\|_2\|g_j\|_2+\epsilon}.
-$$
-
-| W&B key | 의미 |
-|---|---|
-| `grad_conflict_actor/<layout_i>_vs_<layout_j>` | actor layout gradient cosine |
-| `grad_conflict_value/<layout_i>_vs_<layout_j>` | value layout gradient cosine |
-
-Layout이 해당 rollout에 존재하지 않으면 관련 layout metric은
-`NaN`이다.
+`signed`가 음수이면 해당 layout gradient가 전체 combined gradient 방향을
+방해한다. Layout이 해당 rollout에 존재하지 않으면 관련 layout metric은
+`NaN`이다. 현재 `gradient_conflict_utils.py`는 layout 간 cosine conflict와
+magnitude contribution을 계산하거나 기록하지 않는다.
 
 ### Family gradient norm equalization
 
@@ -221,86 +223,6 @@ family_gradient_norm/target
 family_gradient_norm/raw/<layout>
 family_gradient_norm/equalized/<layout>
 ```
-
-## Environment-sample gradient conflict
-
-하나의 sample은 한 environment slot의 앞쪽
-`GRAD_CONFLICT_WINDOW_STEPS` trajectory이며 두 actor를 함께 포함한다. Episode
-reset을 통과하면 `done`이 recurrent state를 reset한다.
-Actor와 value gradient는 별도로 측정한다.
-
-정규화된 gradient를 다음과 같이 둔다.
-
-$$
-u_i=\frac{g_i}{\|g_i\|_2+\epsilon}.
-$$
-
-### 전체 pair 평균 cosine
-
-```text
-grad_conflict_sample_actor/avg_pairwise_cosine
-grad_conflict_sample_value/avg_pairwise_cosine
-```
-
-$$
-\overline{C}=
-\frac{1}{N(N-1)}\sum_{i\ne j}u_i^\top u_j.
-$$
-
-다음 항등식을 사용하므로 full gradient matrix를 저장하지 않고도 모든 pair를
-정확히 반영한다.
-
-$$
-\sum_{i\ne j}u_i^\top u_j
-=\left\|\sum_i u_i\right\|_2^2-\sum_i\|u_i\|_2^2.
-$$
-
-### Conflict rate와 negative cosine
-
-```text
-grad_conflict_sample_actor/conflict_rate
-grad_conflict_sample_value/conflict_rate
-grad_conflict_sample_actor/avg_negative_cosine
-grad_conflict_sample_value/avg_negative_cosine
-```
-
-매 diagnostic update마다 environment를 무작위로 섞고 인접한 두 environment를
-묶어 random perfect matching $\mathcal M$을 만든다. `NUM_ENVS=256`이면
-128개의 disjoint pair를 사용한다.
-
-$$
-\operatorname{conflict\_rate}=
-\frac{1}{|\mathcal M|}\sum_{(i,j)\in\mathcal M}
-\mathbf 1(u_i^\top u_j<0).
-$$
-
-$$
-\operatorname{avg\_negative\_cosine}=
-\frac{1}{|\mathcal M|}\sum_{(i,j)\in\mathcal M}
-\max(0,-u_i^\top u_j).
-$$
-
-`avg_negative_cosine`은 conflict pair만을 조건으로 한 평균이 아니다. 전체
-matched pair에 대한 negative part의 평균이므로 conflict 빈도와 강도를 모두
-반영한다. 두 지표는 전체 $\binom{N}{2}$ pair의 정확한 값이 아니라 매
-update의 random matching estimator이다.
-
-### Sample alignment
-
-```text
-grad_conflict_sample_actor/alignment
-grad_conflict_sample_value/alignment
-```
-
-$$
-\operatorname{alignment}=
-\frac{\|\sum_i g_i\|_2^2}
-{N\sum_i\|g_i\|_2^2+\epsilon}.
-$$
-
-값이 1에 가까우면 environment gradient들이 집단적으로 같은 방향이고, 0에
-가까우면 상쇄되거나 서로 다른 방향이다. 이 값은 random matching이 아니라
-전체 $N$개 gradient를 반영한다.
 
 ## Representation weight metrics
 

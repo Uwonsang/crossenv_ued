@@ -479,7 +479,25 @@ representation_rank/critic_matrix_rank
 | `eval/<layout>` | layout별 evaluation return |
 | `eval_xp/mean` | human-proxy cross-play 평균 return |
 | `eval_xp/<layout>` | layout별 human-proxy cross-play return |
+| `eval_critic/<layout>/value_mean` | self-play eval 중 critic value 평균 |
+| `eval_critic/<layout>/target_mean` | raw eval reward의 bootstrapped discounted-return 평균 |
+| `eval_critic/<layout>/value_rmse` | value와 bootstrapped discounted return 사이 RMSE |
+| `eval_critic/<layout>/td_error_rmse` | raw eval reward 기준 one-step TD-error RMSE |
+| `eval_xp_critic/<layout>/value_mean` | human-proxy XP 중 main policy critic value 평균 |
+| `eval_xp_critic/<layout>/target_mean` | XP raw reward의 bootstrapped discounted-return 평균 |
+| `eval_xp_critic/<layout>/value_rmse` | XP value와 bootstrapped discounted return 사이 RMSE |
+| `eval_xp_critic/<layout>/td_error_rmse` | XP raw reward 기준 one-step TD-error RMSE |
 | `train_returns/<layout>` | logging interval에 종료된 해당 layout episode return 평균 |
+
+Eval rollout은 `EVAL_KWARGS.num_steps`의 마지막 transition에서 항상 실제
+terminal state에 도달한다고 가정하므로 horizon 이후 value는 0으로 둔다.
+Self-play에서는 두 actor의 value를 모두 사용하며, XP에서는 학습된 main
+policy가 차지하는 seat의 value만 사용한다. XP의 squared error는 두 seat와
+모든 human-proxy seed에 걸쳐 평균한 뒤 제곱근을 취한다.
+
+이 target과 TD error는 shaped reward가 아닌 raw environment reward 기준이다.
+따라서 shaped reward가 남아 있는 학습 초반에는 training critic metric과 직접
+비교할 때 reward 정의의 차이에 주의해야 한다.
 
 ## 참고 문헌
 

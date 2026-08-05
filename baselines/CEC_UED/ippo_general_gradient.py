@@ -41,6 +41,12 @@ from representation_metrics import (
     first_epoch_first_minibatch_indices,
 )
 from value_diagnostics import compute_value_diagnostics
+from evaluation_metrics import (
+    EVAL_CRITIC_STAT_NAMES,
+    add_evaluation_metrics_to_log_dict,
+    compute_evaluation_critic_statistics,
+    empty_evaluation_metrics,
+)
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -846,44 +852,6 @@ def make_train(
             metric["layout_gradient"] = layout_gradient_metrics
             rng = update_state[-1]
 
-            def _evaluation_critic_statistics(
-                values, rewards, dones, final_values,
-            ):
-                """Raw-reward critic diagnostics for one evaluation rollout."""
-                dones = dones.astype(values.dtype)
-                next_values = jnp.concatenate(
-                    [values[1:], final_values[jnp.newaxis, :]], axis=0,
-                )
-                td_errors_eval = (
-                    rewards
-                    + config["GAMMA"] * (1.0 - dones) * next_values
-                    - values
-                )
-
-                def _discounted_return(carry, transition):
-                    reward, done = transition
-                    target = (
-                        reward
-                        + config["GAMMA"] * (1.0 - done) * carry
-                    )
-                    return target, target
-
-                _, value_targets_eval = jax.lax.scan(
-                    _discounted_return,
-                    final_values,
-                    (rewards, dones),
-                    reverse=True,
-                )
-                value_errors_eval = value_targets_eval - values
-                return {
-                    "value_mean": values.mean(),
-                    "target_mean": value_targets_eval.mean(),
-                    # Keep squared errors until all equally sized XP groups are
-                    # combined; taking sqrt early would not produce pooled RMSE.
-                    "value_mse": jnp.square(value_errors_eval).mean(),
-                    "td_error_mse": jnp.square(td_errors_eval).mean(),
-                }
-
             def eval_layout(eval_env, params, eval_rng):
                 num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
                 num_actors_eval = eval_env.num_agents * num_eval_envs 
@@ -937,7 +905,10 @@ def make_train(
                 # Evaluation always ends at a true terminal state, so there is
                 # no value bootstrap beyond the fixed horizon.
                 final_values = jnp.zeros_like(values_eval[-1])
-                critic_stats = _evaluation_critic_statistics(values_eval, rewards_eval, dones_eval, final_values)
+                critic_stats = compute_evaluation_critic_statistics(
+                    values_eval, rewards_eval, dones_eval, final_values,
+                    gamma=config["GAMMA"],
+                )
 
                 return returns.mean(), critic_stats
 
@@ -1000,7 +971,10 @@ def make_train(
                 values_eval, rewards_eval, dones_eval = critic_trajectory
                 # XP uses the same fixed terminal horizon as self-play eval.
                 final_values = jnp.zeros_like(values_eval[-1])
-                critic_stats = _evaluation_critic_statistics(values_eval, rewards_eval, dones_eval, final_values)
+                critic_stats = compute_evaluation_critic_statistics(
+                    values_eval, rewards_eval, dones_eval, final_values,
+                    gamma=config["GAMMA"],
+                )
 
                 return returns.mean(), critic_stats
 
@@ -1054,21 +1028,9 @@ def make_train(
                     return out
 
                 def _skip_eval(_):
-                    out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
-                    out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                    critic_stat_names = (
-                        "value_mean", "target_mean", "value_rmse", "td_error_rmse",
+                    return empty_evaluation_metrics(
+                        EVAL_LAYOUTS_9, eval_xp_enabled,
                     )
-                    for layout_name in EVAL_LAYOUTS_9:
-                        for stat_name in critic_stat_names:
-                            out[f"{layout_name}_critic_{stat_name}"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                    if eval_xp_enabled:
-                        for n in EVAL_LAYOUTS_9:
-                            out[f"{n}_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                            for stat_name in critic_stat_names:
-                                out[f"{n}_xp_critic_{stat_name}"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                        out["mean_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
-                    return out
 
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
 
@@ -1080,13 +1042,6 @@ def make_train(
                     "critic/",
                     "td_error/",
                 )
-                eval_critic_stat_names = (
-                    "value_mean",
-                    "target_mean",
-                    "value_rmse",
-                    "td_error_rmse",
-                )
-
                 # Average finite scalar training metrics over the interval.
                 def _accumulate(key, value):
                     value = float(value)
@@ -1108,7 +1063,7 @@ def make_train(
                             **{_ln: float(metric["eval_returns"][_ln]) for _ln in EVAL_LAYOUTS_9},
                         }
                         for _ln in EVAL_LAYOUTS_9:
-                            for stat_name in eval_critic_stat_names:
+                            for stat_name in EVAL_CRITIC_STAT_NAMES:
                                 source_key = f"{_ln}_critic_{stat_name}"
                                 eval_last[source_key] = float(
                                     metric["eval_returns"][source_key]
@@ -1117,7 +1072,7 @@ def make_train(
                             eval_last["mean_xp"] = float(metric["eval_returns"]["mean_xp"])
                             for _ln in EVAL_LAYOUTS_9:
                                 eval_last[f"{_ln}_xp"] = float(metric["eval_returns"][f"{_ln}_xp"])
-                                for stat_name in eval_critic_stat_names:
+                                for stat_name in EVAL_CRITIC_STAT_NAMES:
                                     source_key = f"{_ln}_xp_critic_{stat_name}"
                                     eval_last[source_key] = float(
                                         metric["eval_returns"][source_key]
@@ -1151,24 +1106,12 @@ def make_train(
                         if k.startswith(snapshot_prefixes):
                             log_dict[k] = float(v)
 
-                    if _log_accum["eval_last"] is not None:
-                        log_dict["eval/mean"] = _log_accum["eval_last"]["mean"]
-                        for _ln in EVAL_LAYOUTS_9:
-                            log_dict[f"eval/{_ln}"] = _log_accum["eval_last"][_ln]
-                            for stat_name in eval_critic_stat_names:
-                                source_key = f"{_ln}_critic_{stat_name}"
-                                log_dict[f"eval_critic/{_ln}/{stat_name}"] = (
-                                    _log_accum["eval_last"][source_key]
-                                )
-                        if eval_xp_enabled and "mean_xp" in _log_accum["eval_last"]:
-                            log_dict["eval_xp/mean"] = _log_accum["eval_last"]["mean_xp"]
-                            for _ln in EVAL_LAYOUTS_9:
-                                log_dict[f"eval_xp/{_ln}"] = _log_accum["eval_last"][f"{_ln}_xp"]
-                                for stat_name in eval_critic_stat_names:
-                                    source_key = f"{_ln}_xp_critic_{stat_name}"
-                                    log_dict[f"eval_xp_critic/{_ln}/{stat_name}"] = (
-                                        _log_accum["eval_last"][source_key]
-                                    )
+                    add_evaluation_metrics_to_log_dict(
+                        log_dict,
+                        _log_accum["eval_last"],
+                        EVAL_LAYOUTS_9,
+                        eval_xp_enabled,
+                    )
 
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.

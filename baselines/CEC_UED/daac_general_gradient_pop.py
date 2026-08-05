@@ -1407,7 +1407,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/daac/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"

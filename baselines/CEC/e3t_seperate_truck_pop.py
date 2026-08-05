@@ -902,6 +902,10 @@ def main(config):
         fcp_prefix = ""
         finetune_appendage = "_e3t"
 
+    save_variant = "e3t_separate_trunk_pop"
+    if config["TRAIN_KWARGS"]["finetune"]:
+        save_variant += "_finetune"
+
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
@@ -985,7 +989,7 @@ def main(config):
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {
             'key': rng,
             'params': model_state.params,
@@ -995,7 +999,7 @@ def main(config):
         }
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

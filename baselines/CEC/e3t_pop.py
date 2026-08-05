@@ -800,7 +800,7 @@ def make_train(config, update_step=0):
                 if current_return > best_return[0]:
                     best_return[0] = current_return
                     os.makedirs(config['filepath'], exist_ok=True)
-                    ckpt_path = f"{config['filepath']}/{config['fcp_prefix']}seed{config['SEED']}_best_e3t.pkl"
+                    ckpt_path = f"{config['filepath']}/{config['fcp_prefix']}seed{config['SEED']}_best_e3t_pop.pkl"
                     with open(ckpt_path, "wb") as f:
                         pickle.dump({
                             'params': metric["params"],
@@ -857,6 +857,10 @@ def main(config):
     else:
         fcp_prefix = ""
         finetune_appendage = "_e3t"
+
+    save_variant = "e3t_pop"
+    if config["TRAIN_KWARGS"]["finetune"]:
+        save_variant += "_finetune"
 
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
@@ -941,7 +945,7 @@ def main(config):
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {
             'key': rng,
             'params': model_state.params,
@@ -951,7 +955,7 @@ def main(config):
         }
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

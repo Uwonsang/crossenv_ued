@@ -793,6 +793,7 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    config["model_name"] = "E3T"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_e3t_finetune"
@@ -804,6 +805,10 @@ def main(config):
         fcp_prefix = ""
         finetune_appendage = "_e3t"
 
+    save_variant = "e3t"
+    if config["TRAIN_KWARGS"]["finetune"]:
+        save_variant += "_finetune"
+
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
@@ -812,7 +817,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
+        tags=["E3T", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
@@ -870,11 +875,11 @@ def main(config):
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

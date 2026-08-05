@@ -846,6 +846,44 @@ def make_train(
             metric["layout_gradient"] = layout_gradient_metrics
             rng = update_state[-1]
 
+            def _evaluation_critic_statistics(
+                values, rewards, dones, final_values,
+            ):
+                """Raw-reward critic diagnostics for one evaluation rollout."""
+                dones = dones.astype(values.dtype)
+                next_values = jnp.concatenate(
+                    [values[1:], final_values[jnp.newaxis, :]], axis=0,
+                )
+                td_errors_eval = (
+                    rewards
+                    + config["GAMMA"] * (1.0 - dones) * next_values
+                    - values
+                )
+
+                def _discounted_return(carry, transition):
+                    reward, done = transition
+                    target = (
+                        reward
+                        + config["GAMMA"] * (1.0 - done) * carry
+                    )
+                    return target, target
+
+                _, value_targets_eval = jax.lax.scan(
+                    _discounted_return,
+                    final_values,
+                    (rewards, dones),
+                    reverse=True,
+                )
+                value_errors_eval = value_targets_eval - values
+                return {
+                    "value_mean": values.mean(),
+                    "target_mean": value_targets_eval.mean(),
+                    # Keep squared errors until all equally sized XP groups are
+                    # combined; taking sqrt early would not produce pooled RMSE.
+                    "value_mse": jnp.square(value_errors_eval).mean(),
+                    "td_error_mse": jnp.square(td_errors_eval).mean(),
+                }
+
             def eval_layout(eval_env, params, eval_rng):
                 num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
                 num_actors_eval = eval_env.num_agents * num_eval_envs 
@@ -870,7 +908,7 @@ def make_train(
                         done_e[np.newaxis, :],
                         agent_positions[np.newaxis, :],
                     )
-                    hstate_next, pi, _ = network.apply(params, hstate_e, ac_in)
+                    hstate_next, pi, value_e = network.apply(params, hstate_e, ac_in)
                     pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
                     sampled_action = pi.sample(seed=_rng_e)[0]
                     greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
@@ -888,12 +926,20 @@ def make_train(
                     done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
                     returns_next = returns_e + reward["agent_0"]
 
-                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), None
-                
-                runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
-                state, obs, done, h_state, returns, rng = runner_state
+                    reward_batch = batchify(reward, eval_env.agents, num_actors_eval).squeeze()
+                    critic_transition = (value_e[0], reward_batch, done_next)
 
-                return returns.mean()
+                    return (state_next, obs_next, done_next, hstate_next, returns_next, rng_e), critic_transition
+                
+                runner_state, critic_trajectory = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
+                _, _, _, _, returns, _ = runner_state
+                values_eval, rewards_eval, dones_eval = critic_trajectory
+                # Evaluation always ends at a true terminal state, so there is
+                # no value bootstrap beyond the fixed horizon.
+                final_values = jnp.zeros_like(values_eval[-1])
+                critic_stats = _evaluation_critic_statistics(values_eval, rewards_eval, dones_eval, final_values)
+
+                return returns.mean(), critic_stats
 
             def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
                 """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
@@ -922,7 +968,7 @@ def make_train(
                         main_done_e[np.newaxis, :],
                         agent_positions_e[np.newaxis, :],
                     )
-                    hstate_next, main_pi, _ = network.apply(main_params, hstate_e, main_ac_in)
+                    hstate_next, main_pi, main_value = network.apply(main_params, hstate_e, main_ac_in)
                     main_pi = distrax.Categorical(logits=main_pi.logits * config["EVAL_KWARGS"]["beta"])
                     main_sampled = main_pi.sample(seed=main_rng_e)[0]
                     main_greedy = jnp.argmax(main_pi.probs, axis=-1)[0]
@@ -944,26 +990,33 @@ def make_train(
 
                     returns_next = returns_e + reward["agent_0"]
 
-                    return (state_next, obs_next, done[main_agent_id], hstate_next, returns_next, rng_e), None
+                    critic_transition = (main_value[0], reward["agent_0"], done[main_agent_id])
+        
+        
+                    return (state_next, obs_next, done[main_agent_id], hstate_next, returns_next, rng_e), critic_transition
 
-                runner_state, _ = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
+                runner_state, critic_trajectory = jax.lax.scan(_eval_step, runner_state, None, int(config["EVAL_KWARGS"]["num_steps"]))
                 _, _, _, _, returns, _ = runner_state
+                values_eval, rewards_eval, dones_eval = critic_trajectory
+                # XP uses the same fixed terminal horizon as self-play eval.
+                final_values = jnp.zeros_like(values_eval[-1])
+                critic_stats = _evaluation_critic_statistics(values_eval, rewards_eval, dones_eval, final_values)
 
-                return returns.mean()
+                return returns.mean(), critic_stats
 
             def eval_layout_xp(eval_env, main_params, bc_params_stacked, eval_rng):
                 """Cross-play score for one layout: averaged over human_proxy seeds and over
                 which env seat (agent_0/agent_1) the main agent occupies."""
                 def _one_seed(bc_params_seed, rng_seed):
                     rng_a, rng_b = jax.random.split(rng_seed)
-                    r_main_as_0 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_a, "agent_0")
-                    r_main_as_1 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_b, "agent_1")
-                    return (r_main_as_0 + r_main_as_1) / 2.0
+                    result_main_as_0 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_a, "agent_0")
+                    result_main_as_1 = eval_layout_xp_direction(eval_env, main_params, bc_params_seed, rng_b, "agent_1")
+                    return jax.tree.map(lambda a, b: (a + b) / 2.0, result_main_as_0, result_main_as_1)
 
                 num_hp_seeds = int(config["EVAL_KWARGS"]["human_proxy_num_seeds"])
                 seed_rngs = jax.random.split(eval_rng, num_hp_seeds)
-                per_seed_returns = jax.vmap(_one_seed)(bc_params_stacked, seed_rngs)
-                return per_seed_returns.mean()
+                per_seed_results = jax.vmap(_one_seed)(bc_params_stacked, seed_rngs)
+                return jax.tree.map(lambda value: value.mean(), per_seed_results)
 
             metric["representation"] = representation_metrics
 
@@ -972,30 +1025,48 @@ def make_train(
                     out = {}
                     base = jax.random.fold_in(rng, update_steps)
                     for i, layout_name in enumerate(EVAL_LAYOUTS_9):
-                        out[layout_name] = eval_layout(
+                        layout_return, critic_stats = eval_layout(
                             eval_envs[layout_name],
                             train_state.params,
                             jax.random.fold_in(base, i),
                         )
+                        out[layout_name] = layout_return
+                        out[f"{layout_name}_critic_value_mean"] = critic_stats["value_mean"]
+                        out[f"{layout_name}_critic_target_mean"] = critic_stats["target_mean"]
+                        out[f"{layout_name}_critic_value_rmse"] = jnp.sqrt(critic_stats["value_mse"])
+                        out[f"{layout_name}_critic_td_error_rmse"] = jnp.sqrt(critic_stats["td_error_mse"])
                     out["mean"] = jnp.mean(jnp.stack([out[n] for n in EVAL_LAYOUTS_9]))
                     if eval_xp_enabled:
                         xp_base = jax.random.fold_in(base, 1000)
                         for i, layout_name in enumerate(EVAL_LAYOUTS_9):
-                            out[f"{layout_name}_xp"] = eval_layout_xp(
+                            xp_return, xp_critic_stats = eval_layout_xp(
                                 eval_envs[layout_name],
                                 train_state.params,
                                 human_proxy_params[layout_name],
                                 jax.random.fold_in(xp_base, i),
                             )
+                            out[f"{layout_name}_xp"] = xp_return
+                            out[f"{layout_name}_xp_critic_value_mean"] = xp_critic_stats["value_mean"]
+                            out[f"{layout_name}_xp_critic_target_mean"] = xp_critic_stats["target_mean"]
+                            out[f"{layout_name}_xp_critic_value_rmse"] = jnp.sqrt(xp_critic_stats["value_mse"])
+                            out[f"{layout_name}_xp_critic_td_error_rmse"] = jnp.sqrt(xp_critic_stats["td_error_mse"])
                         out["mean_xp"] = jnp.mean(jnp.stack([out[f"{n}_xp"] for n in EVAL_LAYOUTS_9]))
                     return out
 
                 def _skip_eval(_):
                     out = {n: jnp.array(jnp.nan, dtype=jnp.float32) for n in EVAL_LAYOUTS_9}
                     out["mean"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                    critic_stat_names = (
+                        "value_mean", "target_mean", "value_rmse", "td_error_rmse",
+                    )
+                    for layout_name in EVAL_LAYOUTS_9:
+                        for stat_name in critic_stat_names:
+                            out[f"{layout_name}_critic_{stat_name}"] = jnp.array(jnp.nan, dtype=jnp.float32)
                     if eval_xp_enabled:
                         for n in EVAL_LAYOUTS_9:
                             out[f"{n}_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
+                            for stat_name in critic_stat_names:
+                                out[f"{n}_xp_critic_{stat_name}"] = jnp.array(jnp.nan, dtype=jnp.float32)
                         out["mean_xp"] = jnp.array(jnp.nan, dtype=jnp.float32)
                     return out
 
@@ -1008,6 +1079,12 @@ def make_train(
                     "target_popart/",
                     "critic/",
                     "td_error/",
+                )
+                eval_critic_stat_names = (
+                    "value_mean",
+                    "target_mean",
+                    "value_rmse",
+                    "td_error_rmse",
                 )
 
                 # Average finite scalar training metrics over the interval.
@@ -1030,10 +1107,21 @@ def make_train(
                             "mean": float(metric["eval_returns"]["mean"]),
                             **{_ln: float(metric["eval_returns"][_ln]) for _ln in EVAL_LAYOUTS_9},
                         }
+                        for _ln in EVAL_LAYOUTS_9:
+                            for stat_name in eval_critic_stat_names:
+                                source_key = f"{_ln}_critic_{stat_name}"
+                                eval_last[source_key] = float(
+                                    metric["eval_returns"][source_key]
+                                )
                         if eval_xp_enabled and np.isfinite(float(metric["eval_returns"]["mean_xp"])):
                             eval_last["mean_xp"] = float(metric["eval_returns"]["mean_xp"])
                             for _ln in EVAL_LAYOUTS_9:
                                 eval_last[f"{_ln}_xp"] = float(metric["eval_returns"][f"{_ln}_xp"])
+                                for stat_name in eval_critic_stat_names:
+                                    source_key = f"{_ln}_xp_critic_{stat_name}"
+                                    eval_last[source_key] = float(
+                                        metric["eval_returns"][source_key]
+                                    )
                         _log_accum["eval_last"] = eval_last
 
                 if config["ENV_NAME"] == "overcooked":
@@ -1067,10 +1155,20 @@ def make_train(
                         log_dict["eval/mean"] = _log_accum["eval_last"]["mean"]
                         for _ln in EVAL_LAYOUTS_9:
                             log_dict[f"eval/{_ln}"] = _log_accum["eval_last"][_ln]
+                            for stat_name in eval_critic_stat_names:
+                                source_key = f"{_ln}_critic_{stat_name}"
+                                log_dict[f"eval_critic/{_ln}/{stat_name}"] = (
+                                    _log_accum["eval_last"][source_key]
+                                )
                         if eval_xp_enabled and "mean_xp" in _log_accum["eval_last"]:
                             log_dict["eval_xp/mean"] = _log_accum["eval_last"]["mean_xp"]
                             for _ln in EVAL_LAYOUTS_9:
                                 log_dict[f"eval_xp/{_ln}"] = _log_accum["eval_last"][f"{_ln}_xp"]
+                                for stat_name in eval_critic_stat_names:
+                                    source_key = f"{_ln}_xp_critic_{stat_name}"
+                                    log_dict[f"eval_xp_critic/{_ln}/{stat_name}"] = (
+                                        _log_accum["eval_last"][source_key]
+                                    )
 
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.

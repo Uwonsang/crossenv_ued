@@ -627,13 +627,12 @@ def make_train(
                 network_params,
             )
         )
-        critic_trunk_sam_mask = flax.core.freeze(
-            flax.traverse_util.path_aware_map(
-                lambda path, _: any(
-                    "critic_trunk" in str(key) for key in path
-                ),
-                network_params,
-            )
+        # Apply SAM to the complete value network: the critic feature trunk,
+        # all critic hidden layers, and the critic output head. Reusing the
+        # optimizer labels keeps this mask aligned with future critic modules.
+        full_critic_sam_mask = jax.tree.map(
+            lambda label: label == "value",
+            param_labels,
         )
         tx = optax.multi_transform(
             {
@@ -1052,7 +1051,7 @@ def make_train(
                         train_state.params,
                         first_grads,
                         config["SAM_RHO"],
-                        mask=critic_trunk_sam_mask,
+                        mask=full_critic_sam_mask,
                     )
                     second_total_loss, second_grads = (
                         _loss_and_merged_grads(perturbed_params)
@@ -1063,10 +1062,10 @@ def make_train(
                         ),
                         first_grads,
                         second_grads,
-                        critic_trunk_sam_mask,
+                        full_critic_sam_mask,
                     )
                     # The reported objective corresponds to the perturbed
-                    # critic-trunk pass that supplies the SAM gradients.
+                    # full-critic pass that supplies the SAM gradients.
                     total_loss = second_total_loss
                     # Match SimBaV2's optimizer-update semantics: measure the
                     # parameter state used by this minibatch immediately before
@@ -1081,7 +1080,7 @@ def make_train(
                         sam_first_grad_norm
                     )
                     optimizer_update_metrics["sam/second_grad_norm"] = (
-                        _tree_l2_norm(second_grads, critic_trunk_sam_mask)
+                        _tree_l2_norm(second_grads, full_critic_sam_mask)
                     )
                     optimizer_update_metrics["sam/rho"] = config["SAM_RHO"]
                     train_state = train_state.apply_gradients(grads=grads)
@@ -1618,7 +1617,7 @@ def main(config):
     config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
     config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
     config.setdefault("SAM_RHO", 0.01)
-    config["model_name"] = "IDAAC_POP_SAM_CRITIC"
+    config["model_name"] = "IDAAC_POP_SAM_FULL_CRITIC"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1650,7 +1649,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/idaac_pop_sam_critic/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/idaac_pop_sam_full_critic/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
@@ -1680,10 +1679,10 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["IDAAC", "RNN", "SP", "PopArt", "SAM", "SAM-CriticTrunk"],
+            tags=["IDAAC", "RNN", "SP", "PopArt", "SAM", "SAM-FullCritic"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=(f"IDAAC_gradient_pop_sam_critic_{layout_name}_seed{config['SEED']}")
+            name=(f"IDAAC_gradient_pop_sam_full_critic_{layout_name}_seed{config['SEED']}")
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

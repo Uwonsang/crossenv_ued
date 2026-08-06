@@ -76,4 +76,15 @@
 "GRAD_CONFLICT_CHUNK_SIZE": 64  # must evenly divide NUM_ENVS (one sample contains both actors)
 "POPART_ALPHA": 0.01
 "FIXED_TARGET_SCALE": 30.0  # critic learns raw value / this fixed positive scale
+"SHARPNESS":
+  "EPSILONS": [0.001, 0.0005]  # Keskar et al. (2017), Tables 3 and 4
+  "LBFGSB_MAXITER": 10       # inexact maximization used by the paper
+  "NUM_ACTORS": 16           # evenly sampled recurrent actor trajectories
+  "NUM_STEPS": 400           # fixed post-training rollout horizon
+"CRITIC_LOSS_SURFACE":
+  "SNAPSHOT_FRACTIONS":
+    "early": 0.1
+    "middle": 0.5
+    "final": 1.0
+  "NUM_ACTORS": 16           # evenly sampled intact trajectories per snapshot
 "RESUME_XPID": ""  # set to xpid string (e.g. "lr-20240608-143022") to resume that run

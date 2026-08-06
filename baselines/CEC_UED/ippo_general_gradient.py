@@ -51,6 +51,10 @@ from sharpness import (
     collect_final_sharpness_batch,
     compute_keskar_sharpness,
 )
+from critic_loss_surface import (
+    build_critic_loss_surface_settings,
+    save_critic_loss_surface_snapshots,
+)
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -418,6 +422,7 @@ def make_train(
     train_state_step=None,
 ):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    surface_layout_name = config["ENV_KWARGS"]["layout"]
     env = initialize_environment(config)
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -438,6 +443,16 @@ def make_train(
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     config["ACTION_DIM"] = env.action_space(env.agents[0]).n
+
+    surface_settings = build_critic_loss_surface_settings(
+        config,
+        algorithm="IPPO",
+        layout=surface_layout_name,
+        actor_trunk_keys=ACTOR_TRUNK_KEYS,
+        value_trunk_keys=VALUE_TRUNK_KEYS,
+        shared_trunk_keys=SHARED_TRUNK_KEYS,
+        value_coordinates="raw",
+    )
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
@@ -828,6 +843,18 @@ def make_train(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
+
+            save_critic_loss_surface_snapshots(
+                completed_updates=update_steps + 1,
+                total_updates=config["NUM_UPDATES"],
+                settings=surface_settings,
+                params=train_state.params,
+                initial_hstate=initial_hstate,
+                traj_batch=traj_batch,
+                advantages=advantages,
+                targets=targets,
+            )
+
             metric = traj_batch.info
             metric = jax.tree.map(
                 lambda x: x.reshape(

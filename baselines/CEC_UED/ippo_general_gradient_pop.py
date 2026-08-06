@@ -51,6 +51,10 @@ from sharpness import (
     collect_final_sharpness_batch,
     compute_keskar_sharpness,
 )
+from critic_loss_surface import (
+    build_critic_loss_surface_settings,
+    save_critic_loss_surface_snapshots,
+)
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -418,6 +422,7 @@ def make_train(
     train_state_step=None,
 ):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    surface_layout_name = config["ENV_KWARGS"]["layout"]
     env = initialize_environment(config)
 
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
@@ -438,6 +443,16 @@ def make_train(
         else config["CLIP_EPS"]
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
+
+    surface_settings = build_critic_loss_surface_settings(
+        config,
+        algorithm="IPPO-PopArt",
+        layout=surface_layout_name,
+        actor_trunk_keys=ACTOR_TRUNK_KEYS,
+        value_trunk_keys=VALUE_TRUNK_KEYS,
+        shared_trunk_keys=SHARED_TRUNK_KEYS,
+        value_coordinates="popart_normalized_at_snapshot",
+    )
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
@@ -848,6 +863,8 @@ def make_train(
 
             # ── PopArt: update EMA stats and correct output layer weights ──
             _pa_alpha = config["POPART_ALPHA"]
+            _pa_mu_before = popart_mu
+            _pa_sigma_before = popart_sigma
             _batch_mu = targets.mean()
             _batch_var = targets.var()
             _mu_new = (1 - _pa_alpha) * popart_mu + _pa_alpha * _batch_mu
@@ -870,6 +887,24 @@ def make_train(
             train_state = train_state.replace(params=flax.core.freeze(_pa_params))
             popart_mu, popart_sigma = _mu_new, _sigma_new
             # ── end PopArt 
+
+            save_critic_loss_surface_snapshots(
+                completed_updates=update_steps + 1,
+                total_updates=config["NUM_UPDATES"],
+                settings=surface_settings,
+                params=train_state.params,
+                initial_hstate=initial_hstate,
+                traj_batch=traj_batch,
+                advantages=advantages,
+                targets=(targets - popart_mu) / popart_sigma,
+                values=(
+                    traj_batch.value * _pa_sigma_before
+                    + _pa_mu_before
+                    - popart_mu
+                ) / popart_sigma,
+                popart_mu=popart_mu,
+                popart_sigma=popart_sigma,
+            )
 
             metric = traj_batch.info
             metric = jax.tree.map(

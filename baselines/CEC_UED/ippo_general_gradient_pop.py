@@ -47,6 +47,10 @@ from evaluation_metrics import (
     compute_evaluation_critic_statistics,
     empty_evaluation_metrics,
 )
+from sharpness import (
+    collect_final_sharpness_batch,
+    compute_keskar_sharpness,
+)
 
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
@@ -132,6 +136,7 @@ def initialize_environment(config):
         env.held_out_goal_pos = ho_goal_pos
         env.held_out_other_goal_pos = ho_other_goal_pos
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
+    config["ACTION_DIM"] = env.action_space(env.agents[0]).n
     return env
 
 def _is_connected_jax(passable_9x9):
@@ -353,6 +358,49 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
     layout_id: jnp.ndarray
+
+
+def ppo_loss(
+    network, params, initial_hstate, traj_batch, advantages,
+    targets_normalized, config,
+):
+    """The PopArt PPO objective used by training and final sharpness."""
+    _, pi, value = network.apply(
+        params,
+        initial_hstate,
+        (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+    )
+    log_prob = pi.log_prob(traj_batch.action)
+    value_pred_clipped = traj_batch.value + (
+        value - traj_batch.value
+    ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+    value_loss = 0.5 * jnp.maximum(
+        jnp.square(value - targets_normalized),
+        jnp.square(value_pred_clipped - targets_normalized),
+    ).mean()
+
+    advantages = (
+        (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    )
+    logratio = log_prob - traj_batch.log_prob
+    ratio = jnp.exp(logratio)
+    actor_loss = -jnp.minimum(
+        ratio * advantages,
+        jnp.clip(
+            ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]
+        ) * advantages,
+    ).mean()
+    entropy = pi.entropy().mean()
+    approx_kl = ((ratio - 1) - logratio).mean()
+    clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+    total_loss = (
+        actor_loss
+        + config["VF_COEF"] * value_loss
+        - config["ENT_COEF"] * entropy
+    )
+    return total_loss, (
+        value_loss, actor_loss, entropy, ratio, approx_kl, clip_frac
+    )
 
 
 def batchify(x: dict, agent_list, num_actors):
@@ -708,52 +756,15 @@ def make_train(
                     init_hstate, traj_batch, advantages, targets = batch_info
 
                     def _loss_fn(params, init_hstate, traj_batch, gae, targets):
-                        # RERUN NETWORK
-                        _, pi, value = network.apply(
+                        return ppo_loss(
+                            network,
                             params,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
-                            (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+                            traj_batch,
+                            gae,
+                            (targets - popart_mu) / popart_sigma,
+                            config,
                         )
-                        log_prob = pi.log_prob(traj_batch.action)
-
-                        # CALCULATE VALUE LOSS (in normalized space)
-                        targets_norm = (targets - popart_mu) / popart_sigma
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets_norm)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets_norm)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
-
-                        # CALCULATE ACTOR LOSS
-                        logratio = log_prob - traj_batch.log_prob
-                        ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
-                            )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
-
-                        # debug
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
-
-                        total_loss = (
-                            loss_actor
-                            + config["VF_COEF"] * value_loss
-                            - config["ENT_COEF"] * entropy
-                        )
-                        return total_loss, (value_loss, loss_actor, entropy, ratio, approx_kl, clip_frac)
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
@@ -1279,7 +1290,27 @@ def make_train(
         runner_state, metric = jax.lax.scan(
             _update_step, (runner_state, update_step, popart_mu, popart_sigma), jnp.arange(remaining_updates), remaining_updates
         )
-        return {"runner_state": runner_state}
+        (
+            final_runner_state,
+            final_update_count,
+            final_popart_mu,
+            final_popart_sigma,
+        ) = runner_state
+        final_train_state = final_runner_state[0]
+        return {
+            "sharpness_params": final_train_state.params,
+            "sharpness_batch": collect_final_sharpness_batch(
+                env,
+                network,
+                final_runner_state,
+                final_update_count,
+                config,
+                batchify,
+                unbatchify,
+                value_mu=final_popart_mu,
+                value_sigma=final_popart_sigma,
+            ),
+        }
 
     return train
 
@@ -1433,12 +1464,44 @@ def main(config):
         ),
         device=jax.devices()[0],
     )
-    train_jit(
+    train_output = train_jit(
         rng, model_params, init_popart_mu, init_popart_sigma,
         resume_runner_state,
     )
 
     jax.effects_barrier()
+    print("Computing final Keskar sharpness with L-BFGS-B...")
+    sharpness_network = ActorCriticRNN(
+        int(config["ACTION_DIM"]), config=config
+    )
+    sharpness_batch = train_output["sharpness_batch"]
+
+    def sharpness_loss(params):
+        loss, _ = ppo_loss(
+            sharpness_network,
+            params,
+            sharpness_batch.initial_hstate,
+            sharpness_batch,
+            sharpness_batch.advantages,
+            sharpness_batch.targets,
+            config,
+        )
+        return loss
+
+    sharpness_metrics = compute_keskar_sharpness(
+        sharpness_loss,
+        train_output["sharpness_params"],
+        config["SHARPNESS"]["EPSILONS"],
+        maxiter=int(config["SHARPNESS"]["LBFGSB_MAXITER"]),
+    )
+    wandb.log(sharpness_metrics, step=num_updates)
+    print(
+        "Final sharpness: "
+        + ", ".join(
+            f"{key}={value:.6g}"
+            for key, value in sharpness_metrics.items()
+        )
+    )
     jax.clear_caches()
     wandb.finish()
 

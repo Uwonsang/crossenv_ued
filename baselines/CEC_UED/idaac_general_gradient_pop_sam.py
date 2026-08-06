@@ -63,6 +63,29 @@ VALUE_TRUNK_KEYS = (
 )
 
 
+def _tree_l2_norm(tree, mask=None):
+    leaves = jax.tree_util.tree_leaves(tree if mask is None else jax.tree.map(
+        lambda value, selected: value if selected else jnp.zeros_like(value),
+        tree,
+        mask,
+    ))
+    return jnp.sqrt(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
+
+
+def _sam_perturb(params, grads, rho, mask=None):
+    grad_norm = _tree_l2_norm(grads, mask)
+    scale = rho / (grad_norm + 1e-12)
+    perturbed = jax.tree.map(
+        lambda param, grad, selected: (
+            param + scale * grad if selected else param
+        ),
+        params,
+        grads,
+        jax.tree.map(lambda _: True, grads) if mask is None else mask,
+    )
+    return perturbed, grad_norm
+
+
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
@@ -505,6 +528,7 @@ def make_train(
     config.setdefault("IDAAC_ORDER_COEF", 0.001)
     config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
     config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
+    config.setdefault("SAM_RHO", 0.01)
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
 
@@ -992,22 +1016,37 @@ def make_train(
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, init_hstate, traj_batch, advantages,
-                        targets, order_swap,
+
+                    def _loss_and_merged_grads(params):
+                        loss_and_aux, main_grads = grad_fn(
+                            params, init_hstate, traj_batch, advantages,
+                            targets, order_swap,
+                        )
+                        classifier_grads = jax.grad(_classifier_loss_fn)(
+                            params, init_hstate, traj_batch, order_swap
+                        )
+                        merged_grads = jax.tree.map(
+                            lambda main_grad, classifier_grad, label: (
+                                classifier_grad
+                                if label == "classifier"
+                                else main_grad
+                            ),
+                            main_grads,
+                            classifier_grads,
+                            param_labels,
+                        )
+                        return loss_and_aux, merged_grads
+
+                    _, first_grads = _loss_and_merged_grads(
+                        train_state.params
                     )
-                    classifier_grads = jax.grad(_classifier_loss_fn)(
-                        train_state.params, init_hstate, traj_batch, order_swap
+                    perturbed_params, sam_first_grad_norm = _sam_perturb(
+                        train_state.params,
+                        first_grads,
+                        config["SAM_RHO"],
                     )
-                    grads = jax.tree.map(
-                        lambda main_grad, classifier_grad, label: (
-                            classifier_grad
-                            if label == "classifier"
-                            else main_grad
-                        ),
-                        grads,
-                        classifier_grads,
-                        param_labels,
+                    total_loss, grads = _loss_and_merged_grads(
+                        perturbed_params
                     )
                     # Match SimBaV2's optimizer-update semantics: measure the
                     # parameter state used by this minibatch immediately before
@@ -1018,6 +1057,13 @@ def make_train(
                         actor_param_keys=ACTOR_TRUNK_KEYS,
                         critic_param_keys=VALUE_TRUNK_KEYS,
                     )
+                    optimizer_update_metrics["sam/first_grad_norm"] = (
+                        sam_first_grad_norm
+                    )
+                    optimizer_update_metrics["sam/second_grad_norm"] = (
+                        _tree_l2_norm(grads)
+                    )
+                    optimizer_update_metrics["sam/rho"] = config["SAM_RHO"]
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
                     return train_state, (loss, loss_aux, optimizer_update_metrics)
@@ -1551,7 +1597,8 @@ def main(config):
     config.setdefault("IDAAC_CLF_LR", config["LR"])
     config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
     config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
-    config["model_name"] = "IDAAC_POP"
+    config.setdefault("SAM_RHO", 0.01)
+    config["model_name"] = "IDAAC_POP_SAM"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1583,7 +1630,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/idaac_pop/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/idaac_pop_sam/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
@@ -1613,10 +1660,10 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["IDAAC", "RNN", "SP", "PopArt"],
+            tags=["IDAAC", "RNN", "SP", "PopArt", "SAM", "SAM-All"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=(f"IDAAC_gradient_pop_{layout_name}_seed{config['SEED']}")
+            name=(f"IDAAC_gradient_pop_sam_{layout_name}_seed{config['SEED']}")
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

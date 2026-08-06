@@ -63,6 +63,29 @@ VALUE_TRUNK_KEYS = (
 )
 
 
+def _tree_l2_norm(tree, mask=None):
+    leaves = jax.tree_util.tree_leaves(tree if mask is None else jax.tree.map(
+        lambda value, selected: value if selected else jnp.zeros_like(value),
+        tree,
+        mask,
+    ))
+    return jnp.sqrt(sum(jnp.sum(jnp.square(leaf)) for leaf in leaves))
+
+
+def _sam_perturb(params, grads, rho, mask=None):
+    grad_norm = _tree_l2_norm(grads, mask)
+    scale = rho / (grad_norm + 1e-12)
+    perturbed = jax.tree.map(
+        lambda param, grad, selected: (
+            param + scale * grad if selected else param
+        ),
+        params,
+        grads,
+        jax.tree.map(lambda _: True, grads) if mask is None else mask,
+    )
+    return perturbed, grad_norm
+
+
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
@@ -291,7 +314,10 @@ class ActorCriticRNN(nn.Module):
         return actor_hidden, critic_hidden
 
     @nn.compact
-    def __call__(self, hidden, x, return_advantages=False):
+    def __call__(self, hidden, x, return_auxiliary=False,
+        order_swap=None,
+        detach_order_features=False,
+    ):
         obs, dones, agent_positions = x
         actor_hidden, critic_hidden = hidden
 
@@ -383,6 +409,38 @@ class ActorCriticRNN(nn.Module):
             name="advantage_output",
         )(actor_mean)
 
+        # IDAAC temporal-order adversary. Recurrent representations are paired
+        # with the next timestep; pairs crossing episode boundaries are masked
+        # by the loss function.
+        next_actor_mean = jnp.roll(actor_mean, shift=-1, axis=0)
+        if order_swap is None:
+            order_swap = jnp.zeros(actor_mean.shape[:2], dtype=bool)
+        first_features = jnp.where(
+            order_swap[..., None], next_actor_mean, actor_mean
+        )
+        second_features = jnp.where(
+            order_swap[..., None], actor_mean, next_actor_mean
+        )
+        order_features = jnp.concatenate(
+            (first_features, second_features), axis=-1
+        )
+        if detach_order_features:
+            order_features = jax.lax.stop_gradient(order_features)
+        if self.config["IDAAC_USE_NONLINEAR_CLF"]:
+            order_features = nn.Dense(
+                self.config["IDAAC_CLF_HIDDEN_SIZE"],
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name="order_classifier_hidden",
+            )(order_features)
+            order_features = nn.relu(order_features)
+        order_logits = nn.Dense(
+            1,
+            kernel_init=orthogonal(1.0),
+            bias_init=constant(0.0),
+            name="order_classifier_output",
+        )(order_features).squeeze(-1)
+
         critic = nn.Dense(
             self.config["FC_DIM_SIZE"] * 2,
             kernel_init=orthogonal(2),
@@ -431,8 +489,8 @@ class ActorCriticRNN(nn.Module):
         )(critic)
 
         outputs = ((actor_hidden, critic_hidden), pi, jnp.squeeze(critic, axis=-1))
-        if return_advantages:
-            return outputs + (advantage_predictions,)
+        if return_auxiliary:
+            return outputs + (advantage_predictions, order_logits)
         return outputs
 
 
@@ -466,6 +524,11 @@ def make_train(
     config.setdefault("DAAC_ADV_COEF", 0.25)
     config.setdefault("DAAC_POLICY_LR", config["LR"])
     config.setdefault("DAAC_VALUE_LR", config["LR"])
+    config.setdefault("IDAAC_CLF_LR", config["LR"])
+    config.setdefault("IDAAC_ORDER_COEF", 0.001)
+    config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
+    config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
+    config.setdefault("SAM_RHO", 0.01)
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
 
@@ -553,16 +616,31 @@ def make_train(
         param_labels = flax.core.freeze(
             flax.traverse_util.path_aware_map(
                 lambda path, _: (
-                    "value"
-                    if any("critic" in str(key) for key in path)
-                    else "policy"
+                    "classifier"
+                    if any("order_classifier" in str(key) for key in path)
+                    else (
+                        "value"
+                        if any("critic" in str(key) for key in path)
+                        else "policy"
+                    )
+                ),
+                network_params,
+            )
+        )
+        critic_trunk_sam_mask = flax.core.freeze(
+            flax.traverse_util.path_aware_map(
+                lambda path, _: any(
+                    "critic_trunk" in str(key) for key in path
                 ),
                 network_params,
             )
         )
         tx = optax.multi_transform(
-            {"policy": optimizer(config["DAAC_POLICY_LR"]),
-            "value": optimizer(config["DAAC_VALUE_LR"])},
+            {
+                "policy": optimizer(config["DAAC_POLICY_LR"]),
+                "value": optimizer(config["DAAC_VALUE_LR"]),
+                "classifier": optimizer(config["IDAAC_CLF_LR"]),
+            },
             param_labels)
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -816,15 +894,39 @@ def make_train(
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
-                    init_hstate, traj_batch, advantages, targets = batch_info
+                    (
+                        init_hstate, traj_batch, advantages, targets,
+                        order_swap,
+                    ) = batch_info
 
-                    def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                    def _order_mask(traj_batch):
+                        not_last = (
+                            jnp.arange(traj_batch.done.shape[0])[:, None]
+                            < traj_batch.done.shape[0] - 1
+                        )
+                        next_is_reset = jnp.roll(
+                            traj_batch.done, shift=-1, axis=0
+                        )
+                        return (not_last & ~next_is_reset).astype(jnp.float32)
+
+                    def _masked_mean(values, mask):
+                        return (values * mask).sum() / jnp.maximum(
+                            mask.sum(), 1.0
+                        )
+
+                    def _loss_fn(
+                        params, init_hstate, traj_batch, gae, targets,
+                        order_swap,
+                    ):
                         # RERUN NETWORK
-                        _, pi, value, advantage_predictions = network.apply(
+                        (
+                            _, pi, value, advantage_predictions, order_logits,
+                        ) = network.apply(
                             params,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
-                            return_advantages=True,
+                            return_auxiliary=True,
+                            order_swap=order_swap,
                         )
                         log_prob = pi.log_prob(traj_batch.action)
 
@@ -851,6 +953,28 @@ def make_train(
                         advantage_loss = 0.5 * jnp.square(
                             predicted_advantage - jax.lax.stop_gradient(gae)
                         ).mean()
+                        order_mask = _order_mask(traj_batch)
+                        order_targets = order_swap.astype(jnp.float32)
+                        classifier_loss = _masked_mean(
+                            optax.sigmoid_binary_cross_entropy(
+                                order_logits, order_targets
+                            ),
+                            order_mask,
+                        )
+                        order_loss = _masked_mean(
+                            optax.sigmoid_binary_cross_entropy(
+                                order_logits,
+                                jnp.full_like(order_logits, 0.5),
+                            ),
+                            order_mask,
+                        )
+                        order_accuracy = _masked_mean(
+                            (
+                                (jax.nn.sigmoid(order_logits) >= 0.5)
+                                == order_swap
+                            ).astype(jnp.float32),
+                            order_mask,
+                        )
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -872,14 +996,78 @@ def make_train(
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             + config["DAAC_ADV_COEF"] * advantage_loss
+                            + config["IDAAC_ORDER_COEF"] * order_loss
                             - config["ENT_COEF"] * entropy
                         )
-                        return total_loss, (value_loss, loss_actor, advantage_loss, entropy, ratio, approx_kl, clip_frac)
+                        return total_loss, (
+                            value_loss, loss_actor, advantage_loss,
+                            order_loss, classifier_loss, order_accuracy,
+                            entropy, ratio, approx_kl, clip_frac,
+                        )
+
+                    def _classifier_loss_fn(
+                        params, init_hstate, traj_batch, order_swap,
+                    ):
+                        *_, order_logits = network.apply(
+                            params,
+                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
+                            (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+                            return_auxiliary=True,
+                            order_swap=order_swap,
+                            detach_order_features=True,
+                        )
+                        return _masked_mean(
+                            optax.sigmoid_binary_cross_entropy(
+                                order_logits, order_swap.astype(jnp.float32)
+                            ),
+                            _order_mask(traj_batch),
+                        )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, init_hstate, traj_batch, advantages, targets
+
+                    def _loss_and_merged_grads(params):
+                        loss_and_aux, main_grads = grad_fn(
+                            params, init_hstate, traj_batch, advantages,
+                            targets, order_swap,
+                        )
+                        classifier_grads = jax.grad(_classifier_loss_fn)(
+                            params, init_hstate, traj_batch, order_swap
+                        )
+                        merged_grads = jax.tree.map(
+                            lambda main_grad, classifier_grad, label: (
+                                classifier_grad
+                                if label == "classifier"
+                                else main_grad
+                            ),
+                            main_grads,
+                            classifier_grads,
+                            param_labels,
+                        )
+                        return loss_and_aux, merged_grads
+
+                    _, first_grads = _loss_and_merged_grads(
+                        train_state.params
                     )
+                    perturbed_params, sam_first_grad_norm = _sam_perturb(
+                        train_state.params,
+                        first_grads,
+                        config["SAM_RHO"],
+                        mask=critic_trunk_sam_mask,
+                    )
+                    second_total_loss, second_grads = (
+                        _loss_and_merged_grads(perturbed_params)
+                    )
+                    grads = jax.tree.map(
+                        lambda first_grad, second_grad, use_sam: (
+                            second_grad if use_sam else first_grad
+                        ),
+                        first_grads,
+                        second_grads,
+                        critic_trunk_sam_mask,
+                    )
+                    # The reported objective corresponds to the perturbed
+                    # critic-trunk pass that supplies the SAM gradients.
+                    total_loss = second_total_loss
                     # Match SimBaV2's optimizer-update semantics: measure the
                     # parameter state used by this minibatch immediately before
                     # applying its gradient, then average across minibatches.
@@ -889,6 +1077,13 @@ def make_train(
                         actor_param_keys=ACTOR_TRUNK_KEYS,
                         critic_param_keys=VALUE_TRUNK_KEYS,
                     )
+                    optimizer_update_metrics["sam/first_grad_norm"] = (
+                        sam_first_grad_norm
+                    )
+                    optimizer_update_metrics["sam/second_grad_norm"] = (
+                        _tree_l2_norm(second_grads, critic_trunk_sam_mask)
+                    )
+                    optimizer_update_metrics["sam/rho"] = config["SAM_RHO"]
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss
                     return train_state, (loss, loss_aux, optimizer_update_metrics)
@@ -901,16 +1096,22 @@ def make_train(
                     targets,
                     rng,
                 ) = update_state
-                rng, _rng = jax.random.split(rng)
+                rng, permutation_rng, order_rng = jax.random.split(rng, 3)
 
                 init_hstate = jax.tree.map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
+                order_swap = jax.random.bernoulli(
+                    order_rng, shape=traj_batch.done.shape
+                )
                 batch = (
                     init_hstate,
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
+                    order_swap,
                 )
-                permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
+                permutation = jax.random.permutation(
+                    permutation_rng, config["NUM_ACTORS"]
+                )
 
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=1), batch
@@ -998,18 +1199,21 @@ def make_train(
             # Reduce to scalars so scan output stays O(NUM_UPDATES), not O(NUM_UPDATES*NUM_STEPS*...)
             metric = jax.tree.map(lambda x: x.mean(), metric)
             
-            ratio_0 = loss_info[1][4].at[0,0].get().mean()
+            ratio_0 = loss_info[1][7].at[0,0].get().mean()
             loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
                 "actor_loss": loss_info[1][1],
                 "advantage_loss": loss_info[1][2],
-                "entropy": loss_info[1][3],
-                "ratio": loss_info[1][4],
+                "order_loss": loss_info[1][3],
+                "order_classifier_loss": loss_info[1][4],
+                "order_classifier_accuracy": loss_info[1][5],
+                "entropy": loss_info[1][6],
+                "ratio": loss_info[1][7],
                 "ratio_0": ratio_0,
-                "approx_kl": loss_info[1][5],
-                "clip_frac": loss_info[1][6],
+                "approx_kl": loss_info[1][8],
+                "clip_frac": loss_info[1][9],
                 **loss_info[2],
                 **target_stats,
             }
@@ -1409,7 +1613,12 @@ def main(config):
     config.setdefault("DAAC_ADV_COEF", 0.25)
     config.setdefault("DAAC_POLICY_LR", config["LR"])
     config.setdefault("DAAC_VALUE_LR", config["LR"])
-    config["model_name"] = "DAAC_POP"
+    config.setdefault("IDAAC_ORDER_COEF", 0.001)
+    config.setdefault("IDAAC_CLF_LR", config["LR"])
+    config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
+    config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
+    config.setdefault("SAM_RHO", 0.01)
+    config["model_name"] = "IDAAC_POP_SAM_CRITIC"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1441,7 +1650,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/daac_pop/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/idaac_pop_sam_critic/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
@@ -1471,10 +1680,10 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["DAAC", "RNN", "SP", "PopArt"],
+            tags=["IDAAC", "RNN", "SP", "PopArt", "SAM", "SAM-CriticTrunk"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=(f"DAAC_gradient_pop_{layout_name}_seed{config['SEED']}")
+            name=(f"IDAAC_gradient_pop_sam_critic_{layout_name}_seed{config['SEED']}")
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:

@@ -188,7 +188,7 @@ class ActorCriticRNN(nn.Module):
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
-                reshaped_obs = obs.reshape(-1, 5,5,5)
+                reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
                 # features=64 if "9" in self.config['layout_name'] and self.config["ENV_NAME"] == "overcooked")else 2 * self.config["FC_DIM_SIZE"],

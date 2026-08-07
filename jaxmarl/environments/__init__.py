@@ -22,4 +22,4 @@ from .overcooked import Overcooked_VAE, Overcooked_VAE_CROP
 # from .hanabi import Hanabi
 # from .storm import InTheGrid, InTheGrid_2p
 # from .coin_game import CoinGame
-from .toy_coop import ToyCoop
+from .toy_coop import ToyCoop, ToyCoopNoPink

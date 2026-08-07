@@ -100,6 +100,7 @@ def initialize_environment(config):
         env.held_out_other_goal_pos = ho_other_goal_pos
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
+#일단 여기까지 확인
 
 class ScannedRNN(nn.Module):
     @functools.partial(

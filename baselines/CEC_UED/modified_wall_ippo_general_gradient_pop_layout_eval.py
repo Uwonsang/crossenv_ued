@@ -22,7 +22,7 @@ import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
 from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
-from jaxmarl.environments.toy_coop.modified_wall_toy_coop import ModifiedWallToyCoop
+from jaxmarl.environments.toy_coop.toy_coop_no_pink import ToyCoopNoPink
 
 import wandb
 import functools
@@ -35,7 +35,7 @@ import flax.core
 import imageio
 from algo_utils import init_hdf5, make_eval_envs_overcooked, EVAL_LAYOUTS_9
 
-TOY_LAYOUT_NAMES = ["empty", "wall_a"]
+TOY_LAYOUT_NAMES = ["empty", "wall_a", "wall_b", "wall_c"]
 
 def get_wall_map_name(config):
     return config.get("map_name", config["ENV_KWARGS"].get("map_name", "empty"))
@@ -46,13 +46,16 @@ def get_toy_layout_names(config):
 def get_wall_map_dir_name(config):
     map_name = get_wall_map_name(config)
     if map_name != "mixed":
-        return map_name
-    return "mixed_" + "_".join(get_toy_layout_names(config))
+        dir_name = map_name
+    else:
+        dir_name = "mixed_" + "_".join(get_toy_layout_names(config))
+    ckpt_tag = str(config.get("CKPT_TAG", "")).strip()
+    return f"{dir_name}_{ckpt_tag}" if ckpt_tag else dir_name
 
 def get_toy_layout_wall_maps(layout_names):
     return jnp.array(
         [
-            [[token == "B" for token in row] for row in ModifiedWallToyCoop.LAYOUTS[name]]
+            [[token == "B" for token in row] for row in ToyCoopNoPink.LAYOUTS[name]]
             for name in layout_names
         ],
         dtype=bool,
@@ -73,7 +76,7 @@ def make_modified_wall_env(config):
     env_kwargs = {k: v for k, v in env_kwargs.items() if k in allowed_keys}
     if env_kwargs["map_name"] == "mixed":
         env_kwargs["layout_names"] = get_toy_layout_names(config)
-    return ModifiedWallToyCoop(**env_kwargs)
+    return ToyCoopNoPink(**env_kwargs)
 
 def modified_wall_ckpt_root(config):
     return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
@@ -91,11 +94,11 @@ def make_fixed_toy_env_kwargs(config, map_name):
     return env_kwargs
 
 def make_modified_wall_eval_envs(config):
-    if config["ENV_NAME"] != "ToyCoop":
+    if config["ENV_NAME"] != "ToyCoopNoPink":
         return {}
     envs = {}
     for map_name in get_toy_layout_names(config):
-        base_env = ModifiedWallToyCoop(**make_fixed_toy_env_kwargs(config, map_name))
+        base_env = ToyCoopNoPink(**make_fixed_toy_env_kwargs(config, map_name))
         envs[map_name] = LogWrapper(
             base_env,
             env_params={"random_reset_fn": config["EVAL_KWARGS"]["random_reset_fn"]},
@@ -105,12 +108,12 @@ def make_modified_wall_eval_envs(config):
 def fixed_toy_states_for_layout_eval(config):
     states = []
     for map_name in get_toy_layout_names(config):
-        env = ModifiedWallToyCoop(**make_fixed_toy_env_kwargs(config, map_name))
+        env = ToyCoopNoPink(**make_fixed_toy_env_kwargs(config, map_name))
         states.append(env.custom_reset_fn(jax.random.PRNGKey(0), random_reset=False))
     return jax.tree.map(lambda *x: jnp.stack(x), *states)
 
 def initialize_environment(config):
-    if config["ENV_NAME"] == "ToyCoop":
+    if config["ENV_NAME"] == "ToyCoopNoPink":
         env = make_modified_wall_env(config)
         toy_heldout_num = int(config.get("TOY_HELDOUT_NUM", 100))
 
@@ -119,7 +122,7 @@ def initialize_environment(config):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos, state.other_goal_pos, state.wall_map)
+            res = (state.agent_pos, state.goal_pos, state.wall_map)
             carry = (i+1,)
             return carry, res
 
@@ -129,16 +132,14 @@ def initialize_environment(config):
             jnp.arange(toy_heldout_num),
             toy_heldout_num,
         )
-        ho_agent_pos, ho_goal_pos, ho_other_goal_pos, ho_wall_map = res
+        ho_agent_pos, ho_goal_pos, ho_wall_map = res
         fixed_states = fixed_toy_states_for_layout_eval(config)
         ho_agent_pos = jnp.concatenate([ho_agent_pos, fixed_states.agent_pos], axis=0)
         ho_goal_pos = jnp.concatenate([ho_goal_pos, fixed_states.goal_pos], axis=0)
-        ho_other_goal_pos = jnp.concatenate([ho_other_goal_pos, fixed_states.other_goal_pos], axis=0)
         ho_wall_map = jnp.concatenate([ho_wall_map, fixed_states.wall_map], axis=0)
 
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
-        env.held_out_other_goal_pos = ho_other_goal_pos
         env.held_out_wall_map = ho_wall_map
         config["obs_dim"] = env.observation_space(env.agents[0]).shape
         return env
@@ -191,8 +192,7 @@ def initialize_environment(config):
         ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
         ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
-    elif config["ENV_NAME"] == "ToyCoop":
-        # Generate 100 held-out states for ToyCoop
+    elif config["ENV_NAME"] == "ToyCoopNoPink":
         toy_heldout_num = int(config.get("TOY_HELDOUT_NUM", 100))
 
         @scan_tqdm(toy_heldout_num)
@@ -200,7 +200,7 @@ def initialize_environment(config):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
+            res = (state.agent_pos, state.goal_pos, state.wall_map)
             carry = (i+1,)
             return carry, res
         
@@ -210,12 +210,12 @@ def initialize_environment(config):
             jnp.arange(toy_heldout_num),
             toy_heldout_num,
         )
-        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
+        ho_agent_pos, ho_goal_pos, ho_wall_map = res
         
         # Set the held-out states in the environment
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
-        env.held_out_other_goal_pos = ho_other_goal_pos
+        env.held_out_wall_map = ho_wall_map
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
@@ -1261,7 +1261,7 @@ def main(config):
     resume_xpid = config.get("RESUME_XPID", "")
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    if config["ENV_NAME"] == "ToyCoop":
+    if config["ENV_NAME"] == "ToyCoopNoPink":
         filepath_base = modified_wall_ckpt_root(config)
     else:
         filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
@@ -1282,7 +1282,7 @@ def main(config):
             _peek = pickle.load(f)
         wandb_resume_id = _peek.get('wandb_run_id', None)
 
-    layout_name = get_wall_map_name(config) if config["ENV_NAME"] == "ToyCoop" else config["ENV_KWARGS"]["layout"]
+    layout_name = get_wall_map_name(config) if config["ENV_NAME"] == "ToyCoopNoPink" else config["ENV_KWARGS"]["layout"]
     if wandb_resume_id:
         wandb.init(
             entity=config["ENTITY"],
@@ -1298,7 +1298,7 @@ def main(config):
             tags=["IPPO", "RNN", "SP"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=f"CEC_POPART_LAYOUT_EVAL_modified_wall_{layout_name}_seed{config['SEED']}" if config["ENV_NAME"] == "ToyCoop" else f"CEC_gradient_pop_layout_eval_{layout_name}_seed{config['SEED']}"
+            name=f"CEC_POPART_LAYOUT_EVAL_modified_wall_{layout_name}_seed{config['SEED']}" if config["ENV_NAME"] == "ToyCoopNoPink" else f"CEC_gradient_pop_layout_eval_{layout_name}_seed{config['SEED']}"
         )
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -1334,7 +1334,7 @@ def main(config):
             finetune_filepath += f"/cramped_room_9"
         if config['FCP']:
             finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
-            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
+            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoopNoPink' else 6
         else:
             finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
             finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19

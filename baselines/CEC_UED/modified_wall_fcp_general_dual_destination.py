@@ -20,7 +20,7 @@ from omegaconf import OmegaConf
 
 import jaxmarl
 from jaxmarl.wrappers.baselines import LogWrapper
-from jaxmarl.environments.toy_coop.modified_wall_toy_coop import ModifiedWallToyCoop
+from jaxmarl.environments.toy_coop.toy_coop_no_pink import ToyCoopNoPink
 from jaxmarl.environments.overcooked import overcooked_layouts
 
 import wandb
@@ -63,7 +63,7 @@ def make_modified_wall_env(config):
     if env_kwargs["map_name"] == "mixed":
         env_kwargs["layout_names"] = get_toy_layout_names(config)
     config["ENV_KWARGS"]["map_name"] = env_kwargs["map_name"]
-    return ModifiedWallToyCoop(**env_kwargs)
+    return ToyCoopNoPink(**env_kwargs)
 
 def toy_ckpt_root(config):
     return f"ckpts/ippo/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
@@ -73,7 +73,7 @@ def initialize_environment(config):
     config['layout_name'] = layout_name
     if config["ENV_NAME"] == "overcooked":
         config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
-    if config["ENV_NAME"] == "ToyCoop":
+    if config["ENV_NAME"] == "ToyCoopNoPink":
         env = make_modified_wall_env(config)
     else:
         env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
@@ -102,24 +102,23 @@ def initialize_environment(config):
         ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
         ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
-    elif config["ENV_NAME"] == "ToyCoop":
-        # Generate 100 held-out states for ToyCoop
+    elif config["ENV_NAME"] == "ToyCoopNoPink":
         @scan_tqdm(100)
         def gen_held_out_toycoop(runner_state, unused):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
+            res = (state.agent_pos, state.goal_pos, state.wall_map)
             carry = (i+1,)
             return carry, res
         
         carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
-        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
+        ho_agent_pos, ho_goal_pos, ho_wall_map = res
         
         # Set the held-out states in the environment
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
-        env.held_out_other_goal_pos = ho_other_goal_pos
+        env.held_out_wall_map = ho_wall_map
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
@@ -763,7 +762,7 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
-    run_env_name = f"modified_wall_{get_wall_map_name(config)}" if config["ENV_NAME"] == "ToyCoop" else config["ENV_KWARGS"]["layout"]
+    run_env_name = f"modified_wall_{get_wall_map_name(config)}" if config["ENV_NAME"] == "ToyCoopNoPink" else config["ENV_KWARGS"]["layout"]
     run_name_prefix = config.get("model_name", "FCP")
     wandb.init(
         entity=config["ENTITY"],
@@ -773,7 +772,7 @@ def main(config):
         mode=config["WANDB_MODE"],
         name=f"{run_name_prefix}_{run_env_name}_seed{config['SEED']}"
     )
-    filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoopNoPink" else f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/fcp/{save_xpid}"
@@ -813,7 +812,7 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
     elif config['TRAIN_KWARGS']['finetune']:
         print("Loading finetune checkpoint")
-        ik_filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoop" else f"ckpts/ippo/{config['ENV_NAME']}"
+        ik_filepath = toy_ckpt_root(config) if config["ENV_NAME"] == "ToyCoopNoPink" else f"ckpts/ippo/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             ik_filepath += f"/{config['ENV_KWARGS']['layout']}"
         ik_filepath += f"/ikTrue"
@@ -832,8 +831,8 @@ def main(config):
     if len(frozen_param_stack) == 0:
         partner_root_value = config.get("FCP_PARTNER_ROOT")
         if (
-            config["ENV_NAME"] == "ToyCoop"
-            and (not partner_root_value or partner_root_value == "ckpts/ippo/ToyCoop/ikFalse/reset_all")
+            config["ENV_NAME"] == "ToyCoopNoPink"
+            and (not partner_root_value or partner_root_value == "ckpts/ippo/ToyCoopNoPink/ikFalse/reset_all")
         ):
             partner_root_value = f"{toy_ckpt_root(config)}/ikFalse/reset_all"
         partner_root = Path(partner_root_value)

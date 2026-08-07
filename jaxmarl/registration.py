@@ -29,6 +29,7 @@ from .environments import (
     Overcooked_VAE_CROP,
     # CoinGame,
     ToyCoop,
+    ToyCoopNoPink,
 )
 import inspect
 import pdb
@@ -46,6 +47,9 @@ def make(env_id: str, **env_kwargs):
     if env_id == "ToyCoop":
         env_kwargs = filter_kwargs(env_kwargs, ToyCoop)
         env = ToyCoop(**env_kwargs)
+    elif env_id == "ToyCoopNoPink":
+        env_kwargs = filter_kwargs(env_kwargs, ToyCoopNoPink)
+        env = ToyCoopNoPink(**env_kwargs)
 
     # 1. MPE PettingZoo Environments
     if env_id == "MPE_simple_v3":
@@ -186,5 +190,6 @@ registered_envs = [
     "overcooked_vae",
     "overcooked_vae_crop",
     "coin_game",
-    "ToyCoop"
+    "ToyCoop",
+    "ToyCoopNoPink"
 ]

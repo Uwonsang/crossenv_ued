@@ -6,10 +6,11 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/baselines/CEC_UED:$REPO_ROOT:${PYTHONPATH:-}"
 
 GPU_ID="${1:-}"
-SEEDS="${SEEDS:-0 1}"
+SEEDS="${SEEDS:-1}"
 TRAIN_MAP="${TRAIN_MAP:-mixed}"
 XP_MAPS="${XP_MAPS:-wall_a wall_b empty}"
 XP_MODELS="${XP_MODELS:-CEC_MIXED CEC_POPART_MIXED}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-20}"
 TRAIN_CEC="${TRAIN_CEC:-true}"
 TRAIN_POPART="${TRAIN_POPART:-true}"
 RUN_XP="${RUN_XP:-true}"
@@ -25,6 +26,7 @@ echo "  train layouts: config layout_names"
 echo "  xp maps: $XP_MAPS"
 echo "  xp models: $XP_MODELS"
 echo "  seeds: $SEEDS"
+echo "  eval_interval: $EVAL_INTERVAL"
 echo "  train_cec: $TRAIN_CEC"
 echo "  train_popart: $TRAIN_POPART"
 echo "  run_xp: $RUN_XP"
@@ -39,6 +41,7 @@ if [[ "$TRAIN_CEC" == "true" ]]; then
     python3 baselines/CEC_UED/modified_wall_ippo_general_dual_destination_layout_eval.py \
       SEED="$seed" \
       map_name="$TRAIN_MAP" \
+      EVAL_KWARGS.eval_interval="$EVAL_INTERVAL" \
       WANDB_MODE="$WANDB_MODE"
   done
 fi
@@ -51,6 +54,7 @@ if [[ "$TRAIN_POPART" == "true" ]]; then
     python3 baselines/CEC_UED/modified_wall_ippo_general_gradient_pop_layout_eval.py \
       SEED="$seed" \
       map_name="$TRAIN_MAP" \
+      EVAL_KWARGS.eval_interval="$EVAL_INTERVAL" \
       WANDB_MODE="$WANDB_MODE"
   done
 fi

@@ -1,4 +1,4 @@
-"ENV_NAME": "ToyCoop"  # ToyCoop or overcooked #checked
+"ENV_NAME": "ToyCoopNoPink"
 "LR": 3e-4 #checked
 "NUM_ENVS": 256
 "NUM_SEEDS": 1
@@ -80,7 +80,7 @@
   "random_reset_fn": "reset_all" 
   "beta": 1.0
   "argmax": False
-"FCP_PARTNER_ROOT": "ckpts/ippo/ToyCoop/ikFalse/reset_all"
+"FCP_PARTNER_ROOT": "ckpts/ippo/ToyCoopNoPink/ikFalse/reset_all"
 
 # Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
 "map_name": "empty"  # empty, wall_a, wall_b, wall_c, mixed

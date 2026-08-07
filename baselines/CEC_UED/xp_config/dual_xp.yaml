@@ -1,4 +1,4 @@
-"ENV_NAME": "ToyCoop"
+"ENV_NAME": "ToyCoopNoPink"
 "NUM_STEPS": 100
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
@@ -24,7 +24,7 @@
 
 "DEBUG_GIFS":
   "enabled": False
-  "max_pairs": 40
+  "max_pairs": 7
   "pairs": []
   "only_cross_play": True
   "traj_seed": 0
@@ -32,7 +32,7 @@
   "upload_wandb": True
   "out_dir": "baselines/CEC_UED/results/dual_xp/debug_gifs"
 
-"MODEL_ROOT": "ckpts/ippo/ToyCoop"
+"MODEL_ROOT": "ckpts/ippo/ToyCoopNoPink"
 "SAVE_PATH": "baselines/CEC_UED/results/dual_xp"
 "OUTPUT_FILE": null
 "SEEDS": [0, 1, 2, 3, 4, 5]
@@ -40,6 +40,7 @@
 "IPPO_POP_STAGES": ["progress_33", "progress_67", "progress_100"]
 "model_name": "IPPO" # IPPO, FCP, CEC, CEC_MIXED, IPPO_POP
 "partner_model_name": null # null means same as model_name
+"run_suffix": ""
 
 "ENTITY": "overcooked_ai"
 "PROJECT": "crossenv_ued_dual_destination"
@@ -47,7 +48,9 @@
 
 # Modified-wall ToyCoop override. Kept at the bottom so experiment-specific edits are obvious.
 "map_name": "empty" # empty, wall_a, wall_b, wall_c, mixed
+"CKPT_TAG": ""
 "layout_names": # used to resolve CEC_MIXED / CEC_POPART_MIXED checkpoint folders
   - "empty"
   - "wall_a"
   - "wall_b"
+  - "wall_c"

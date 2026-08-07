@@ -1,4 +1,4 @@
-"ENV_NAME": "ToyCoop"  # ToyCoop or overcooked #checked
+"ENV_NAME": "ToyCoopNoPink"
 "LR": 3e-4 #checked
 "NUM_ENVS": 256
 "NUM_SEEDS": 1

@@ -133,6 +133,10 @@ def resolve_path(path):
     return str(Path(get_original_cwd()) / path)
 
 
+def normalize_dual_return(reward, max_steps):
+    return reward / (2.0 * float(max_steps))
+
+
 def safe_name(name):
     return "".join(c if c.isalnum() or c in ("-", "_", ".") else "_" for c in str(name))
 
@@ -142,19 +146,22 @@ def get_wall_map_name(config):
 
 
 def get_toy_layout_names(config):
-    return list(config.get("layout_names", ["empty", "wall_a"]))
+    return list(config.get("layout_names", ["empty", "wall_a", "wall_b", "wall_c"]))
 
 
 def get_wall_map_dir_name(config, map_name):
     if map_name != "mixed":
-        return map_name
-    return "mixed_" + "_".join(get_toy_layout_names(config))
+        dir_name = map_name
+    else:
+        dir_name = "mixed_" + "_".join(get_toy_layout_names(config))
+    ckpt_tag = str(config.get("CKPT_TAG", "")).strip()
+    return f"{dir_name}_{ckpt_tag}" if ckpt_tag else dir_name
 
 
 def resolve_model_root(config, model_name):
     root = Path(config["MODEL_ROOT"])
     map_name = get_wall_map_name(config)
-    if config["ENV_NAME"] == "ToyCoop" and root.name == "ToyCoop":
+    if config["ENV_NAME"] == "ToyCoopNoPink" and root.name == "ToyCoopNoPink":
         if model_name in ("CEC_MIXED", "CEC_POPART_MIXED"):
             map_name = "mixed"
         root = root / "modified_wall" / get_wall_map_dir_name(config, map_name)
@@ -339,6 +346,9 @@ def main(config):
     split = "procedural" if config["ENV_KWARGS"]["random_reset"] else "fixed"
     map_name = get_wall_map_name(config)
     run_name = f"XP_{model_name}_{map_name}_{split}" if model_name == partner_model_name else f"XP_{model_name}_x_{partner_model_name}_{map_name}_{split}"
+    run_suffix = str(config.get("run_suffix", "")).strip()
+    if run_suffix:
+        run_name = f"{run_name}_{safe_name(run_suffix)}"
     wandb_run = None
     if config["WANDB_MODE"] != "disabled":
         import wandb
@@ -418,7 +428,7 @@ def main(config):
                 seed=int(i * 1000 + j),
             )
             rewards_np = jax.device_get(rewards)
-            normalized_rewards_np = rewards_np / (2.0 * config["ENV_KWARGS"]["max_steps"])
+            normalized_rewards_np = normalize_dual_return(rewards_np, config["ENV_KWARGS"]["max_steps"])
             success_np = rewards_np > -config["ENV_KWARGS"]["max_steps"]
             pair_mean = float(rewards_np.mean())
             pair_std = float(rewards_np.std())
@@ -439,20 +449,6 @@ def main(config):
                 "random_reset": bool(config["ENV_KWARGS"]["random_reset"]),
             }
             pair_rows.append(pair_row)
-            if wandb_run is not None:
-                wandb_run.log(
-                    {
-                        "pair_idx": pair_idx,
-                        "pair/reward_mean": pair_mean,
-                        "pair/reward_std": pair_std,
-                        "pair/normalized_reward_mean": pair_normalized_mean,
-                        "pair/success_rate": pair_success_rate,
-                        "pair/is_self_pair": int(is_self_pair),
-                        f"pair_reward/{pair_name}": pair_mean,
-                        f"pair_normalized_reward/{pair_name}": pair_normalized_mean,
-                        f"pair_success_rate/{pair_name}": pair_success_rate,
-                    }
-                )
 
             debug_pair_requested = not debug_pairs or pair_name in debug_pairs
             debug_pair_allowed = not debug_only_cross_play or not is_self_pair
@@ -518,13 +514,12 @@ def main(config):
                     wandb_run.log(
                         {
                             f"debug_gifs/{debug_prefix}": wandb.Video(gif_path, fps=debug_fps, format="gif"),
-                            f"debug_rollout_reward/{pair_name}": float(debug_rewards_np.sum()),
                         }
                     )
             pair_idx += 1
 
             for reward in rewards_np:
-                normalized_reward = float(reward / (2.0 * config["ENV_KWARGS"]["max_steps"]))
+                normalized_reward = float(normalize_dual_return(reward, config["ENV_KWARGS"]["max_steps"]))
                 rows.append(
                     {
                         "model": model_name,
@@ -542,20 +537,19 @@ def main(config):
     out = config.get("OUTPUT_FILE")
     if out is None:
         out_prefix = model_name if model_name == partner_model_name else f"{model_name}_x_{partner_model_name}"
+        if run_suffix:
+            out_prefix = f"{out_prefix}_{safe_name(run_suffix)}"
         out = f"{config['SAVE_PATH']}/modified_wall/{map_name}/{out_prefix}_{split}_XP_results.csv"
     out = resolve_path(out)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     df = pd.DataFrame(rows)
     pair_df = pd.DataFrame(pair_rows)
     df.to_csv(out, index=False)
-    pair_out = out.replace(".csv", "_pair_summary.csv")
-    pair_df.to_csv(pair_out, index=False)
     debug_df = pd.DataFrame(debug_records)
     debug_out = out.replace(".csv", "_debug_gifs.csv")
     if len(debug_df):
         debug_df.to_csv(debug_out, index=False)
     print(f"Saved {len(rows)} rows to {out}")
-    print(f"Saved {len(pair_rows)} pair summaries to {pair_out}")
     if len(debug_df):
         print(f"Saved {len(debug_df)} debug GIF records to {debug_out}")
 
@@ -567,37 +561,29 @@ def main(config):
         self_pair_df = pair_df[pair_df["is_self_pair"]]
         xp_pair_df = pair_df[~pair_df["is_self_pair"]]
         summary_log = {
-            "xp/reward_mean": float(df["reward"].mean()),
-            "xp/reward_std": float(df["reward"].std()),
-            "xp/reward_min": float(df["reward"].min()),
-            "xp/reward_max": float(df["reward"].max()),
-            "xp/normalized_reward_mean": float(df["normalized_reward"].mean()),
-            "xp/normalized_reward_std": float(df["normalized_reward"].std()),
+            "xp/return_mean": float(df["reward"].mean()),
+            "xp/return_std": float(df["reward"].std()),
+            "xp/return_min": float(df["reward"].min()),
+            "xp/return_max": float(df["reward"].max()),
+            "xp/normalized_return_mean": float(df["normalized_reward"].mean()),
+            "xp/normalized_return_std": float(df["normalized_reward"].std()),
             "xp/success_rate": float(df["success"].mean()),
-            "xp/cross_play_reward_mean": float(xp_df["reward"].mean()) if len(xp_df) else float("nan"),
-            "xp/cross_play_reward_std": float(xp_df["reward"].std()) if len(xp_df) else float("nan"),
-            "xp/cross_play_normalized_reward_mean": float(xp_df["normalized_reward"].mean()) if len(xp_df) else float("nan"),
+            "xp/cross_play_return_mean": float(xp_df["reward"].mean()) if len(xp_df) else float("nan"),
+            "xp/cross_play_return_std": float(xp_df["reward"].std()) if len(xp_df) else float("nan"),
+            "xp/cross_play_normalized_return_mean": float(xp_df["normalized_reward"].mean()) if len(xp_df) else float("nan"),
             "xp/cross_play_success_rate": float(xp_df["success"].mean()) if len(xp_df) else float("nan"),
-            "xp/self_play_reward_mean": float(self_df["reward"].mean()) if len(self_df) else float("nan"),
-            "xp/self_play_reward_std": float(self_df["reward"].std()) if len(self_df) else float("nan"),
-            "xp/self_play_normalized_reward_mean": float(self_df["normalized_reward"].mean()) if len(self_df) else float("nan"),
+            "xp/self_play_return_mean": float(self_df["reward"].mean()) if len(self_df) else float("nan"),
+            "xp/self_play_return_std": float(self_df["reward"].std()) if len(self_df) else float("nan"),
+            "xp/self_play_normalized_return_mean": float(self_df["normalized_reward"].mean()) if len(self_df) else float("nan"),
             "xp/self_play_success_rate": float(self_df["success"].mean()) if len(self_df) else float("nan"),
-            "xp/cross_play_pair_mean": float(xp_pair_df["reward_mean"].mean()) if len(xp_pair_df) else float("nan"),
-            "xp/self_play_pair_mean": float(self_pair_df["reward_mean"].mean()) if len(self_pair_df) else float("nan"),
-            "xp/cross_play_pair_normalized_mean": float(xp_pair_df["normalized_reward_mean"].mean()) if len(xp_pair_df) else float("nan"),
-            "xp/self_play_pair_normalized_mean": float(self_pair_df["normalized_reward_mean"].mean()) if len(self_pair_df) else float("nan"),
             "xp/num_pairs": int(len(pair_df)),
             "xp/num_cross_play_pairs": int(len(xp_pair_df)),
             "xp/num_self_play_pairs": int(len(self_pair_df)),
             "xp/num_model_1_policies": int(n_1),
             "xp/num_model_2_policies": int(n_2),
             "xp/num_rollouts": int(len(df)),
-            "xp/reward_histogram": wandb.Histogram(df["reward"].to_numpy()),
-            "xp/pair_summary": wandb.Table(dataframe=pair_df),
-            "xp/rollouts": wandb.Table(dataframe=df),
+            "xp/return_histogram": wandb.Histogram(df["reward"].to_numpy()),
         }
-        if len(debug_df):
-            summary_log["xp/debug_gifs"] = wandb.Table(dataframe=debug_df)
         wandb_run.log(summary_log)
         wandb_run.finish()
 

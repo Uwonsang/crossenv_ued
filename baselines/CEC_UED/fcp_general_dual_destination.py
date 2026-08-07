@@ -61,24 +61,23 @@ def initialize_environment(config):
         ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
         ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
         env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
-    elif config["ENV_NAME"] == "ToyCoop":
-        # Generate 100 held-out states for ToyCoop
+    elif config["ENV_NAME"] == "ToyCoopNoPink":
         @scan_tqdm(100)
         def gen_held_out_toycoop(runner_state, unused):
             (i,) = runner_state
             key = jax.random.key(i)
             state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos, state.other_goal_pos)
+            res = (state.agent_pos, state.goal_pos, state.wall_map)
             carry = (i+1,)
             return carry, res
         
         carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
-        ho_agent_pos, ho_goal_pos, ho_other_goal_pos = res
+        ho_agent_pos, ho_goal_pos, ho_wall_map = res
         
         # Set the held-out states in the environment
         env.held_out_agent_pos = ho_agent_pos
         env.held_out_goal_pos = ho_goal_pos
-        env.held_out_other_goal_pos = ho_other_goal_pos
+        env.held_out_wall_map = ho_wall_map
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
@@ -722,7 +721,7 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
-    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoop" else config["ENV_KWARGS"]["layout"]
+    run_env_name = "dual_destination" if config["ENV_NAME"] == "ToyCoopNoPink" else config["ENV_KWARGS"]["layout"]
     run_name_prefix = config.get("model_name", "FCP")
     wandb.init(
         entity=config["ENTITY"],
@@ -789,7 +788,7 @@ def main(config):
         rng = jax.random.PRNGKey(config["SEED"])
     
     if len(frozen_param_stack) == 0:
-        partner_root = Path(config.get("FCP_PARTNER_ROOT", "ckpts/ippo/ToyCoop/ikFalse/reset_all"))
+        partner_root = Path(config.get("FCP_PARTNER_ROOT", "ckpts/ippo/ToyCoopNoPink/ikFalse/reset_all"))
         if not partner_root.is_absolute():
             partner_root = Path.cwd() / partner_root
 

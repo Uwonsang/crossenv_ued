@@ -75,26 +75,18 @@ class ToyCoopNoPink(ModifiedWallToyCoop):
             and self.held_out_wall_map is not None
         )
 
+        first_key, retry_key = jax.random.split(key)
+        state = self.custom_reset_fn(
+            first_key, random_reset=self.random_reset, debug=self.debug
+        )
         if self.random_reset and self.check_held_out and has_held_out:
-            def cond_fn(carry):
-                _, state = carry
-                return self._matches_held_out(state)
-
-            def body_fn(carry):
-                rng, _ = carry
-                rng, sample_rng = jax.random.split(rng)
-                return rng, self.custom_reset_fn(
-                    sample_rng, random_reset=self.random_reset, debug=self.debug
-                )
-
-            key, sample_key = jax.random.split(key)
-            state = self.custom_reset_fn(
-                sample_key, random_reset=self.random_reset, debug=self.debug
-            )
-            _, state = jax.lax.while_loop(cond_fn, body_fn, (key, state))
-        else:
-            state = self.custom_reset_fn(
-                key, random_reset=self.random_reset, debug=self.debug
+            state = jax.lax.cond(
+                self._matches_held_out(state),
+                lambda rng: self.custom_reset_fn(
+                    rng, random_reset=self.random_reset, debug=self.debug
+                ),
+                lambda rng: state,
+                retry_key,
             )
 
         return self.get_obs(state), state

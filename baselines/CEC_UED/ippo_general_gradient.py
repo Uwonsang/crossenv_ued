@@ -844,6 +844,44 @@ def make_train(
             )
             train_state = update_state[0]
 
+            # Save the small final checkpoint immediately after the final PPO
+            # update, before loss-surface snapshots, evaluation, WandB, and the
+            # larger resumable checkpoint can delay or interrupt finalization.
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+
+                def final_save_callback(params):
+                    ckpt_path = save_info["final_ckpt_path"]
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'key': save_info["rng"],
+                            'params': params,
+                            'update_steps': num_updates_total,
+                        }, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(
+                        f"Finished training for seed {config['SEED']} with "
+                        f"ckpt {config['TRAIN_KWARGS']['ckpt_id']}"
+                        f"_updates{num_updates_total}"
+                    )
+                    print("--------------------------------")
+
+                is_last_step = jnp.equal(
+                    update_steps, num_updates_total - 1
+                )
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(
+                        final_save_callback,
+                        None,
+                        train_state.params,
+                        ordered=True,
+                    ),
+                    lambda _: None,
+                    operand=None,
+                )
+
             save_critic_loss_surface_snapshots(
                 completed_updates=update_steps + 1,
                 total_updates=config["NUM_UPDATES"],
@@ -1210,44 +1248,24 @@ def make_train(
                         ),
                     }, f)
 
-            # Keep resume checkpoints aligned with WandB aggregation boundaries.
+            # Keep periodic checkpoints and always retain the completed state.
             save_ckpt_interval = LOG_INTERVAL
             if save_ckpt_interval > 0:
-                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                is_scheduled_ckpt = jnp.equal(
+                    update_steps % save_ckpt_interval, 0
+                )
+                is_last_update = jnp.equal(
+                    update_steps, int(config["NUM_UPDATES"]) - 1
+                )
+                run_save_ckpt = jnp.logical_or(
+                    is_scheduled_ckpt, is_last_update
+                )
                 jax.lax.cond(
                     run_save_ckpt,
                     lambda _: jax.experimental.io_callback(
                         ckpt_callback, None,
                         train_state.params, train_state.opt_state, train_state.step,
                         update_steps, env_state, last_obs, last_done, hstate, rng,
-                        ordered=True,
-                    ),
-                    lambda _: None,
-                    operand=None,
-                )
-
-            if save_info is not None:
-                num_updates_total = save_info["num_updates"]
-                def final_save_callback(params):
-                    fp = save_info["filepath"]
-                    prefix = save_info["fcp_prefix"]
-                    appendage = save_info["finetune_appendage"]
-                    rng_key = save_info["rng"]
-                    os.makedirs(fp, exist_ok=True)
-                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_updates{num_updates_total}.pkl"
-                    with open(ckpt_path, "wb") as f:
-                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total}, f)
-                    print(f"Saved final model to {ckpt_path}")
-                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
-                    print("--------------------------------")
-
-                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
-                jax.lax.cond(
-                    is_last_step,
-                    lambda _: jax.experimental.io_callback(
-                        final_save_callback,
-                        None,
-                        train_state.params,
                         ordered=True,
                     ),
                     lambda _: None,
@@ -1364,9 +1382,25 @@ def main(config):
             name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
         )
 
+    num_updates = int(
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}"
+        f"_updates{num_updates}.pkl",
+    )
+    legacy_final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl",
+    )
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
-        # check if ckpt exists
-        if os.path.exists(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
+        if (
+            os.path.exists(final_ckpt_path)
+            or os.path.exists(legacy_final_ckpt_path)
+        ):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
@@ -1414,13 +1448,13 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     save_info = {
         "filepath": filepath,
         "fcp_prefix": fcp_prefix,
         "finetune_appendage": finetune_appendage,
         "rng": rng,
         "num_updates": num_updates,
+        "final_ckpt_path": final_ckpt_path,
     }
 
     print(f"Starting from update step {final_update_step}")

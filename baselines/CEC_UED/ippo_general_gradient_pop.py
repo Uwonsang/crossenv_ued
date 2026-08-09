@@ -886,7 +886,42 @@ def make_train(
             ) / _sigma_new
             train_state = train_state.replace(params=flax.core.freeze(_pa_params))
             popart_mu, popart_sigma = _mu_new, _sigma_new
-            # ── end PopArt 
+            # ── end PopArt
+
+            # Save the small final checkpoint immediately after params are
+            # finalized (post-PopArt), before loss-surface snapshots,
+            # evaluation, WandB, and the larger resumable checkpoint can
+            # delay or interrupt finalization.
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+                def final_save_callback(params, mu, sigma):
+                    fp = save_info["filepath"]
+                    prefix = save_info["fcp_prefix"]
+                    appendage = save_info["finetune_appendage"]
+                    rng_key = save_info["rng"]
+                    os.makedirs(fp, exist_ok=True)
+                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_pop_updates{num_updates_total}.pkl"
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total,
+                                     'popart_mu': mu, 'popart_sigma': sigma}, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
+                    print("--------------------------------")
+
+                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(
+                        final_save_callback,
+                        None,
+                        train_state.params,
+                        popart_mu,
+                        popart_sigma,
+                        ordered=True,
+                    ),
+                    lambda _: None,
+                    operand=None,
+                )
 
             save_critic_loss_surface_snapshots(
                 completed_updates=update_steps + 1,
@@ -1258,10 +1293,18 @@ def make_train(
                         ),
                     }, f)
 
-            # Keep resume checkpoints aligned with WandB aggregation boundaries.
+            # Keep periodic checkpoints and always retain the completed state.
             save_ckpt_interval = LOG_INTERVAL
             if save_ckpt_interval > 0:
-                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                is_scheduled_ckpt = jnp.equal(
+                    update_steps % save_ckpt_interval, 0
+                )
+                is_last_update = jnp.equal(
+                    update_steps, int(config["NUM_UPDATES"]) - 1
+                )
+                run_save_ckpt = jnp.logical_or(
+                    is_scheduled_ckpt, is_last_update
+                )
                 jax.lax.cond(
                     run_save_ckpt,
                     lambda _: jax.experimental.io_callback(
@@ -1269,37 +1312,6 @@ def make_train(
                         train_state.params, train_state.opt_state, train_state.step,
                         update_steps, popart_mu, popart_sigma,
                         env_state, last_obs, last_done, hstate, rng,
-                        ordered=True,
-                    ),
-                    lambda _: None,
-                    operand=None,
-                )
-
-            if save_info is not None:
-                num_updates_total = save_info["num_updates"]
-                def final_save_callback(params, mu, sigma):
-                    fp = save_info["filepath"]
-                    prefix = save_info["fcp_prefix"]
-                    appendage = save_info["finetune_appendage"]
-                    rng_key = save_info["rng"]
-                    os.makedirs(fp, exist_ok=True)
-                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_pop_updates{num_updates_total}.pkl"
-                    with open(ckpt_path, "wb") as f:
-                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total,
-                                     'popart_mu': mu, 'popart_sigma': sigma}, f)
-                    print(f"Saved final model to {ckpt_path}")
-                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
-                    print("--------------------------------")
-
-                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
-                jax.lax.cond(
-                    is_last_step,
-                    lambda _: jax.experimental.io_callback(
-                        final_save_callback,
-                        None,
-                        train_state.params,
-                        popart_mu,
-                        popart_sigma,
                         ordered=True,
                     ),
                     lambda _: None,

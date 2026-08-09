@@ -100,5 +100,5 @@ for src in "${ARGS[@]}"; do
   mkdir -p "$dest_dir"
   echo "[COPY] $src"
   echo "    -> $dest  (updates=$updates -> $n)"
-  cp -a "$src" "$dest_dir/"
+  cp -a --no-preserve=ownership "$src" "$dest_dir/"
 done

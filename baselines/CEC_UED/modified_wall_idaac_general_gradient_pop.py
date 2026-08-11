@@ -95,6 +95,56 @@ def _memory_efficient_feature_metrics(features, cutoff=0.01):
 representation_metrics_module.compute_feature_metrics = _memory_efficient_feature_metrics
 
 
+def compute_separate_trunk_penultimate_metrics(
+    network, params, initial_hstate, network_inputs, cutoff=0.01,
+):
+    """Representation metrics for the layers that exist in ToyCoopNoPink."""
+    (_, _, _), intermediates = network.apply(
+        params,
+        initial_hstate,
+        network_inputs,
+        mutable=["intermediates"],
+    )
+    captured = intermediates["intermediates"]
+    role_features = (
+        ("actor_trunk", captured["actor_trunk_penultimate"][0]),
+        ("critic_trunk", captured["critic_trunk_penultimate"][0]),
+        ("actor", captured["actor_penultimate"][0]),
+        ("critic", captured["critic_penultimate"][0]),
+    )
+    metrics = {}
+    for role, features in role_features:
+        scale_metrics, rank_metrics = _memory_efficient_feature_metrics(
+            features, cutoff=cutoff
+        )
+        for name, value in scale_metrics.items():
+            metrics[f"representation_feature/{role}_{name}"] = value
+        for name, value in rank_metrics.items():
+            metrics[f"representation_rank/{role}_{name}"] = value
+
+    actor_norms = [
+        jnp.mean(value[0])
+        for name, value in captured.items()
+        if name.startswith("feature_norm_actor_hidden_")
+    ]
+    critic_norms = [
+        jnp.mean(value[0])
+        for name, value in captured.items()
+        if name.startswith("feature_norm_critic_hidden_")
+    ]
+    actor_norms.extend(
+        jnp.mean(value[0]) for name, value in captured["actor_trunk"].items()
+        if name.startswith("feature_norm_")
+    )
+    critic_norms.extend(
+        jnp.mean(value[0]) for name, value in captured["critic_trunk"].items()
+        if name.startswith("feature_norm_")
+    )
+    metrics["representation_feature_total/actor_feature_norm"] = sum(actor_norms)
+    metrics["representation_feature_total/critic_feature_norm"] = sum(critic_norms)
+    return metrics
+
+
 # Actor and critic use independent encoder/RNN trunks with identical topology.
 ACTOR_TRUNK_KEYS = (
     "actor_trunk",

@@ -173,6 +173,21 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0):
 @hydra.main(version_base=None, config_path="repro_config", config_name="test_general")
 def main(config):
     config = OmegaConf.to_container(config)
+    model_name = config["model_name"]
+    popart_model_names = {
+        "CEC_POP_ART",
+        "CEC_POP_ART_PREV",
+        "CEC_POP_ART_64",
+        "CEC_POP_ART_TEST",
+    }
+    rnn_model_names = {
+        "CEC",
+        "CEC_PREV",
+        "CEC_64",
+        "FCP",
+        "IPPO",
+        *popart_model_names,
+    }
 
     ##################
     # Load all models for current ckpt id
@@ -183,29 +198,77 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"])
+    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"]) + f"/{config['ENV_NAME']}"
     config['SAVE_PATH_FINAL'] = save_path_final
     os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
-
     param_list = []
     seed_list = []
     iter_range = range(config['NUM_MODELS'])
+
     def find_model_path(seed):
-        if config["model_name"] == "CEC":
-            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_updates58593.pkl"] 
-        elif config["model_name"] == "FCP":
+        model_root = f"{config['MODEL_PATH']}/{model_name}"
+
+        if model_name == "CEC_PREV":
             patterns = [
-                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/fcp_seed{seed}_best.pkl",
+                f"{model_root}/seed{seed}/"
+                f"seed{seed}_ckpt0_improved_updates58593.pkl"
             ]
-        elif config["model_name"] == "E3T":
-            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_best_e3t.pkl"]
-        elif config["model_name"] == "IPPO":
+        elif model_name == "CEC_64":
             patterns = [
-                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"]
-        elif config["model_name"] == "CEC_POP_ART":
-            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"]
-        elif config["model_name"] == "CEC_POP_ART_TEST":
-            patterns = [f"{config['MODEL_PATH']}/CEC_POP_ART_TEST/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29.pkl"]
+                f"{model_root}/seed{seed}/"
+                f"seed{seed}_ckpt0_improved_updates183105.pkl"
+            ]
+        elif model_name == "FCP":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/fcp_seed{seed}_best.pkl",
+            ]
+        elif model_name == "E3T":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/seed{seed}_best_e3t.pkl"
+            ]
+        elif model_name == "IPPO":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/seed{seed}_best.pkl"
+            ]
+        elif model_name == "CEC_POP_ART_PREV":
+            patterns = [
+                f"{model_root}/seed{seed}/"
+                f"seed{seed}_ckpt0_improved_pop_updates29296.pkl"
+            ]
+        elif model_name == "CEC_POP_ART_64":
+            patterns = [
+                f"{model_root}/seed{seed}/"
+                f"seed{seed}_ckpt0_improved_pop_updates183105.pkl"
+            ]
+        elif model_name == "CEC_POP_ART_TEST":
+            patterns = [
+                f"{model_root}/seed{seed}/"
+                f"seed{seed}_ckpt0_improved_pop_updates29.pkl"
+            ]
+        else:
+            raise ValueError(f"Unknown model_name: {model_name}")
+
+        for pat in patterns:
+            matches = sorted(glob_module.glob(pat))
+            if matches:
+                return matches[-1]
+        return None
+    
+    def find_toy_model_path(seed):
+        model_root = os.path.join(config['MODEL_PATH'], "ToyCoop", model_name)
+        if model_name == "CEC":
+            patterns = [f"{model_root}/seed{seed}/seed{seed}_best.pkl"]
+        elif model_name == "FCP":
+            patterns = [
+                f"{model_root}/seed{seed}/fcp_seed{seed}_best.pkl"
+            ]
+        elif model_name == "IPPO":
+            patterns = [
+                f"{model_root}/seed{seed}/seed{seed}_best.pkl"
+            ]
         for pat in patterns:
             matches = sorted(glob_module.glob(pat))
             if matches:
@@ -214,11 +277,14 @@ def main(config):
 
     for seed in iter_range:
         try:
-            filepath = find_model_path(seed)
+            if config["ENV_NAME"] == "ToyCoop":
+                filepath = find_toy_model_path(seed)
+            else:
+                filepath = find_model_path(seed)
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
-                if config["model_name"] in ("CEC_POP_ART", "CEC_POP_ART_TEST"):
+                if model_name in popart_model_names:
                     import flax.core
                     p = flax.core.unfreeze(model_params)
                     if 'critic_output' in p.get('params', {}):
@@ -247,9 +313,9 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    if config["model_name"] in ("CEC", "FCP", "IPPO", "CEC_POP_ART", "CEC_POP_ART_TEST"):
+    if model_name in rnn_model_names:
         network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
-    elif config["model_name"] == "E3T":
+    elif model_name == "E3T":
         network = ActorCriticE3T(env.action_space("agent_0").n, config=config)
     
     ##################
@@ -284,7 +350,11 @@ def main(config):
                 df_dict['seed_2'].append(seed_2)
                 df_dict['reward'].append(reward)
         df = pd.DataFrame(df_dict)
-        savefile = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results.csv"
+
+        if config["ENV_NAME"] == "ToyCoop":
+            savefile = f"{config['SAVE_PATH_FINAL']}/{model_name}_XP_results.csv"
+        else:
+            savefile = f"{config['SAVE_PATH_FINAL']}/{model_name}_{layout_name}_XP_results.csv"
         df.to_csv(savefile, index=False)
         print(f"Saved data to {savefile}")
     else:
@@ -381,7 +451,7 @@ def main(config):
 
                 # Save as gif with explicit loop parameter and duration
 
-                gif_path = f"{config['SAVE_PATH_FINAL']}/{config['model_name']}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
+                gif_path = f"{config['SAVE_PATH_FINAL']}/{model_name}_{layout_name}_XP_results_seed{seed_0}x{seed_1}_traj{traj_num}.gif"
                 imageio.mimsave(
                     gif_path,
                     frames,

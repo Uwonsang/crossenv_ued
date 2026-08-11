@@ -557,7 +557,7 @@ def make_train(config, update_step=0, save_info=None, opt_state=None):
             ]
             original_params = train_state.params
 
-            _GC_STEPS = config["GRAD_CONFLICT_STEPS"]
+            _GC_STEPS = config["GRAD_CONFLICT_WINDOW_STEPS"]
             _gc_traj = jax.tree.map(lambda x: x[:_GC_STEPS], traj_batch)
             _gc_adv  = advantages[:_GC_STEPS]
             # targets are real-scale; normalize for value loss (network outputs normalized)

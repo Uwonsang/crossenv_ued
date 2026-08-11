@@ -52,9 +52,9 @@
 "FCP": False
 "FCP_KWARGS":
   "train_oracle": True
-"MODEL_PATH": "/app/nas/models/new_baselines_model"
+"MODEL_PATH": "/app/nas/models/aaai"
 "SAVE_PATH": "/app/baselines/CEC/results/test_general"
-"NUM_MODELS": 3
+"NUM_MODELS": 6
 "XP_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          

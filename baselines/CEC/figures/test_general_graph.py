@@ -10,17 +10,40 @@ import os
 import hydra
 from omegaconf import OmegaConf
 
-# ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC", "CEC_POP_ART"]
-ALG_ORDER = ["IPPO", "E3T", "FCP", "CEC"]
+ALG_ORDER = [
+    "IPPO",
+    "E3T",
+    "FCP",
+    "CEC_64",
+    "CEC_PREV",
+    "CEC_POP_ART_64",
+    "CEC_POP_ART_PREV",
+]
+
+ALG_LABELS = {
+    "IPPO": "IPPO",
+    "E3T": "E3T",
+    "FCP": "FCP",
+    "CEC_64": "CEC-64",
+    "CEC_PREV": "CEC-Prev",
+    "CEC_POP_ART_64": "CEC-PopArt-64",
+    "CEC_POP_ART_PREV": "CEC-PopArt-Prev",
+}
 
 _ALG_PAT = "|".join(re.escape(a) for a in sorted(ALG_ORDER, key=len, reverse=True))
 FNAME_RE = re.compile(
     rf"^(?P<alg>{_ALG_PAT})_(?P<map>.+)_9_XP_results\.csv$"
 )
 
-# IPPO, E3T, FCP, CEC — "5 Heldout Grids" style (red / purple / gold / forest green)
-# ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733", "#008000"]
-ALG_COLORS = ["#d62728", "#7b126b", "#e3a21a", "#117733"]
+ALG_COLORS = [
+    "#d62728",  # IPPO
+    "#7b126b",  # E3T
+    "#e3a21a",  # FCP
+    "#117733",  # CEC-64
+    "#66a61e",  # CEC-Prev
+    "#2166ac",  # CEC-PopArt-64
+    "#67a9cf",  # CEC-PopArt-Prev
+]
 
 MAP_ORDER = [
     "asymm_advantages",
@@ -83,7 +106,12 @@ def plot_per_map(grid: pd.DataFrame, out_path: Path, title_prefix: str = "") -> 
     n_maps = len(MAP_ORDER)
     ncols = 3
     nrows = int(np.ceil(n_maps / ncols))
-    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 3.8 * nrows), squeeze=False)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(5.2 * ncols, 4.2 * nrows),
+        squeeze=False,
+    )
     axes_flat = axes.ravel()
     colors = _alg_color_map()
 
@@ -115,7 +143,11 @@ def plot_per_map(grid: pd.DataFrame, out_path: Path, title_prefix: str = "") -> 
             alpha=0.9,
         )
         ax.set_xticks(x)
-        ax.set_xticklabels(ALG_ORDER, rotation=15, ha="right")
+        ax.set_xticklabels(
+            [ALG_LABELS[alg] for alg in ALG_ORDER],
+            rotation=30,
+            ha="right",
+        )
         label = MAP_LABEL_KO.get(map_name, map_name)
         ax.set_title(f"{title_prefix}{label}")
         ax.set_ylabel("mean reward")
@@ -143,7 +175,7 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
     errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    fig, ax = plt.subplots(figsize=(11, 5))
     x = np.arange(len(ALG_ORDER))
     colors = [_alg_color_map()[a] for a in ALG_ORDER]
     ax.bar(
@@ -157,7 +189,11 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
         alpha=0.92,
     )
     ax.set_xticks(x)
-    ax.set_xticklabels(ALG_ORDER)
+    ax.set_xticklabels(
+        [ALG_LABELS[alg] for alg in ALG_ORDER],
+        rotation=25,
+        ha="right",
+    )
     ax.set_ylabel("mean reward (average over maps)")
     ax.set_title("Overall performance — average over 5 maps (test_general)")
     ax.grid(axis="y", alpha=0.35)
@@ -171,7 +207,12 @@ def plot_overall(grid: pd.DataFrame, out_path: Path) -> None:
 def main(config):
     config = OmegaConf.to_container(config)
 
-    results_path = Path(__file__).resolve().parent.parent / "results" / f"test_general_{config['NUM_MODELS']}" 
+    results_path = (
+        Path(__file__).resolve().parent.parent
+        / "results"
+        / f"test_general_{config['NUM_MODELS']}"
+        / config["ENV_NAME"]
+    )
     out_path = Path(__file__).resolve().parent / "results" / f"test_general_graph_{config['NUM_MODELS']}"
 
     grid = load_grid(config, results_path)

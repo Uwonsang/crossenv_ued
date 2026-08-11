@@ -29,6 +29,16 @@ import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 import time
+from baselines.CEC_UED.algo_utils import (
+    BCPolicy,
+    EVAL_LAYOUTS_9,
+    load_human_proxy_params,
+    make_eval_envs_overcooked,
+)
+from baselines.CEC.evaluation_rollout_utils import (
+    evaluate_cross_play_layout,
+    evaluate_self_play_layout,
+)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -298,6 +308,24 @@ def make_train(config, update_step=0):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    eval_envs = make_eval_envs_overcooked(config)
+    eval_all_layouts = (
+        config["ENV_NAME"] == "overcooked"
+        and bool(config["ENV_KWARGS"]["random_reset"])
+        and config["ENV_KWARGS"]["random_reset_fn"] == "reset_all"
+        and bool(config["ENV_KWARGS"]["check_held_out"])
+        and len(eval_envs) > 0
+    )
+    human_proxy_params = (
+        load_human_proxy_params(
+            config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
+            int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+        )
+        if eval_all_layouts
+        else {}
+    )
+    LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
+
     def linear_schedule(count):
         frac = (
             1.0
@@ -310,6 +338,7 @@ def make_train(config, update_step=0):
     def train(rng, model_params=None, update_step=0):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
+        bc_network = BCPolicy()
         rng, _rng = jax.random.split(rng)
         # get flattened obs dim
         flattened_obs_dim = 1
@@ -347,6 +376,43 @@ def make_train(config, update_step=0):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+
+        def eval_layout_sp(eval_env, params, eval_rng):
+            return evaluate_self_play_layout(
+                eval_env=eval_env,
+                params=params,
+                eval_rng=eval_rng,
+                network_apply=network.apply,
+                initialize_carry=ScannedRNN.initialize_carry,
+                batchify=batchify,
+                unbatchify=unbatchify,
+                num_eval_envs=int(config["EVAL_KWARGS"]["num_envs"]),
+                num_steps=int(config["EVAL_KWARGS"]["num_steps"]),
+                hidden_dim=config["GRU_HIDDEN_DIM"],
+                beta=config["EVAL_KWARGS"]["beta"],
+                argmax=config["EVAL_KWARGS"]["argmax"],
+            )
+
+        def eval_layout_xp(
+            eval_env, main_params, bc_params_stacked, eval_rng,
+        ):
+            return evaluate_cross_play_layout(
+                eval_env=eval_env,
+                main_params=main_params,
+                bc_params_stacked=bc_params_stacked,
+                eval_rng=eval_rng,
+                network_apply=network.apply,
+                bc_network_apply=bc_network.apply,
+                initialize_carry=ScannedRNN.initialize_carry,
+                num_eval_envs=int(config["EVAL_KWARGS"]["num_envs"]),
+                num_steps=int(config["EVAL_KWARGS"]["num_steps"]),
+                hidden_dim=config["GRU_HIDDEN_DIM"],
+                beta=config["EVAL_KWARGS"]["beta"],
+                argmax=config["EVAL_KWARGS"]["argmax"],
+                num_human_proxy_seeds=int(
+                    config["EVAL_KWARGS"]["human_proxy_num_seeds"]
+                ),
+            )
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -611,18 +677,76 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            def callback(metric):
-                wandb.log(
-                    {
-                        # the metrics have an agent dimension, but this is identical
-                        # for all agents so index into the 0th item of that dimension.
-                        "returns": metric["returns"],
-                        "env_step": metric["update_steps"]
-                        * config["NUM_ENVS"]
-                        * config["NUM_STEPS"],
-                        **metric["loss"],
-                    }
+            if eval_all_layouts:
+                run_eval = (
+                    (update_steps % LOG_INTERVAL == 0)
+                    | (update_steps == int(config["NUM_UPDATES"]) - 1)
                 )
+
+                def _do_eval(_):
+                    base = jax.random.fold_in(rng, update_steps)
+                    eval_layout_names = EVAL_LAYOUTS_9
+                    out = {}
+                    for i, eval_layout_name in enumerate(eval_layout_names):
+                        out[eval_layout_name] = eval_layout_sp(
+                            eval_envs[eval_layout_name],
+                            train_state.params,
+                            jax.random.fold_in(base, i),
+                        )
+                        out[f"{eval_layout_name}_xp"] = eval_layout_xp(
+                            eval_envs[eval_layout_name],
+                            train_state.params,
+                            human_proxy_params[eval_layout_name],
+                            jax.random.fold_in(base, 1000 + i),
+                        )
+                    out["mean"] = jnp.mean(jnp.stack([
+                        out[name] for name in eval_layout_names
+                    ]))
+                    out["mean_xp"] = jnp.mean(jnp.stack([
+                        out[f"{name}_xp"] for name in eval_layout_names
+                    ]))
+                    return out
+
+                def _skip_eval(_):
+                    nan = jnp.array(jnp.nan, dtype=jnp.float32)
+                    eval_layout_names = EVAL_LAYOUTS_9
+                    out = {name: nan for name in eval_layout_names}
+                    out.update({
+                        f"{name}_xp": nan for name in eval_layout_names
+                    })
+                    out["mean"] = nan
+                    out["mean_xp"] = nan
+                    return out
+
+                metric["eval_returns"] = jax.lax.cond(
+                    run_eval, _do_eval, _skip_eval, operand=None
+                )
+
+            def callback(metric):
+                log_data = {
+                    "returns": metric["returns"],
+                    "env_step": metric["update_steps"]
+                    * config["NUM_ENVS"]
+                    * config["NUM_STEPS"],
+                    **metric["loss"],
+                }
+                if "eval_returns" in metric:
+                    eval_layout_names = EVAL_LAYOUTS_9
+                    sp_mean = float(metric["eval_returns"]["mean"])
+                    xp_mean = float(metric["eval_returns"]["mean_xp"])
+                    if np.isfinite(sp_mean):
+                        log_data["eval/mean"] = sp_mean
+                        for eval_layout_name in eval_layout_names:
+                            log_data[f"eval/{eval_layout_name}"] = float(
+                                metric["eval_returns"][eval_layout_name]
+                            )
+                    if np.isfinite(xp_mean):
+                        log_data["eval_xp/mean"] = xp_mean
+                        for eval_layout_name in eval_layout_names:
+                            log_data[f"eval_xp/{eval_layout_name}"] = float(
+                                metric["eval_returns"][f"{eval_layout_name}_xp"]
+                            )
+                wandb.log(log_data, step=int(metric["update_steps"]))
                 current_return = float(metric["returns"])
                 if current_return > best_return[0]:
                     best_return[0] = current_return
@@ -669,6 +793,7 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    config["model_name"] = "E3T"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_e3t_finetune"
@@ -680,6 +805,10 @@ def main(config):
         fcp_prefix = ""
         finetune_appendage = "_e3t"
 
+    save_variant = "e3t"
+    if config["TRAIN_KWARGS"]["finetune"]:
+        save_variant += "_finetune"
+
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
@@ -688,7 +817,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "RNN", "SP"],
+        tags=["E3T", "RNN", "SP"],
         config=config,
         mode=config["WANDB_MODE"],
         name=f"e3t_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
@@ -746,11 +875,11 @@ def main(config):
     
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl", "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_e3t{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

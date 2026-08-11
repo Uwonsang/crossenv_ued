@@ -73,5 +73,5 @@
   "beta": 1.0
   "argmax": False
 # for gradient conflict
-"GRAD_CONFLICT_STEPS": 32
+"GRAD_CONFLICT_WINDOW_STEPS": 32  # rollout steps used by gradient diagnostics
 "POPART_ALPHA": 0.01

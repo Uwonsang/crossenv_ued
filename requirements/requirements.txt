@@ -9,6 +9,7 @@ safetensors==0.6.2
 wandb
 h5py
 imageio==2.37.0
+matplotlib
 # requirements are alligned with nvcr.io/nvidia/jax:24.04-py3 image
 jax==0.4.26
 jaxlib==0.4.26

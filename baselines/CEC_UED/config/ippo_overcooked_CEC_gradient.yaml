@@ -54,7 +54,7 @@
   "train_oracle": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
-"PROJECT": "crossenv_ued_gradient"
+"PROJECT": "crossenv_ued_ljy_idaac_gradient"
 "WANDB_MODE" : "disabled"
 "model_name": "CEC"
 # EVAL Params

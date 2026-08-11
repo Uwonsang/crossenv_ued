@@ -788,6 +788,12 @@ def make_train(
         network_params = network.init(_rng, init_hstate, init_x)
         if model_params is not None:
             network_params = model_params
+        actor_metric_param_keys = tuple(
+            name for name in ACTOR_TRUNK_KEYS if name in network_params["params"]
+        )
+        critic_metric_param_keys = tuple(
+            name for name in VALUE_TRUNK_KEYS if name in network_params["params"]
+        )
         def optimizer(learning_rate):
             if config["ANNEAL_LR"]:
                 schedule = functools.partial(linear_schedule, initial_lr=learning_rate)
@@ -1235,8 +1241,8 @@ def make_train(
                     optimizer_update_metrics = compute_optimizer_update_metrics(
                         gradients=grads,
                         params=train_state.params,
-                        actor_param_keys=ACTOR_TRUNK_KEYS,
-                        critic_param_keys=VALUE_TRUNK_KEYS,
+                        actor_param_keys=actor_metric_param_keys,
+                        critic_param_keys=critic_metric_param_keys,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
                     loss, loss_aux = total_loss

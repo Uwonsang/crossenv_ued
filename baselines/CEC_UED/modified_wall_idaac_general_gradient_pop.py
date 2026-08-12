@@ -1719,9 +1719,20 @@ def make_train(
                         layout_names, human_proxy_xp_enabled,
                     )
                     if training_xp_enabled and _log_accum["xp_last"] is not None:
-                        log_dict["eval_xp/mean"] = _log_accum["xp_last"]["mean_xp"]
+                        xp_mean = _log_accum["xp_last"]["mean_xp"]
+                        return_scale = 2.0 * float(config["ENV_KWARGS"]["max_steps"])
+                        log_dict["eval_xp/mean"] = xp_mean
+                        log_dict["xp/return_mean_fixed_heldout"] = xp_mean
+                        log_dict["xp/normalized_return_mean_fixed_heldout"] = (
+                            xp_mean / return_scale
+                        )
                         for name in layout_names:
-                            log_dict[f"eval_xp/{name}"] = _log_accum["xp_last"][f"{name}_xp"]
+                            xp_return = _log_accum["xp_last"][f"{name}_xp"]
+                            log_dict[f"eval_xp/{name}"] = xp_return
+                            log_dict[f"xp/return_{name}"] = xp_return
+                            log_dict[f"xp/normalized_return_{name}"] = (
+                                xp_return / return_scale
+                            )
 
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.

@@ -861,6 +861,7 @@ def make_train(
             "layout_sum": {},
             "layout_count": {},
             "eval_last": None,
+            "xp_last": None,
         }
 
         # TRAIN LOOP
@@ -1677,6 +1678,13 @@ def make_train(
                                     for stat_name in EVAL_CRITIC_STAT_NAMES:
                                         source_key = f"{_ln}_xp_critic_{stat_name}"
                                         eval_last[source_key] = float(metric["eval_returns"][source_key])
+                            _log_accum["xp_last"] = {
+                                "mean_xp": eval_last["mean_xp"],
+                                **{
+                                    f"{name}_xp": eval_last[f"{name}_xp"]
+                                    for name in layout_names
+                                },
+                            }
                         _log_accum["eval_last"] = eval_last
 
                 if len(layout_names) > 0:
@@ -1710,10 +1718,10 @@ def make_train(
                         log_dict, _log_accum["eval_last"],
                         layout_names, human_proxy_xp_enabled,
                     )
-                    if training_xp_enabled and _log_accum["eval_last"] is not None:
-                        log_dict["eval_xp/mean"] = _log_accum["eval_last"]["mean_xp"]
+                    if training_xp_enabled and _log_accum["xp_last"] is not None:
+                        log_dict["eval_xp/mean"] = _log_accum["xp_last"]["mean_xp"]
                         for name in layout_names:
-                            log_dict[f"eval_xp/{name}"] = _log_accum["eval_last"][f"{name}_xp"]
+                            log_dict[f"eval_xp/{name}"] = _log_accum["xp_last"][f"{name}_xp"]
 
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.

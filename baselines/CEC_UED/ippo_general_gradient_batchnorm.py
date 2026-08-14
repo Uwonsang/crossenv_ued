@@ -506,20 +506,12 @@ def make_train(
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adamw(
-                    learning_rate=linear_schedule,
-                    weight_decay=config["WEIGHT_DECAY"],
-                    eps=1e-5,
-                ),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
         else:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adamw(
-                    learning_rate=config["LR"],
-                    weight_decay=config["WEIGHT_DECAY"],
-                    eps=1e-5,
-                ),
+                optax.adam(config["LR"], eps=1e-5),
             )
         train_state = TrainState.create(
             apply_fn=network.apply,
@@ -1321,7 +1313,6 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
-    config["model_name"] = "CEC_WD"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1353,7 +1344,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/ippo_wd/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
@@ -1385,13 +1376,10 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["IPPO", "RNN", "SP", "AdamW", "weight_decay"],
+            tags=["IPPO", "RNN", "SP"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=(
-                f"CEC_gradient_wd_{layout_name}_seed{config['SEED']}"
-                f"_wd{config['WEIGHT_DECAY']:g}"
-            ),
+            name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
         )
 
     num_updates = int(
@@ -1399,13 +1387,13 @@ def main(config):
     )
     final_ckpt_path = os.path.join(
         filepath,
-        f"{fcp_prefix}seed{config['SEED']}_wd_ckpt"
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
         f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}"
         f"_updates{num_updates}.pkl",
     )
     legacy_final_ckpt_path = os.path.join(
         filepath,
-        f"{fcp_prefix}seed{config['SEED']}_wd_ckpt"
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
         f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl",
     )
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -1427,7 +1415,7 @@ def main(config):
         print(f"Resuming from update step {final_update_step}")
     elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_wd_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             opt_state = None

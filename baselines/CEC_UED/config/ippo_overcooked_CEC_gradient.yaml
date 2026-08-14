@@ -1,5 +1,6 @@
 "ENV_NAME": "overcooked"  # ToyCoop or overcooked #checked
 "LR": 3e-4 #checked
+"WEIGHT_DECAY": 0.0001  # used by ippo_general_gradient_wd.py (AdamW)
 "NUM_ENVS": 256
 "NUM_SEEDS": 1
 "NUM_STEPS": 400 #checked

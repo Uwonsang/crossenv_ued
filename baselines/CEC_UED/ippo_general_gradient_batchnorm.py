@@ -9,10 +9,11 @@ import pickle
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
+from flax.core import freeze, unfreeze
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Dict
+from typing import Sequence, NamedTuple, Dict, Any
 from flax.training.train_state import TrainState
 import distrax
 import hydra
@@ -62,13 +63,16 @@ from critic_loss_surface import (
 ACTOR_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_2", "Dense_3", "Dense_4", "Dense_5", "Dense_6",
+    "SharedBatchNorm_0", "SharedBatchNorm_1",
 )
 VALUE_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
+    "SharedBatchNorm_0", "SharedBatchNorm_1",
 )
 SHARED_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
+    "SharedBatchNorm_0", "SharedBatchNorm_1",
 )
 
 
@@ -197,12 +201,89 @@ class ScannedRNN(nn.Module):
         )
 
 
+class BatchNorm(nn.Module):
+    """Batch normalization with moving statistics for evaluation."""
+
+    epsilon: float = 1e-5
+    momentum: float = 0.99
+
+    @nn.compact
+    def __call__(self, x, use_running_average: bool = False):
+        reduction_axes = tuple(range(x.ndim - 1))
+        running_mean = self.variable(
+            "batch_stats", "mean", jnp.zeros, (x.shape[-1],)
+        )
+        running_variance = self.variable(
+            "batch_stats", "variance", jnp.ones, (x.shape[-1],)
+        )
+
+        if use_running_average:
+            mean = running_mean.value
+            variance = running_variance.value
+        else:
+            mean = jnp.mean(x, axis=reduction_axes)
+            variance = jnp.mean(jnp.square(x - mean), axis=reduction_axes)
+            if not self.is_initializing():
+                running_mean.value = (
+                    self.momentum * running_mean.value
+                    + (1.0 - self.momentum) * mean
+                )
+                running_variance.value = (
+                    self.momentum * running_variance.value
+                    + (1.0 - self.momentum) * variance
+                )
+
+        scale = self.param("scale", nn.initializers.ones, (x.shape[-1],))
+        bias = self.param("bias", nn.initializers.zeros, (x.shape[-1],))
+        return (x - mean) * jax.lax.rsqrt(variance + self.epsilon) * scale + bias
+
+
+class BatchNormTrainState(TrainState):
+    batch_stats: Any
+
+
+class BatchNormInferenceNetwork:
+    """Adapter exposing a params-only apply API with fixed running statistics."""
+
+    def __init__(self, network, batch_stats):
+        self.network = network
+        self.batch_stats = batch_stats
+
+    def apply(self, params, *args, **kwargs):
+        return self.network.apply(
+            {"params": params, "batch_stats": self.batch_stats},
+            *args,
+            use_running_average=True,
+            **kwargs,
+        )
+
+
+def merge_restored_parameters(initialized_variables, restored_variables):
+    """Restore matching weights while retaining newly added BatchNorm params."""
+    initialized = unfreeze(initialized_variables)
+    restored = unfreeze(restored_variables)
+    if "params" in initialized and "params" not in restored:
+        restored = {"params": restored}
+
+    def merge(default_tree, restored_tree):
+        for key, restored_value in restored_tree.items():
+            if key not in default_tree:
+                continue
+            if isinstance(default_tree[key], dict) and isinstance(restored_value, dict):
+                merge(default_tree[key], restored_value)
+            else:
+                default_tree[key] = restored_value
+
+    merge(initialized, restored)
+    return freeze(initialized)
+
+
 class ActorCriticRNN(nn.Module):
     action_dim: Sequence[int]
     config: Dict
 
     @nn.compact
-    def __call__(self, hidden, x):
+    def __call__(self, hidden, x, use_running_average: bool = False):
         obs, dones, agent_positions = x
         batch_size, num_envs, flattened_obs_dim = obs.shape
 
@@ -240,6 +321,9 @@ class ActorCriticRNN(nn.Module):
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(reshaped_obs)
+            embedding = BatchNorm(name="SharedBatchNorm_0")(
+                embedding, use_running_average=use_running_average
+            )
             embedding = nn.relu(embedding)
             record_feature_norm("shared_conv_0", embedding)
 
@@ -250,6 +334,9 @@ class ActorCriticRNN(nn.Module):
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(embedding)
+            embedding = BatchNorm(name="SharedBatchNorm_1")(
+                embedding, use_running_average=use_running_average
+            )
             embedding = nn.relu(embedding)
             record_feature_norm("shared_conv_1", embedding)
 
@@ -366,14 +453,31 @@ class Transition(NamedTuple):
 
 
 def ppo_loss(
-    network, params, initial_hstate, traj_batch, advantages, targets, config
+    network, params, batch_stats, initial_hstate, traj_batch, advantages,
+    targets, config, update_batch_stats=False,
 ):
     """The PPO objective used by both training and final sharpness."""
-    _, pi, value = network.apply(
-        params,
-        initial_hstate,
-        (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+    variables = {"params": params, "batch_stats": batch_stats}
+    network_inputs = (
+        traj_batch.obs, traj_batch.done, traj_batch.agent_positions
     )
+    if update_batch_stats:
+        (_, pi, value), updates = network.apply(
+            variables,
+            initial_hstate,
+            network_inputs,
+            use_running_average=False,
+            mutable=["batch_stats"],
+        )
+        updated_batch_stats = updates["batch_stats"]
+    else:
+        _, pi, value = network.apply(
+            variables,
+            initial_hstate,
+            network_inputs,
+            use_running_average=True,
+        )
+        updated_batch_stats = batch_stats
     log_prob = pi.log_prob(traj_batch.action)
     value_pred_clipped = traj_batch.value + (
         value - traj_batch.value
@@ -403,7 +507,8 @@ def ppo_loss(
         - config["ENT_COEF"] * entropy
     )
     return total_loss, (
-        value_loss, actor_loss, entropy, ratio, approx_kl, clip_frac
+        (value_loss, actor_loss, entropy, ratio, approx_kl, clip_frac),
+        updated_batch_stats,
     )
 
 
@@ -500,9 +605,13 @@ def make_train(
             jnp.zeros((1, config["NUM_ENVS"], 2, 2)).astype(jnp.int32)
         )
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ENVS"], config["GRU_HIDDEN_DIM"])
-        network_params = network.init(_rng, init_hstate, init_x)
+        network_variables = network.init(
+            _rng, init_hstate, init_x, use_running_average=False
+        )
         if model_params is not None:
-            network_params = model_params
+            network_variables = merge_restored_parameters(
+                network_variables, model_params
+            )
         if config["ANNEAL_LR"]:
             tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
@@ -513,9 +622,10 @@ def make_train(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
                 optax.adam(config["LR"], eps=1e-5),
             )
-        train_state = TrainState.create(
+        train_state = BatchNormTrainState.create(
             apply_fn=network.apply,
-            params=network_params,
+            params=network_variables["params"],
+            batch_stats=network_variables["batch_stats"],
             tx=tx,
         )
         if opt_state is not None:
@@ -571,7 +681,15 @@ def make_train(
                     last_done[np.newaxis, :],
                     agent_positions[np.newaxis, :],
                 )
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+                hstate, pi, value = network.apply(
+                    {
+                        "params": train_state.params,
+                        "batch_stats": train_state.batch_stats,
+                    },
+                    hstate,
+                    ac_in,
+                    use_running_average=True,
+                )
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 env_act = unbatchify(
@@ -627,7 +745,15 @@ def make_train(
                 last_done[np.newaxis, :],
                 agent_positions[np.newaxis, :],
             )
-            _, _, last_val = network.apply(train_state.params, hstate, ac_in)
+            _, _, last_val = network.apply(
+                {
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
+                hstate,
+                ac_in,
+                use_running_average=True,
+            )
             last_val = last_val.squeeze()
 
             def _calculate_gae(traj_batch, last_val):
@@ -662,6 +788,9 @@ def make_train(
                 "counter_circuit_9", "forced_coord_9",
             ]
             original_params = train_state.params
+            inference_network = BatchNormInferenceNetwork(
+                network, train_state.batch_stats
+            )
 
             # per-step layout id, classified pre-step inside _env_step, already tiled to actors
             _actor_layout_full = traj_batch.layout_id  # (NUM_STEPS, NUM_ACTORS)
@@ -691,7 +820,7 @@ def make_train(
                     traj_batch,
                 )
                 return compute_layout_gradient_metrics(
-                    network=network,
+                    network=inference_network,
                     original_params=original_params,
                     initial_hstate=initial_hstate,
                     traj_batch=layout_gradient_traj,
@@ -730,7 +859,7 @@ def make_train(
                     traj_batch,
                 )
                 return compute_minibatch_penultimate_metrics(
-                    network,
+                    inference_network,
                     original_params,
                     representation_hstate,
                     (
@@ -756,11 +885,13 @@ def make_train(
                         return ppo_loss(
                             network,
                             params,
+                            train_state.batch_stats,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             traj_batch,
                             gae,
                             targets,
                             config,
+                            update_batch_stats=True,
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -778,8 +909,11 @@ def make_train(
                         critic_param_keys=VALUE_TRUNK_KEYS,
                         shared_param_keys=SHARED_TRUNK_KEYS,
                     )
+                    loss, (loss_aux, updated_batch_stats) = total_loss
                     train_state = train_state.apply_gradients(grads=grads)
-                    loss, loss_aux = total_loss
+                    train_state = train_state.replace(
+                        batch_stats=updated_batch_stats
+                    )
                     return train_state, (loss, loss_aux, optimizer_update_metrics)
 
                 (
@@ -850,13 +984,16 @@ def make_train(
             if save_info is not None:
                 num_updates_total = save_info["num_updates"]
 
-                def final_save_callback(params):
+                def final_save_callback(params, batch_stats):
                     ckpt_path = save_info["final_ckpt_path"]
                     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
                     with open(ckpt_path, "wb") as f:
                         pickle.dump({
                             'key': save_info["rng"],
-                            'params': params,
+                            'params': {
+                                'params': params,
+                                'batch_stats': batch_stats,
+                            },
                             'update_steps': num_updates_total,
                         }, f)
                     print(f"Saved final model to {ckpt_path}")
@@ -876,6 +1013,7 @@ def make_train(
                         final_save_callback,
                         None,
                         train_state.params,
+                        train_state.batch_stats,
                         ordered=True,
                     ),
                     lambda _: None,
@@ -886,7 +1024,10 @@ def make_train(
                 completed_updates=update_steps + 1,
                 total_updates=config["NUM_UPDATES"],
                 settings=surface_settings,
-                params=train_state.params,
+                params={
+                    "params": train_state.params,
+                    "batch_stats": train_state.batch_stats,
+                },
                 initial_hstate=initial_hstate,
                 traj_batch=traj_batch,
                 advantages=advantages,
@@ -952,7 +1093,15 @@ def make_train(
                         done_e[np.newaxis, :],
                         agent_positions[np.newaxis, :],
                     )
-                    hstate_next, pi, value_e = network.apply(params, hstate_e, ac_in)
+                    hstate_next, pi, value_e = network.apply(
+                        {
+                            "params": params,
+                            "batch_stats": train_state.batch_stats,
+                        },
+                        hstate_e,
+                        ac_in,
+                        use_running_average=True,
+                    )
                     pi = distrax.Categorical(logits=pi.logits * config["EVAL_KWARGS"]["beta"])
                     sampled_action = pi.sample(seed=_rng_e)[0]
                     greedy_action = jnp.argmax(pi.probs, axis=-1)[0]
@@ -1015,7 +1164,15 @@ def make_train(
                         main_done_e[np.newaxis, :],
                         agent_positions_e[np.newaxis, :],
                     )
-                    hstate_next, main_pi, main_value = network.apply(main_params, hstate_e, main_ac_in)
+                    hstate_next, main_pi, main_value = network.apply(
+                        {
+                            "params": main_params,
+                            "batch_stats": train_state.batch_stats,
+                        },
+                        hstate_e,
+                        main_ac_in,
+                        use_running_average=True,
+                    )
                     main_pi = distrax.Categorical(logits=main_pi.logits * config["EVAL_KWARGS"]["beta"])
                     main_sampled = main_pi.sample(seed=main_rng_e)[0]
                     main_greedy = jnp.argmax(main_pi.probs, axis=-1)[0]
@@ -1229,7 +1386,7 @@ def make_train(
             )
 
             def ckpt_callback(
-                params, opt_state_, tx_step, step,
+                params, batch_stats, opt_state_, tx_step, step,
                 env_state_, last_obs_, last_done_, hstate_, rng_,
             ):
                 step = int(step)
@@ -1238,7 +1395,10 @@ def make_train(
                 mid_ckpt_path = os.path.join(mid_ckpt_dir, "resume_ckpt.pkl")
                 with open(mid_ckpt_path, "wb") as f:
                     pickle.dump({
-                        'params': params,
+                        'params': {
+                            'params': params,
+                            'batch_stats': batch_stats,
+                        },
                         'opt_state': opt_state_,
                         'tx_step': tx_step,
                         'final_update_step': step + 1,
@@ -1264,7 +1424,8 @@ def make_train(
                     run_save_ckpt,
                     lambda _: jax.experimental.io_callback(
                         ckpt_callback, None,
-                        train_state.params, train_state.opt_state, train_state.step,
+                        train_state.params, train_state.batch_stats,
+                        train_state.opt_state, train_state.step,
                         update_steps, env_state, last_obs, last_done, hstate, rng,
                         ordered=True,
                     ),
@@ -1296,9 +1457,12 @@ def make_train(
         final_train_state = final_runner_state[0]
         return {
             "sharpness_params": final_train_state.params,
+            "sharpness_batch_stats": final_train_state.batch_stats,
             "sharpness_batch": collect_final_sharpness_batch(
                 env,
-                network,
+                BatchNormInferenceNetwork(
+                    network, final_train_state.batch_stats
+                ),
                 final_runner_state,
                 final_update_count,
                 config,
@@ -1313,6 +1477,11 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
+    config["model_name"] = "CEC_BATCHNORM"
+    config["BATCH_NORM"] = True
+    config["BATCH_NORM_TRACK_RUNNING_STATS"] = True
+    config["BATCH_NORM_EPSILON"] = 1e-5
+    config["BATCH_NORM_MOMENTUM"] = 0.99
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
@@ -1344,7 +1513,7 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/ippo_batchnorm/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
@@ -1376,10 +1545,10 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["IPPO", "RNN", "SP"],
+            tags=["IPPO", "RNN", "SP", "BatchNorm"],
             config=config,
             mode=config["WANDB_MODE"],
-            name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
+            name=f"CEC_gradient_batchnorm_{layout_name}_seed{config['SEED']}"
         )
 
     num_updates = int(
@@ -1387,13 +1556,13 @@ def main(config):
     )
     final_ckpt_path = os.path.join(
         filepath,
-        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{fcp_prefix}seed{config['SEED']}_batchnorm_ckpt"
         f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}"
         f"_updates{num_updates}.pkl",
     )
     legacy_final_ckpt_path = os.path.join(
         filepath,
-        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{fcp_prefix}seed{config['SEED']}_batchnorm_ckpt"
         f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl",
     )
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
@@ -1407,7 +1576,17 @@ def main(config):
     if _has_mid_ckpt:
         print(f"Found mid-run checkpoint: {mid_ckpt_path}")
         model_params = _peek['params']
-        opt_state = _peek.get('opt_state', None)
+        has_running_stats = (
+            hasattr(model_params, "keys") and "batch_stats" in model_params
+        )
+        opt_state = (
+            _peek.get('opt_state', None) if has_running_stats else None
+        )
+        if not has_running_stats:
+            print(
+                "Legacy BatchNorm checkpoint has no running statistics; "
+                "initializing batch_stats and rebuilding optimizer state."
+            )
         resume_train_state_step = _peek.get('tx_step', None)
         resume_runner_state = _peek.get('runner_state', None)
         final_update_step = _peek['final_update_step']
@@ -1415,7 +1594,7 @@ def main(config):
         print(f"Resuming from update step {final_update_step}")
     elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_batchnorm_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             opt_state = None
@@ -1478,6 +1657,7 @@ def main(config):
         loss, _ = ppo_loss(
             sharpness_network,
             params,
+            train_output["sharpness_batch_stats"],
             sharpness_batch.initial_hstate,
             sharpness_batch,
             sharpness_batch.advantages,

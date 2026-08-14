@@ -315,12 +315,6 @@ def make_train(config, update_step=0):
         and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
     layout_name = config["layout_name"]
-    if eval_xp_enabled and layout_name not in EVAL_LAYOUTS_9:
-        supported_layouts = ", ".join(EVAL_LAYOUTS_9)
-        raise ValueError(
-            f"Unsupported BC XP layout '{layout_name}'. "
-            f"Choose one of: {supported_layouts}"
-        )
     human_proxy_params = (
         load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],

@@ -275,6 +275,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 def make_train(config, update_step=0, filepath=""):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
+    layout_name = config["layout_name"]
     
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
@@ -306,13 +307,18 @@ def make_train(config, update_step=0, filepath=""):
         and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
     
-    xp_layout_name = config["ENV_KWARGS"]["layout"]
     human_proxy_params = {}
     if eval_xp_enabled:
+        if layout_name not in EVAL_LAYOUTS_9:
+            supported_layouts = ", ".join(EVAL_LAYOUTS_9)
+            raise ValueError(
+                f"Unsupported BC XP layout '{layout_name}'. "
+                f"Choose one of: {supported_layouts}"
+            )
         human_proxy_params = load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
             int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
-            layout_names=(xp_layout_name,),
+            layout_names=(layout_name,),
         )
 
     def linear_schedule(count):
@@ -718,27 +724,27 @@ def make_train(config, update_step=0, filepath=""):
             if eval_xp_enabled:
                 def _do_eval_xp(_):
                     xp_return, xp_critic_stats = eval_layout_xp(
-                        eval_envs[xp_layout_name],
+                        eval_envs[layout_name],
                         train_state.params,
-                        human_proxy_params[xp_layout_name],
+                        human_proxy_params[layout_name],
                         jax.random.fold_in(rng, update_steps),
                     )
                     return {
                         "mean_xp": xp_return,
-                        f"{xp_layout_name}_xp": xp_return,
-                        f"{xp_layout_name}_xp_critic_value_mean": xp_critic_stats["value_mean"],
-                        f"{xp_layout_name}_xp_critic_target_mean": xp_critic_stats["target_mean"],
-                        f"{xp_layout_name}_xp_critic_value_rmse": jnp.sqrt(xp_critic_stats["value_mse"]),
-                        f"{xp_layout_name}_xp_critic_td_error_rmse": jnp.sqrt(xp_critic_stats["td_error_mse"]),
+                        f"{layout_name}_xp": xp_return,
+                        f"{layout_name}_xp_critic_value_mean": xp_critic_stats["value_mean"],
+                        f"{layout_name}_xp_critic_target_mean": xp_critic_stats["target_mean"],
+                        f"{layout_name}_xp_critic_value_rmse": jnp.sqrt(xp_critic_stats["value_mse"]),
+                        f"{layout_name}_xp_critic_td_error_rmse": jnp.sqrt(xp_critic_stats["td_error_mse"]),
                     }
 
                 def _skip_eval_xp(_):
                     nan = jnp.array(jnp.nan, dtype=jnp.float32)
                     return {
                         "mean_xp": nan,
-                        f"{xp_layout_name}_xp": nan,
+                        f"{layout_name}_xp": nan,
                         **{
-                            f"{xp_layout_name}_xp_critic_{stat_name}": nan
+                            f"{layout_name}_xp_critic_{stat_name}": nan
                             for stat_name in EVAL_CRITIC_STAT_NAMES
                         },
                     }
@@ -757,12 +763,12 @@ def make_train(config, update_step=0, filepath=""):
                     float(metric["eval_returns"]["mean_xp"])
                 ):
                     log_dict["eval_xp/mean"] = float(metric["eval_returns"]["mean_xp"])
-                    log_dict[f"eval_xp/{xp_layout_name}"] = float(
-                        metric["eval_returns"][f"{xp_layout_name}_xp"]
+                    log_dict[f"eval_xp/{layout_name}"] = float(
+                        metric["eval_returns"][f"{layout_name}_xp"]
                     )
                     for stat_name in EVAL_CRITIC_STAT_NAMES:
-                        source_key = f"{xp_layout_name}_xp_critic_{stat_name}"
-                        log_dict[f"eval_xp_critic/{xp_layout_name}/{stat_name}"] = float(
+                        source_key = f"{layout_name}_xp_critic_{stat_name}"
+                        log_dict[f"eval_xp_critic/{layout_name}/{stat_name}"] = float(
                             metric["eval_returns"][source_key]
                         )
                 wandb.log(log_dict)

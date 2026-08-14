@@ -309,19 +309,25 @@ def make_train(config, update_step=0):
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
     eval_envs = make_eval_envs_overcooked(config)
-    eval_all_layouts = (
+    eval_xp_enabled = (
         config["ENV_NAME"] == "overcooked"
-        and bool(config["ENV_KWARGS"]["random_reset"])
-        and config["ENV_KWARGS"]["random_reset_fn"] == "reset_all"
-        and bool(config["ENV_KWARGS"]["check_held_out"])
         and len(eval_envs) > 0
+        and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
+    layout_name = config["layout_name"]
+    if eval_xp_enabled and layout_name not in EVAL_LAYOUTS_9:
+        supported_layouts = ", ".join(EVAL_LAYOUTS_9)
+        raise ValueError(
+            f"Unsupported BC XP layout '{layout_name}'. "
+            f"Choose one of: {supported_layouts}"
+        )
     human_proxy_params = (
         load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
             int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+            layout_names=(layout_name,),
         )
-        if eval_all_layouts
+        if eval_xp_enabled
         else {}
     )
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
@@ -677,7 +683,7 @@ def make_train(config, update_step=0):
             }
             rng = update_state[-1]
 
-            if eval_all_layouts:
+            if eval_xp_enabled:
                 run_eval = (
                     (update_steps % LOG_INTERVAL == 0)
                     | (update_steps == int(config["NUM_UPDATES"]) - 1)
@@ -685,7 +691,7 @@ def make_train(config, update_step=0):
 
                 def _do_eval(_):
                     base = jax.random.fold_in(rng, update_steps)
-                    eval_layout_names = EVAL_LAYOUTS_9
+                    eval_layout_names = (layout_name,)
                     out = {}
                     for i, eval_layout_name in enumerate(eval_layout_names):
                         out[eval_layout_name] = eval_layout_sp(
@@ -709,7 +715,7 @@ def make_train(config, update_step=0):
 
                 def _skip_eval(_):
                     nan = jnp.array(jnp.nan, dtype=jnp.float32)
-                    eval_layout_names = EVAL_LAYOUTS_9
+                    eval_layout_names = (layout_name,)
                     out = {name: nan for name in eval_layout_names}
                     out.update({
                         f"{name}_xp": nan for name in eval_layout_names
@@ -731,7 +737,7 @@ def make_train(config, update_step=0):
                     **metric["loss"],
                 }
                 if "eval_returns" in metric:
-                    eval_layout_names = EVAL_LAYOUTS_9
+                    eval_layout_names = (layout_name,)
                     sp_mean = float(metric["eval_returns"]["mean"])
                     xp_mean = float(metric["eval_returns"]["mean_xp"])
                     if np.isfinite(sp_mean):

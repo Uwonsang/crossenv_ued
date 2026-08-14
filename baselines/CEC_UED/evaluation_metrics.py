@@ -43,8 +43,13 @@ def compute_evaluation_critic_statistics(
     }
 
 
-def empty_evaluation_metrics(layout_names, eval_xp_enabled):
+def empty_evaluation_metrics(
+    layout_names, eval_xp_enabled, xp_layout_names=None,
+):
     """Return the fixed NaN pytree required by the skipped lax.cond branch."""
+    if xp_layout_names is None:
+        xp_layout_names = layout_names
+
     nan = jnp.array(jnp.nan, dtype=jnp.float32)
     metrics = {layout_name: nan for layout_name in layout_names}
     metrics["mean"] = nan
@@ -54,7 +59,7 @@ def empty_evaluation_metrics(layout_names, eval_xp_enabled):
             metrics[f"{layout_name}_critic_{stat_name}"] = nan
 
     if eval_xp_enabled:
-        for layout_name in layout_names:
+        for layout_name in xp_layout_names:
             metrics[f"{layout_name}_xp"] = nan
             for stat_name in EVAL_CRITIC_STAT_NAMES:
                 metrics[f"{layout_name}_xp_critic_{stat_name}"] = nan
@@ -65,10 +70,13 @@ def empty_evaluation_metrics(layout_names, eval_xp_enabled):
 
 def add_evaluation_metrics_to_log_dict(
     log_dict, eval_metrics, layout_names, eval_xp_enabled,
+    xp_layout_names=None,
 ):
     """Add the flat internal evaluation results under their W&B key names."""
     if eval_metrics is None:
         return log_dict
+    if xp_layout_names is None:
+        xp_layout_names = layout_names
 
     log_dict["eval/mean"] = eval_metrics["mean"]
     for layout_name in layout_names:
@@ -79,7 +87,7 @@ def add_evaluation_metrics_to_log_dict(
 
     if eval_xp_enabled and "mean_xp" in eval_metrics:
         log_dict["eval_xp/mean"] = eval_metrics["mean_xp"]
-        for layout_name in layout_names:
+        for layout_name in xp_layout_names:
             log_dict[f"eval_xp/{layout_name}"] = eval_metrics[f"{layout_name}_xp"]
             for stat_name in EVAL_CRITIC_STAT_NAMES:
                 source_key = f"{layout_name}_xp_critic_{stat_name}"

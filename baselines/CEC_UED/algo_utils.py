@@ -83,13 +83,23 @@ def make_eval_envs_overcooked(config):
         )
     return envs
 
-def load_human_proxy_params(ckpt_dir, num_seeds):
-    """Loads human_proxy (BC) checkpoints for every EVAL_LAYOUTS_9 layout, stacked across seeds.
+def load_human_proxy_params(ckpt_dir, num_seeds, layout_names=None):
+    """Load human_proxy (BC) checkpoints, stacked across seeds.
 
     Returns {layout_name_9: params_pytree} where each leaf has a leading `num_seeds` axis.
+    When ``layout_names`` is omitted, checkpoints for every evaluation layout are loaded.
     """
+    if layout_names is None:
+        layout_names = EVAL_LAYOUTS_9
+
     params_by_layout = {}
-    for layout_name_9 in EVAL_LAYOUTS_9:
+    for layout_name_9 in layout_names:
+        if layout_name_9 not in EVAL_LAYOUTS_9:
+            supported_layouts = ", ".join(EVAL_LAYOUTS_9)
+            raise ValueError(
+                f"Unsupported BC evaluation layout '{layout_name_9}'. "
+                f"Choose one of: {supported_layouts}"
+            )
         layout_name = layout_name_9[:-2]  # strip the CEC_UED-only "_9" suffix
         seed_params = []
         for seed in range(num_seeds):

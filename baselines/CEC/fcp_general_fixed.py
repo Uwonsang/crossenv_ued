@@ -287,6 +287,7 @@ def make_train(config, update_step=0):
         human_proxy_params = load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
             int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+            layout_names=(layout_name,),
         )
 
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)

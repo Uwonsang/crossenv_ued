@@ -32,6 +32,16 @@ import time
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from find_mid_ckpt import find_mid_ckpt
+from baselines.CEC_UED.algo_utils import (
+    BCPolicy,
+    EVAL_LAYOUTS_9,
+    load_human_proxy_params,
+    make_eval_envs_overcooked,
+)
+from baselines.CEC_UED.evaluation_metrics import (
+    EVAL_CRITIC_STAT_NAMES,
+    compute_evaluation_critic_statistics,
+)
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -289,6 +299,22 @@ def make_train(config, update_step=0, filepath=""):
 
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
+    eval_envs = make_eval_envs_overcooked(config)
+    eval_xp_enabled = (
+        config["ENV_NAME"] == "overcooked"
+        and len(eval_envs) > 0
+        and bool(config["EVAL_KWARGS"]["eval_xp"])
+    )
+    
+    xp_layout_name = config["ENV_KWARGS"]["layout"]
+    human_proxy_params = {}
+    if eval_xp_enabled:
+        human_proxy_params = load_human_proxy_params(
+            config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
+            int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+            layout_names=(xp_layout_name,),
+        )
+
     def linear_schedule(count):
         frac = (
             1.0
@@ -301,6 +327,7 @@ def make_train(config, update_step=0, filepath=""):
     def train(rng, model_params=None, update_step=0):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
+        bc_network = BCPolicy()
         rng, _rng = jax.random.split(rng)
         # get flattened obs dim
         flattened_obs_dim = 1
@@ -338,6 +365,8 @@ def make_train(config, update_step=0, filepath=""):
         reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
         obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
         init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+
+        eval_interval = max(1, int(config["NUM_UPDATES"]) // 100)
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -589,12 +618,154 @@ def make_train(config, update_step=0, filepath=""):
             }
             rng = update_state[-1]
 
+            run_eval = jnp.logical_or(
+                jnp.equal(update_steps % eval_interval, 0),
+                jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+            )
+
+            def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
+                """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
+
+                `main_agent_id` picks which env seat the main agent controls; the other seat
+                is controlled by the (stateless) BC policy.
+                """
+                other_agent_id = "agent_1" if main_agent_id == "agent_0" else "agent_0"
+                num_eval_envs = int(config["EVAL_KWARGS"]["num_envs"])
+
+                eval_rng, reset_rng = jax.random.split(eval_rng)
+                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
+                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
+                init_hstate = ScannedRNN.initialize_carry(num_eval_envs, config["GRU_HIDDEN_DIM"])
+                init_done = jnp.zeros((num_eval_envs,), dtype=bool)
+                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
+                runner_state = (init_state, init_obs, init_done, init_hstate, init_returns, eval_rng)
+
+                def _eval_step(carry, _):
+                    env_state_e, obs_e, main_done_e, hstate_e, returns_e, rng_e = carry
+                    rng_e, main_rng_e, other_rng_e = jax.random.split(rng_e, 3)
+
+                    agent_positions_e = env_state_e.env_state.agent_pos.reshape(num_eval_envs, -1)
+                    main_ac_in = (
+                        obs_e[main_agent_id].reshape(num_eval_envs, -1)[np.newaxis, :],
+                        main_done_e[np.newaxis, :],
+                        agent_positions_e[np.newaxis, :],
+                    )
+                    hstate_next, main_pi, main_value = network.apply(main_params, hstate_e, main_ac_in)
+                    main_pi = distrax.Categorical(logits=main_pi.logits * config["EVAL_KWARGS"]["beta"])
+                    main_sampled = main_pi.sample(seed=main_rng_e)[0]
+                    main_greedy = jnp.argmax(main_pi.probs, axis=-1)[0]
+                    main_action = jnp.where(config["EVAL_KWARGS"]["argmax"], main_greedy, main_sampled)
+
+                    other_logits = bc_network.apply(bc_params, obs_e[other_agent_id].astype(jnp.float32))
+                    other_pi = distrax.Categorical(logits=other_logits * config["EVAL_KWARGS"]["beta"])
+                    other_sampled = other_pi.sample(seed=other_rng_e)
+                    other_greedy = jnp.argmax(other_pi.probs, axis=-1)
+                    other_action = jnp.where(config["EVAL_KWARGS"]["argmax"], other_greedy, other_sampled)
+
+                    env_act = {main_agent_id: main_action, other_agent_id: other_action}
+
+                    rng_e, _rng_e = jax.random.split(rng_e)
+                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
+                    obs_next, state_next, reward, done, _info = jax.vmap(
+                        eval_env.step, in_axes=(0, 0, 0)
+                    )(rng_step_e, env_state_e, env_act)
+
+                    returns_next = returns_e + reward["agent_0"]
+                    critic_transition = (main_value[0], reward["agent_0"], done[main_agent_id])
+
+                    return (state_next, obs_next, done[main_agent_id], hstate_next, returns_next, rng_e), critic_transition
+
+                runner_state, critic_trajectory = jax.lax.scan(
+                    _eval_step,
+                    runner_state,
+                    None,
+                    int(config["EVAL_KWARGS"]["num_steps"]),
+                )
+                _, _, _, _, returns, _ = runner_state
+                values_eval, rewards_eval, dones_eval = critic_trajectory
+                final_values = jnp.zeros_like(values_eval[-1])
+                critic_stats = compute_evaluation_critic_statistics(
+                    values_eval,
+                    rewards_eval,
+                    dones_eval,
+                    final_values,
+                    gamma=config["GAMMA"],
+                )
+
+                return returns.mean(), critic_stats
+
+            def eval_layout_xp(eval_env, main_params, bc_params_stacked, eval_rng):
+                """Average XP over human_proxy seeds and both agent seats."""
+                def _one_seed(bc_params_seed, rng_seed):
+                    rng_a, rng_b = jax.random.split(rng_seed)
+                    result_main_as_0 = eval_layout_xp_direction(
+                        eval_env, main_params, bc_params_seed, rng_a, "agent_0"
+                    )
+                    result_main_as_1 = eval_layout_xp_direction(
+                        eval_env, main_params, bc_params_seed, rng_b, "agent_1"
+                    )
+                    return jax.tree.map(
+                        lambda a, b: (a + b) / 2.0,
+                        result_main_as_0,
+                        result_main_as_1,
+                    )
+
+                num_hp_seeds = int(config["EVAL_KWARGS"]["human_proxy_num_seeds"])
+                seed_rngs = jax.random.split(eval_rng, num_hp_seeds)
+                per_seed_results = jax.vmap(_one_seed)(bc_params_stacked, seed_rngs)
+                return jax.tree.map(lambda value: value.mean(), per_seed_results)
+
+            if eval_xp_enabled:
+                def _do_eval_xp(_):
+                    xp_return, xp_critic_stats = eval_layout_xp(
+                        eval_envs[xp_layout_name],
+                        train_state.params,
+                        human_proxy_params[xp_layout_name],
+                        jax.random.fold_in(rng, update_steps),
+                    )
+                    return {
+                        "mean_xp": xp_return,
+                        f"{xp_layout_name}_xp": xp_return,
+                        f"{xp_layout_name}_xp_critic_value_mean": xp_critic_stats["value_mean"],
+                        f"{xp_layout_name}_xp_critic_target_mean": xp_critic_stats["target_mean"],
+                        f"{xp_layout_name}_xp_critic_value_rmse": jnp.sqrt(xp_critic_stats["value_mse"]),
+                        f"{xp_layout_name}_xp_critic_td_error_rmse": jnp.sqrt(xp_critic_stats["td_error_mse"]),
+                    }
+
+                def _skip_eval_xp(_):
+                    nan = jnp.array(jnp.nan, dtype=jnp.float32)
+                    return {
+                        "mean_xp": nan,
+                        f"{xp_layout_name}_xp": nan,
+                        **{
+                            f"{xp_layout_name}_xp_critic_{stat_name}": nan
+                            for stat_name in EVAL_CRITIC_STAT_NAMES
+                        },
+                    }
+
+                metric["eval_returns"] = jax.lax.cond(
+                    run_eval, _do_eval_xp, _skip_eval_xp, operand=None
+                )
+
             def callback(metric):
-                wandb.log({
+                log_dict = {
                     "returns": metric["returns"],
                     "env_step": int(metric["update_steps"] * config["NUM_ENVS"] * config["NUM_STEPS"]),
                     **metric["loss"],
-                })
+                }
+                if "eval_returns" in metric and np.isfinite(
+                    float(metric["eval_returns"]["mean_xp"])
+                ):
+                    log_dict["eval_xp/mean"] = float(metric["eval_returns"]["mean_xp"])
+                    log_dict[f"eval_xp/{xp_layout_name}"] = float(
+                        metric["eval_returns"][f"{xp_layout_name}_xp"]
+                    )
+                    for stat_name in EVAL_CRITIC_STAT_NAMES:
+                        source_key = f"{xp_layout_name}_xp_critic_{stat_name}"
+                        log_dict[f"eval_xp_critic/{xp_layout_name}/{stat_name}"] = float(
+                            metric["eval_returns"][source_key]
+                        )
+                wandb.log(log_dict)
                 step = int(metric["update_steps"])
                 params = jax.device_get(metric["params"])
                 current_return = float(metric["returns"])

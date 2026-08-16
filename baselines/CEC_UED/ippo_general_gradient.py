@@ -1252,20 +1252,14 @@ def make_train(
                         ),
                     }, f)
 
-            # Keep periodic checkpoints and always retain the completed state.
+            # Keep periodic checkpoints.
             save_ckpt_interval = LOG_INTERVAL
             if save_ckpt_interval > 0:
                 is_scheduled_ckpt = jnp.equal(
                     update_steps % save_ckpt_interval, 0
                 )
-                is_last_update = jnp.equal(
-                    update_steps, int(config["NUM_UPDATES"]) - 1
-                )
-                run_save_ckpt = jnp.logical_or(
-                    is_scheduled_ckpt, is_last_update
-                )
                 jax.lax.cond(
-                    run_save_ckpt,
+                    is_scheduled_ckpt,
                     lambda _: jax.experimental.io_callback(
                         ckpt_callback, None,
                         train_state.params, train_state.opt_state, train_state.step,

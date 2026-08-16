@@ -35,6 +35,14 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
 - **`target_popart_graph.py`** — PopArt-normalized value target (`target_popart/...`), per layout.
 - **`train_returns_graph.py`** — training return (`train_returns/...`), per layout.
 - **`eval_graph.py`** — eval return (`eval/...`), per layout.
+- **`eval_xp_model_graph.py`** — `config.model_name`별 BC cross-play return
+  (`eval_xp/mean`) 평균 곡선. 여러 run은 모델별로 묶는다. 기본 프로젝트는
+  `icrl`이다. 환경 수가 다른 run도
+  샘플 수 기준으로 비교할 수 있도록 기본 x축을
+  `update_step * NUM_ENVS * NUM_STEPS`로 다시 계산한다. 서로 다른 평가
+  주기는 공통 x-grid로 보간한 뒤 집계하며, 기본적으로 해당 모델 run의
+  절반 이상이 존재하는 구간만 표시한다. 결과는
+  `figures/generated/eval_xp_model_graph/`에 저장한다.
 
 ## Current logging compatibility
 
@@ -61,6 +69,9 @@ python baselines/CEC/figures/analysis/target_raw_graph.py --run-id 5rwobcx9
 python baselines/CEC/figures/analysis/target_popart_graph.py --run-id 5rwobcx9
 python baselines/CEC/figures/analysis/train_returns_graph.py --run-id 5rwobcx9 --smooth-window 20
 python baselines/CEC/figures/analysis/eval_graph.py --run-id 5rwobcx9
+python baselines/CEC/figures/analysis/eval_xp_model_graph.py \
+  --model-names CEC_IDAAC CEC_POP CEC_IDAAC_POP CEC \
+  --x-axis update_step
 ```
 
 Run `python3 <script>.py --help` for the full flag list.

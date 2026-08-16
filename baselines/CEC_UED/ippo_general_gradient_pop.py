@@ -693,8 +693,11 @@ def make_train(
             )
 
             run_eval = jnp.logical_or(
-                jnp.equal(update_steps % LOG_INTERVAL, 0),
-                jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+                jnp.logical_or(
+                    jnp.equal(update_steps % LOG_INTERVAL, 0),
+                    jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+                ),
+                jnp.equal(update_steps, update_step),
             )
 
             layout_gradient_window_steps = int(

@@ -1402,6 +1402,7 @@ def make_train(
                 if (
                     step % LOG_INTERVAL == 0
                     or step == int(config["NUM_UPDATES"]) - 1
+                    or step == update_step
                 ):
                     log_dict = {
                         "update_step": step,

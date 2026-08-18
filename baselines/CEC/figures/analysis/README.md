@@ -37,12 +37,25 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
 - **`eval_graph.py`** — eval return (`eval/...`), per layout.
 - **`eval_xp_model_graph.py`** — `config.model_name`별 BC cross-play return
   (`eval_xp/mean`) 평균 곡선. 여러 run은 모델별로 묶는다. 기본 프로젝트는
-  `icrl`이다. 환경 수가 다른 run도
-  샘플 수 기준으로 비교할 수 있도록 기본 x축을
+  `crossenv_ICLR`이다. 환경 수가 다른 run도
+  샘플 수 기준으로 비교할 수 있도록 x축을
   `update_step * NUM_ENVS * NUM_STEPS`로 다시 계산한다. 서로 다른 평가
   주기는 공통 x-grid로 보간한 뒤 집계하며, 기본적으로 해당 모델 run의
   절반 이상이 존재하는 구간만 표시한다. 결과는
-  `figures/generated/eval_xp_model_graph/`에 저장한다.
+  `figures/results/eval_xp_model_graph/`에 저장한다. `--num-envs`로 하나
+  이상의 `NUM_ENVS` 값에 해당하는 run만 선택할 수 있다. 선은 해당
+  model/NUM_ENVS run들의 평균이고 음영은 최소–최대 범위다. `--seeds`로
+  그래프에 포함할 seed들을 지정할 수 있다.
+- **`eval_xp_comparison_graphs.py`** — `NUM_ENVS=256`에서 generalization
+  technique 비교 그래프만 생성한다. `--num-envs`와 `--seeds`로 포함할
+  환경 수와 seed를 선택할 수 있다.
+  BatchNorm은 현재 존재하는 seed 4/5를 사용한다. LayerNorm seed 0/1은
+  현재 XP 평가가 각각 4개뿐이므로 그래프에 incomplete로 표시한다.
+- **`eval_xp_scaling_graph.py`** — 선택한 seed의 `CEC`, `CEC_IDAAC_POP`에 대해
+  `NUM_ENVS=32, 64, 128, 256` XP environment scaling curve를 두 개의
+  subplot으로 생성한다. `--seeds 0 1`을 사용하면 선은 seed 평균, 음영은
+  seed 최소–최대 범위를 나타낸다. 출력 파일명에는 선택한 seed가 자동으로
+  포함된다.
 
 ## Current logging compatibility
 
@@ -71,7 +84,10 @@ python baselines/CEC/figures/analysis/train_returns_graph.py --run-id 5rwobcx9 -
 python baselines/CEC/figures/analysis/eval_graph.py --run-id 5rwobcx9
 python baselines/CEC/figures/analysis/eval_xp_model_graph.py \
   --model-names CEC_IDAAC CEC_POP CEC_IDAAC_POP CEC \
-  --x-axis update_step
+  --num-envs 256 \
+  --seeds 0 1
+python baselines/CEC/figures/analysis/eval_xp_comparison_graphs.py
+python baselines/CEC/figures/analysis/eval_xp_scaling_graph.py
 ```
 
 Run `python3 <script>.py --help` for the full flag list.

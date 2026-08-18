@@ -17,7 +17,10 @@ SMOOTH_WINDOW = 1
 MIN_RUN_FRACTION = 0.5
 
 SAVE_DIR = Path(__file__).parent.parent / "results" / "eval_xp_model_graph"
-MODEL_COLORS = ["#7f56d9", "#e66b2e", "#ef3e4a", "#df70d6"]
+MODEL_COLORS = [
+    "#7f56d9", "#e66b2e", "#ef3e4a", "#df70d6", "#55a868",
+    "#f2a65a", "#4c72b0", "#c44e52", "#8172b2", "#ccb974",
+]
 
 
 def parse_args():
@@ -25,6 +28,8 @@ def parse_args():
     parser.add_argument("--entity", default=ENTITY)
     parser.add_argument("--project", default=PROJECT)
     parser.add_argument("--model-names", nargs="+", default=MODEL_NAMES)
+    parser.add_argument("--num-envs", type=int, nargs="+")
+    parser.add_argument("--seeds", type=int, nargs="+")
     parser.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW)
     parser.add_argument("--min-run-fraction", type=float, default=MIN_RUN_FRACTION)
     parser.add_argument("--output", type=Path)
@@ -113,8 +118,10 @@ def fetch_model_histories(
     return pd.concat(histories, ignore_index=True), run_counts
 
 
-def aggregate_histories(histories, model_name: str):
+def aggregate_histories(histories, model_name: str, num_envs=None):
     model_history = histories[histories["model_name"] == model_name]
+    if num_envs is not None:
+        model_history = model_history[model_history["num_envs"] == num_envs]
     per_run = (
         model_history.groupby(["run_id", "env_step"], as_index=False)[
             "eval_xp/mean"
@@ -122,7 +129,9 @@ def aggregate_histories(histories, model_name: str):
         .mean()
     )
     if per_run.empty:
-        return pd.DataFrame(columns=["env_step", "mean", "count"])
+        return pd.DataFrame(
+            columns=["env_step", "mean", "minimum", "maximum", "count"]
+        )
 
     # Evaluation intervals can differ with NUM_ENVS. Interpolate each run onto
     # one common grid so the model average does not alternate between subsets
@@ -141,6 +150,8 @@ def aggregate_histories(histories, model_name: str):
         {
             "env_step": grid,
             "mean": values.mean(axis=0).to_numpy(),
+            "minimum": values.min(axis=0).to_numpy(),
+            "maximum": values.max(axis=0).to_numpy(),
             "count": values.count(axis=0).to_numpy(),
         }
     )
@@ -148,25 +159,38 @@ def aggregate_histories(histories, model_name: str):
 
 def plot_eval_xp_by_model(
     histories,
-    run_counts,
     model_names,
     smooth_window: int,
     min_run_fraction: float,
     out_path: Path,
     title: str = "BC Cross-Play Evaluation by Model",
     label_suffixes=None,
+    num_envs_values=None,
 ):
     if smooth_window < 1:
         raise ValueError("smooth_window must be at least 1")
     if not 0.0 < min_run_fraction <= 1.0:
         raise ValueError("min_run_fraction must be in (0, 1]")
 
-    fig, ax = plt.subplots(figsize=(9, 5.5))
+    fig, ax = plt.subplots(figsize=(11.5, 5.5))
+    if num_envs_values:
+        series = [
+            (model_name, int(num_envs))
+            for model_name in model_names
+            for num_envs in num_envs_values
+        ]
+    else:
+        series = [(model_name, None) for model_name in model_names]
+
     plotted = 0
-    for index, model_name in enumerate(model_names):
-        stats = aggregate_histories(histories, model_name)
+    for index, (model_name, num_envs) in enumerate(series):
+        stats = aggregate_histories(histories, model_name, num_envs)
+        group_history = histories[histories["model_name"] == model_name]
+        if num_envs is not None:
+            group_history = group_history[group_history["num_envs"] == num_envs]
+        group_run_count = group_history["run_id"].nunique()
         minimum_runs = max(
-            1, int(np.ceil(run_counts[model_name] * min_run_fraction))
+            1, int(np.ceil(group_run_count * min_run_fraction))
         )
         stats = stats[stats["count"] >= minimum_runs]
         if stats.empty:
@@ -174,14 +198,35 @@ def plot_eval_xp_by_model(
             continue
 
         mean = stats["mean"].rolling(smooth_window, min_periods=1).mean()
+        minimum = stats["minimum"].rolling(
+            smooth_window, min_periods=1
+        ).mean()
+        maximum = stats["maximum"].rolling(
+            smooth_window, min_periods=1
+        ).mean()
         color = MODEL_COLORS[index % len(MODEL_COLORS)]
         suffix = "" if label_suffixes is None else label_suffixes.get(model_name, "")
+        if num_envs is None:
+            label = f"{model_name}{suffix} (n={group_run_count})"
+        else:
+            label = (
+                f"NUM_ENVS: {num_envs}, model_name: {model_name}{suffix} "
+                f"(n={group_run_count})"
+            )
         ax.plot(
             stats["env_step"],
             mean,
             color=color,
             linewidth=2,
-            label=f"{model_name}{suffix} (n={run_counts[model_name]})",
+            label=label,
+        )
+        ax.fill_between(
+            stats["env_step"],
+            minimum,
+            maximum,
+            color=color,
+            alpha=0.16,
+            linewidth=0,
         )
         plotted += 1
 
@@ -190,9 +235,18 @@ def plot_eval_xp_by_model(
 
     ax.set_xlabel("Environment Steps")
     ax.set_ylabel("Eval XP Return")
-    ax.set_title(title)
+    ax.margins(x=0)
+    ax.set_title(title, pad=54)
     ax.grid(alpha=0.3)
-    ax.legend(fontsize=9)
+    ax.legend(
+        fontsize=8,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 1.01),
+        ncol=3,
+        columnspacing=1.0,
+        handletextpad=0.5,
+        frameon=False,
+    )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
@@ -202,17 +256,48 @@ def plot_eval_xp_by_model(
 
 def main():
     args = parse_args()
-    histories, run_counts = fetch_model_histories(
-        args.entity, args.project, args.model_names
+    seeds_by_model = None
+    if args.seeds:
+        seeds_by_model = {
+            model_name: tuple(args.seeds) for model_name in args.model_names
+        }
+    histories, _ = fetch_model_histories(
+        args.entity,
+        args.project,
+        args.model_names,
+        num_envs=args.num_envs,
+        seeds_by_model=seeds_by_model,
     )
-    output = args.output or (SAVE_DIR / "eval_xp_by_model_env_step.png")
+    filename_parts = ["eval_xp_by_model"]
+    title_filters = []
+    if args.num_envs:
+        num_envs_label = "_".join(str(value) for value in args.num_envs)
+        filename_parts.append(f"num_envs{num_envs_label}")
+        title_filters.append(
+            f"NUM_ENVS={','.join(str(value) for value in args.num_envs)}"
+        )
+    if args.seeds:
+        title_filters.append(
+            f"SEEDS={','.join(str(seed) for seed in args.seeds)}"
+        )
+    filename_parts.append("env_step")
+    default_filename = "_".join(filename_parts) + ".png"
+    if title_filters:
+        title = (
+            "BC Cross-Play Evaluation by Model "
+            f"({'; '.join(title_filters)})"
+        )
+    else:
+        title = "BC Cross-Play Evaluation by Model"
+    output = args.output or (SAVE_DIR / default_filename)
     plot_eval_xp_by_model(
         histories=histories,
-        run_counts=run_counts,
         model_names=args.model_names,
         smooth_window=args.smooth_window,
         min_run_fraction=args.min_run_fraction,
         out_path=output,
+        title=title,
+        num_envs_values=args.num_envs,
     )
 
 

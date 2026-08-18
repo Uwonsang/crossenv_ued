@@ -1,0 +1,82 @@
+"ENV_NAME": "ToyCoopNoPink"
+"LR": 3e-4
+"NUM_ENVS": 64
+"NUM_SEEDS": 1
+"NUM_STEPS": 100
+"FC_DIM_SIZE": 256
+"GRU_HIDDEN_DIM": 256
+"TOTAL_TIMESTEPS": 1e8
+"MAX_TRAIN_STEPS": 1e8
+"UPDATE_EPOCHS": 32
+"NUM_MINIBATCHES": 2
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"SCALE_CLIP_EPS": false
+"ENT_COEF": 0.005
+"VF_COEF": 1.0
+"MOA_COEF": 1.0
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ANNEAL_LR": true
+"SEED": 0
+
+"ENV_KWARGS":
+  "random_reset": false
+  "max_steps": 100
+  "check_held_out": false
+  "debug": false
+  "partial_obs": false
+  "incentivize_strat": 2
+  "shuffle_inv_and_pot": false
+  "layout": "empty"
+  "random_reset_fn": "reset_all"
+
+"TRAINING": true
+"TRAIN_KWARGS":
+  "ckpt_id": 0
+  "overwrite_ckpt": true
+  "finetune": false
+  "e3t_beta": 0.55
+
+"TEST_KWARGS":
+  "beta": 1.0
+  "argmax": false
+  "num_trajs": 2
+  "plot": false
+  "self_play": false
+  "ik": false
+  "debug": false
+  "use_ckpt": true
+
+"CONV_NET": true
+"LSTM": true
+"FCP": false
+"FCP_KWARGS":
+  "train_oracle": false
+
+"ENTITY": "overcooked_ai"
+"PROJECT": "crossenv_ued_ICLR_dual_destination"
+"WANDB_MODE": "online"
+"model_name": "E3T"
+
+"save_frames": false
+"save_frames_interval": 200
+"save_env_state": false
+"save_env_state_interval": 10
+
+"EVAL_KWARGS":
+  "num_envs": 5
+  "num_steps": 100
+  "max_steps": 100
+  "random_reset": false
+  "check_held_out": false
+  "shuffle_inv_and_pot": false
+  "random_reset_fn": "reset_all"
+  "beta": 1.0
+  "argmax": false
+  "eval_xp": false
+  "human_proxy_ckpt_dir": "baselines/human_proxy/checkpoints"
+  "human_proxy_num_seeds": 5
+
+"map_name": "empty"

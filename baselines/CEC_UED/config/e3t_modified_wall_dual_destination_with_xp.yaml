@@ -66,6 +66,7 @@
 "save_env_state_interval": 10
 
 "EVAL_KWARGS":
+  "eval_interval": 25
   "num_envs": 5
   "num_steps": 100
   "max_steps": 100
@@ -80,3 +81,16 @@
   "human_proxy_num_seeds": 5
 
 "map_name": "empty"
+"layout_names":
+  - "empty"
+  - "wall_a"
+
+"XP_KWARGS":
+  "enabled": false
+  "partner_seed": 98
+  "num_envs": 5
+  "num_steps": 100
+  "beta": 1.0
+  "argmax": false
+
+

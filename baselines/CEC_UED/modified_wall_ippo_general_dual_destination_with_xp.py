@@ -89,14 +89,25 @@ def load_xp_partner_params(config):
     xp_cfg = config.get("XP_KWARGS", {})
     partner_seed = int(xp_cfg.get("partner_seed", 98))
     root = toy_ckpt_root(config)
-    path = latest_match([
-        f"{root}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/cec_layout_eval/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
-    ])
+    if not config["ENV_KWARGS"]["random_reset"]:
+        patterns = [
+            f"{root}/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/ippo_layout_eval/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
+            f"{root}/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/ippo/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
+        ]
+        partner_name = "IPPO"
+    else:
+        patterns = [
+            f"{root}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/cec_layout_eval/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
+        ]
+        partner_name = "CEC"
+    path = latest_match(patterns)
     if path is None:
-        raise FileNotFoundError(f"Missing CEC XP partner seed{partner_seed} under {root}")
+        raise FileNotFoundError(
+            f"Missing {partner_name} XP partner seed{partner_seed} under {root}"
+        )
     with open(path, "rb") as f:
         ckpt = pickle.load(f)
-    print(f"Loaded XP partner CEC seed{partner_seed}: {path}")
+    print(f"Loaded XP partner {partner_name} seed{partner_seed}: {path}")
     return ckpt["params"], path
 
 def make_fixed_toy_env_kwargs(config, map_name):

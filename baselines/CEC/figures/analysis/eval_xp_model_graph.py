@@ -13,11 +13,10 @@ import wandb
 ENTITY = "overcooked_ai"
 PROJECT = "crossenv_ICLR"
 MODEL_NAMES = ["CEC_IDAAC", "CEC_POP", "CEC_IDAAC_POP", "CEC"]
-X_AXIS = "env_step"
 SMOOTH_WINDOW = 1
 MIN_RUN_FRACTION = 0.5
 
-SAVE_DIR = Path(__file__).parent.parent / "generated" / "eval_xp_model_graph"
+SAVE_DIR = Path(__file__).parent.parent / "results" / "eval_xp_model_graph"
 MODEL_COLORS = ["#7f56d9", "#e66b2e", "#ef3e4a", "#df70d6"]
 
 
@@ -26,20 +25,29 @@ def parse_args():
     parser.add_argument("--entity", default=ENTITY)
     parser.add_argument("--project", default=PROJECT)
     parser.add_argument("--model-names", nargs="+", default=MODEL_NAMES)
-    parser.add_argument(
-        "--x-axis", default=X_AXIS, choices=["env_step", "update_step"]
-    )
     parser.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW)
     parser.add_argument("--min-run-fraction", type=float, default=MIN_RUN_FRACTION)
     parser.add_argument("--output", type=Path)
     return parser.parse_args()
 
 
-def fetch_model_histories(entity: str, project: str, model_names):
+def fetch_model_histories(
+    entity: str,
+    project: str,
+    model_names,
+    num_envs=None,
+    seeds_by_model=None,
+):
     api = wandb.Api()
+    filters = {"config.model_name": {"$in": list(model_names)}}
+    if num_envs is not None:
+        if isinstance(num_envs, (list, tuple, set)):
+            filters["config.NUM_ENVS"] = {"$in": [int(n) for n in num_envs]}
+        else:
+            filters["config.NUM_ENVS"] = int(num_envs)
     runs = api.runs(
         f"{entity}/{project}",
-        filters={"config.model_name": {"$in": list(model_names)}},
+        filters=filters,
     )
 
     histories = []
@@ -48,6 +56,10 @@ def fetch_model_histories(entity: str, project: str, model_names):
         model_name = run.config.get("model_name")
         if model_name not in run_counts:
             continue
+        if seeds_by_model is not None:
+            allowed_seeds = seeds_by_model.get(model_name, ())
+            if int(run.config.get("SEED", -1)) not in allowed_seeds:
+                continue
 
         history = run.history(
             keys=["_step", "env_step", "update_step", "eval_xp/mean"],
@@ -85,11 +97,11 @@ def fetch_model_histories(entity: str, project: str, model_names):
         # Recompute this instead of trusting old runs' env_step field: some
         # trainers historically logged the raw update index under that name.
         history["env_step"] = history["update_step"] * steps_per_update
-        history = history[
-            ["env_step", "update_step", "eval_xp/mean"]
-        ].dropna()
+        history = history[["env_step", "eval_xp/mean"]].dropna()
         history["model_name"] = model_name
         history["run_id"] = run.id
+        history["num_envs"] = int(run.config["NUM_ENVS"])
+        history["seed"] = int(run.config["SEED"])
         histories.append(history)
         run_counts[model_name] += 1
 
@@ -101,23 +113,25 @@ def fetch_model_histories(entity: str, project: str, model_names):
     return pd.concat(histories, ignore_index=True), run_counts
 
 
-def aggregate_histories(histories, model_name: str, x_axis: str):
+def aggregate_histories(histories, model_name: str):
     model_history = histories[histories["model_name"] == model_name]
     per_run = (
-        model_history.groupby(["run_id", x_axis], as_index=False)["eval_xp/mean"]
+        model_history.groupby(["run_id", "env_step"], as_index=False)[
+            "eval_xp/mean"
+        ]
         .mean()
     )
     if per_run.empty:
-        return pd.DataFrame(columns=[x_axis, "mean", "count"])
+        return pd.DataFrame(columns=["env_step", "mean", "count"])
 
     # Evaluation intervals can differ with NUM_ENVS. Interpolate each run onto
     # one common grid so the model average does not alternate between subsets
     # of runs at adjacent x positions.
-    grid = np.linspace(per_run[x_axis].min(), per_run[x_axis].max(), 500)
+    grid = np.linspace(per_run["env_step"].min(), per_run["env_step"].max(), 500)
     interpolated = []
     for _, run_history in per_run.groupby("run_id"):
-        run_history = run_history.sort_values(x_axis)
-        x = run_history[x_axis].to_numpy(dtype=float)
+        run_history = run_history.sort_values("env_step")
+        x = run_history["env_step"].to_numpy(dtype=float)
         y = run_history["eval_xp/mean"].to_numpy(dtype=float)
         values = np.interp(grid, x, y, left=np.nan, right=np.nan)
         interpolated.append(values)
@@ -125,7 +139,7 @@ def aggregate_histories(histories, model_name: str, x_axis: str):
     values = pd.DataFrame(np.stack(interpolated), columns=grid)
     return pd.DataFrame(
         {
-            x_axis: grid,
+            "env_step": grid,
             "mean": values.mean(axis=0).to_numpy(),
             "count": values.count(axis=0).to_numpy(),
         }
@@ -136,10 +150,11 @@ def plot_eval_xp_by_model(
     histories,
     run_counts,
     model_names,
-    x_axis: str,
     smooth_window: int,
     min_run_fraction: float,
     out_path: Path,
+    title: str = "BC Cross-Play Evaluation by Model",
+    label_suffixes=None,
 ):
     if smooth_window < 1:
         raise ValueError("smooth_window must be at least 1")
@@ -149,7 +164,7 @@ def plot_eval_xp_by_model(
     fig, ax = plt.subplots(figsize=(9, 5.5))
     plotted = 0
     for index, model_name in enumerate(model_names):
-        stats = aggregate_histories(histories, model_name, x_axis)
+        stats = aggregate_histories(histories, model_name)
         minimum_runs = max(
             1, int(np.ceil(run_counts[model_name] * min_run_fraction))
         )
@@ -160,23 +175,22 @@ def plot_eval_xp_by_model(
 
         mean = stats["mean"].rolling(smooth_window, min_periods=1).mean()
         color = MODEL_COLORS[index % len(MODEL_COLORS)]
+        suffix = "" if label_suffixes is None else label_suffixes.get(model_name, "")
         ax.plot(
-            stats[x_axis],
+            stats["env_step"],
             mean,
             color=color,
             linewidth=2,
-            label=f"{model_name} (n={run_counts[model_name]})",
+            label=f"{model_name}{suffix} (n={run_counts[model_name]})",
         )
         plotted += 1
 
     if plotted == 0:
         raise RuntimeError("No model curves could be plotted.")
 
-    ax.set_xlabel(
-        "Environment Steps" if x_axis == "env_step" else "Update Step"
-    )
+    ax.set_xlabel("Environment Steps")
     ax.set_ylabel("Eval XP Return")
-    ax.set_title("BC Cross-Play Evaluation by Model")
+    ax.set_title(title)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=9)
     fig.tight_layout()
@@ -191,14 +205,11 @@ def main():
     histories, run_counts = fetch_model_histories(
         args.entity, args.project, args.model_names
     )
-    output = args.output or (
-        SAVE_DIR / f"eval_xp_by_model_{args.x_axis}.png"
-    )
+    output = args.output or (SAVE_DIR / "eval_xp_by_model_env_step.png")
     plot_eval_xp_by_model(
         histories=histories,
         run_counts=run_counts,
         model_names=args.model_names,
-        x_axis=args.x_axis,
         smooth_window=args.smooth_window,
         min_run_fraction=args.min_run_fraction,
         out_path=output,

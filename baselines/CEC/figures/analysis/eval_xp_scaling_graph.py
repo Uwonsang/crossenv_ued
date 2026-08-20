@@ -122,6 +122,7 @@ def plot_scaling(histories, seeds, smooth_window, output):
 
         ax.set_title(model_name)
         ax.set_xlabel("Environment Steps")
+        ax.margins(x=0)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=9)
 

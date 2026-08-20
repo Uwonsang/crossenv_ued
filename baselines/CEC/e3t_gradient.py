@@ -9,7 +9,6 @@ import glob
 import pickle
 import jax
 import jax.numpy as jnp
-import flax
 import flax.linen as nn
 import numpy as np
 import optax
@@ -40,17 +39,17 @@ from baselines.CEC.evaluation_rollout_utils import (
     evaluate_cross_play_layout,
     evaluate_self_play_layout,
 )
-from baselines.CEC_UED.evaluation_metrics import (
-    EVAL_CRITIC_STAT_NAMES,
-    add_evaluation_metrics_to_log_dict,
-    empty_evaluation_metrics,
-)
 from baselines.CEC_UED.value_diagnostics import compute_value_diagnostics
 from baselines.CEC_UED.representation_metrics import (
     compute_optimizer_update_metrics,
     compute_minibatch_penultimate_metrics,
     empty_penultimate_metrics,
     first_epoch_first_minibatch_indices,
+)
+from baselines.CEC_UED.evaluation_metrics import (
+    EVAL_CRITIC_STAT_NAMES,
+    add_evaluation_metrics_to_log_dict,
+    empty_evaluation_metrics,
 )
 from baselines.CEC_UED.sharpness import (
     collect_final_sharpness_batch,
@@ -69,12 +68,15 @@ from baselines.CEC_UED.gradient_conflict_utils import (
 LAYOUT_NAMES = tuple(EVAL_LAYOUTS_9)
 
 
-def _e3t_idaac_parameter_groups(config):
-    """Return parameter module names for the instantiated E3T-IDAAC model."""
+def _e3t_parameter_groups(config):
+    """Return parameter module names for the instantiated E3T network."""
     shared_keys = ["Dense_0", "Dense_1", "ScannedRNN_0"]
     if config["CONV_NET"]:
         shared_keys = ["Conv_0", "Conv_1", *shared_keys]
 
+    # Dense_2..Dense_6 form the model-of-other-agent branch and therefore
+    # belong to the actor path. Overcooked adds one actor hidden layer and two
+    # critic hidden layers, shifting the subsequent Flax module indices.
     if config["ENV_NAME"] == "overcooked":
         actor_branch_keys = [f"Dense_{index}" for index in range(2, 12)]
         value_branch_keys = [f"Dense_{index}" for index in range(12, 17)]
@@ -82,16 +84,13 @@ def _e3t_idaac_parameter_groups(config):
         actor_branch_keys = [f"Dense_{index}" for index in range(2, 11)]
         value_branch_keys = [f"Dense_{index}" for index in range(11, 14)]
 
-    actor_branch_keys.extend(["advantage_output", "order_classifier_output"])
-    if config["IDAAC_USE_NONLINEAR_CLF"]:
-        actor_branch_keys.append("order_classifier_hidden")
-
     shared_keys = tuple(shared_keys)
     return (
         (*shared_keys, *actor_branch_keys),
         (*shared_keys, *value_branch_keys),
         shared_keys,
     )
+
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -204,6 +203,7 @@ def _classify_layout_jax(maze_map_9x9_ch0):
         ),
     ).astype(jnp.int32)
 
+
 class ScannedRNN(nn.Module):
     @functools.partial(
         nn.scan,
@@ -239,14 +239,7 @@ class ActorCriticRNN(nn.Module):
     config: Dict
 
     @nn.compact
-    def __call__(
-        self,
-        hidden,
-        x,
-        return_advantages=False,
-        order_swap=None,
-        detach_order_features=False,
-    ):
+    def __call__(self, hidden, x):
         obs, dones, agent_positions = x
         batch_size, num_envs, _ = obs.shape
         collect_intermediates = (
@@ -358,47 +351,6 @@ class ActorCriticRNN(nn.Module):
         if not self.is_initializing():
             self.sow("intermediates", "actor_penultimate", actor_mean)
 
-        # DAAC auxiliary task: predict the normalized GAE for every action
-        # from the same policy features used by the actor output. The loss
-        # selects only the prediction for the sampled action.
-        advantage_predictions = nn.Dense(
-            self.action_dim,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-            name="advantage_output",
-        )(actor_mean)
-
-        # IDAAC temporal-order adversary. Consecutive policy features are
-        # randomly presented in their original or reversed temporal order.
-        next_actor_mean = jnp.roll(actor_mean, shift=-1, axis=0)
-        if order_swap is None:
-            order_swap = jnp.zeros(actor_mean.shape[:2], dtype=bool)
-        first_features = jnp.where(
-            order_swap[..., None], next_actor_mean, actor_mean
-        )
-        second_features = jnp.where(
-            order_swap[..., None], actor_mean, next_actor_mean
-        )
-        order_features = jnp.concatenate(
-            (first_features, second_features), axis=-1
-        )
-        if detach_order_features:
-            order_features = jax.lax.stop_gradient(order_features)
-        if self.config["IDAAC_USE_NONLINEAR_CLF"]:
-            order_features = nn.Dense(
-                self.config["IDAAC_CLF_HIDDEN_SIZE"],
-                kernel_init=orthogonal(np.sqrt(2)),
-                bias_init=constant(0.0),
-                name="order_classifier_hidden",
-            )(order_features)
-            order_features = nn.relu(order_features)
-        order_logits = nn.Dense(
-            1,
-            kernel_init=orthogonal(1.0),
-            bias_init=constant(0.0),
-            name="order_classifier_output",
-        )(order_features).squeeze(-1)
-
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        
@@ -435,10 +387,7 @@ class ActorCriticRNN(nn.Module):
             critic
         )
 
-        outputs = (hidden, pi, jnp.squeeze(critic, axis=-1), other_pi)
-        if return_advantages:
-            return outputs + (advantage_predictions, order_logits)
-        return outputs
+        return hidden, pi, jnp.squeeze(critic, axis=-1), other_pi
 
 
 class Transition(NamedTuple):
@@ -455,43 +404,14 @@ class Transition(NamedTuple):
     other_action: jnp.ndarray
 
 
-def _idaac_order_mask(traj_batch):
-    not_last = (
-        jnp.arange(traj_batch.done.shape[0])[:, None]
-        < traj_batch.done.shape[0] - 1
-    )
-    next_is_reset = jnp.roll(traj_batch.done, shift=-1, axis=0)
-    return (not_last & ~next_is_reset).astype(jnp.float32)
-
-
-def _masked_mean(values, mask):
-    return (values * mask).sum() / jnp.maximum(mask.sum(), 1.0)
-
-
-def e3t_idaac_loss(
-    network,
-    params,
-    initial_hstate,
-    traj_batch,
-    advantages,
-    targets,
-    order_swap,
-    config,
+def e3t_ppo_loss(
+    network, params, initial_hstate, traj_batch, advantages, targets, config
 ):
-    """E3T-IDAAC objective shared by training and final sharpness."""
-    (
-        _,
-        pi,
-        value,
-        other_pi,
-        advantage_predictions,
-        order_logits,
-    ) = network.apply(
+    """E3T PPO objective shared by training and final sharpness."""
+    _, pi, value, other_pi = network.apply(
         params,
         initial_hstate,
         (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
-        return_advantages=True,
-        order_swap=order_swap,
     )
     log_prob = pi.log_prob(traj_batch.action)
     other_log_prob = other_pi.log_prob(traj_batch.other_action)
@@ -508,35 +428,6 @@ def e3t_idaac_loss(
     normalized_advantages = (
         (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     )
-    predicted_advantage = jnp.take_along_axis(
-        advantage_predictions,
-        traj_batch.action[..., None],
-        axis=-1,
-    ).squeeze(-1)
-    advantage_loss = 0.5 * jnp.square(
-        predicted_advantage - jax.lax.stop_gradient(normalized_advantages)
-    ).mean()
-
-    order_mask = _idaac_order_mask(traj_batch)
-    classifier_loss = _masked_mean(
-        optax.sigmoid_binary_cross_entropy(
-            order_logits, order_swap.astype(jnp.float32)
-        ),
-        order_mask,
-    )
-    order_loss = _masked_mean(
-        optax.sigmoid_binary_cross_entropy(
-            order_logits, jnp.full_like(order_logits, 0.5)
-        ),
-        order_mask,
-    )
-    order_accuracy = _masked_mean(
-        (
-            (jax.nn.sigmoid(order_logits) >= 0.5) == order_swap
-        ).astype(jnp.float32),
-        order_mask,
-    )
-
     logratio = log_prob - traj_batch.log_prob
     ratio = jnp.exp(logratio)
     actor_loss = -jnp.minimum(
@@ -552,42 +443,16 @@ def e3t_idaac_loss(
         actor_loss
         + config["MOA_COEF"] * moa_nll_loss
         + config["VF_COEF"] * value_loss
-        + config["DAAC_ADV_COEF"] * advantage_loss
-        + config["IDAAC_ORDER_COEF"] * order_loss
         - config["ENT_COEF"] * entropy
     )
     return total_loss, (
         value_loss,
         actor_loss,
-        advantage_loss,
-        order_loss,
-        classifier_loss,
-        order_accuracy,
         entropy,
         ratio,
         approx_kl,
         clip_frac,
         moa_nll_loss,
-    )
-
-
-def e3t_idaac_classifier_loss(
-    network, params, initial_hstate, traj_batch, order_swap
-):
-    """Temporal-order classifier loss used for its separate optimizer step."""
-    *_, order_logits = network.apply(
-        params,
-        initial_hstate,
-        (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
-        return_advantages=True,
-        order_swap=order_swap,
-        detach_order_features=True,
-    )
-    return _masked_mean(
-        optax.sigmoid_binary_cross_entropy(
-            order_logits, order_swap.astype(jnp.float32)
-        ),
-        _idaac_order_mask(traj_batch),
     )
 
 def batchify(x: dict, agent_list, num_actors):
@@ -604,11 +469,7 @@ def make_train(
     config, update_step=0, save_info=None, opt_state=None,
     train_state_step=None,
 ):
-    config.setdefault("DAAC_ADV_COEF", 0.25)
-    config.setdefault("IDAAC_CLF_LR", config["LR"])
-    config.setdefault("IDAAC_ORDER_COEF", 0.001)
-    config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
-    config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
+    # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     surface_layout_name = config["ENV_KWARGS"]["layout"]
     env = initialize_environment(config)
     
@@ -616,11 +477,7 @@ def make_train(
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = (
-        0 if opt_state is not None
-        else update_step
-        * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
-    )
+    resume_update_step = 0 if opt_state is not None else update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -636,12 +493,12 @@ def make_train(
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     config["ACTION_DIM"] = env.action_space(env.agents[0]).n
     actor_trunk_keys, value_trunk_keys, shared_trunk_keys = (
-        _e3t_idaac_parameter_groups(config)
+        _e3t_parameter_groups(config)
     )
 
     surface_settings = build_critic_loss_surface_settings(
         config,
-        algorithm="E3T_IDAAC",
+        algorithm="E3T",
         layout=surface_layout_name,
         actor_trunk_keys=actor_trunk_keys,
         value_trunk_keys=value_trunk_keys,
@@ -674,14 +531,14 @@ def make_train(
     )
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
 
-    def linear_schedule(count, initial_lr):
+    def linear_schedule(count):
         frac = (
             1.0
             - ((count + resume_update_step) // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]))
             / config["MAX_TRAIN_UPDATES"]
         )
         frac = jnp.maximum(1e-9, frac)
-        return initial_lr * frac
+        return config["LR"] * frac
 
     remaining_updates = int(config["NUM_UPDATES"]) - update_step
 
@@ -705,54 +562,28 @@ def make_train(
         network_params = network.init(_rng, init_hstate, init_x)
         if model_params is not None:
             network_params = model_params
-        network_params = flax.core.freeze(network_params)
-
-        param_labels = flax.core.freeze(
-            flax.traverse_util.path_aware_map(
-                lambda path, _: (
-                    "classifier"
-                    if any(
-                        "order_classifier" in str(key) for key in path
-                    )
-                    else "main"
-                ),
-                network_params,
-            )
-        )
-        classifier_param_mask = jax.tree.map(
-            lambda label: label == "classifier", param_labels
-        )
-
-        def optimizer(learning_rate):
-            if config["ANNEAL_LR"]:
-                schedule = functools.partial(
-                    linear_schedule, initial_lr=learning_rate
-                )
-            else:
-                schedule = learning_rate
-            return optax.chain(
+        if config["ANNEAL_LR"]:
+            tx = optax.chain(
                 optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-                optax.adam(learning_rate=schedule, eps=1e-5),
+                optax.adam(learning_rate=linear_schedule, eps=1e-5),
             )
-
-        tx = optax.multi_transform(
-            {
-                "main": optimizer(config["LR"]),
-                "classifier": optimizer(config["IDAAC_CLF_LR"]),
-            },
-            param_labels,
-        )
+        else:
+            tx = optax.chain(
+                optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
+                optax.adam(config["LR"], eps=1e-5),
+            )
         train_state = TrainState.create(
             apply_fn=network.apply,
             params=network_params,
             tx=tx,
         )
         if opt_state is not None:
-            train_state = train_state.replace(opt_state=opt_state)
-        if train_state_step is not None:
-            train_state = train_state.replace(step=train_state_step)
+            train_state = train_state.replace(
+                opt_state=opt_state,
+                step=train_state.step if train_state_step is None else train_state_step,
+            )
 
-        # INIT ENV
+        # INIT OR RESTORE ENV RUNNER STATE
         if resume_runner_state is None:
             rng, _rng = jax.random.split(rng)
             reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
@@ -763,12 +594,10 @@ def make_train(
             rng, runner_rng = jax.random.split(rng)
             initial_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
         else:
-            env_state, obsv, initial_done, init_hstate, runner_rng = (
-                resume_runner_state
-            )
+            env_state, obsv, initial_done, init_hstate, runner_rng = resume_runner_state
 
-        # Match ippo_general_gradient.py: average training scalars between the
-        # roughly 100 logging/evaluation points retained for each run.
+        # Match ippo_general_gradient.py: aggregate frequent training scalars
+        # and emit roughly 100 WandB points over the complete run.
         _log_accum = {
             "sum": {},
             "count": {},
@@ -978,7 +807,8 @@ def make_train(
 
             def _compute_layout_gradient(_):
                 gradient_traj = jax.tree.map(
-                    lambda value: value[:gradient_window_steps], traj_batch
+                    lambda value: value[:gradient_window_steps],
+                    traj_batch,
                 )
                 return compute_layout_gradient_metrics(
                     network=network,
@@ -1046,68 +876,22 @@ def make_train(
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
-                    (
-                        init_hstate,
-                        traj_batch,
-                        advantages,
-                        targets,
-                        order_swap,
-                    ) = batch_info
+                    init_hstate, traj_batch, advantages, targets = batch_info
 
-                    def _loss_fn(
-                        params,
-                        init_hstate,
-                        traj_batch,
-                        gae,
-                        targets,
-                        order_swap,
-                    ):
-                        return e3t_idaac_loss(
+                    def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                        return e3t_ppo_loss(
                             network,
                             params,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
                             traj_batch,
                             gae,
                             targets,
-                            order_swap,
                             config,
-                        )
-
-                    def _classifier_loss_fn(
-                        params, init_hstate, traj_batch, order_swap,
-                    ):
-                        return e3t_idaac_classifier_loss(
-                            network,
-                            params,
-                            jax.tree.map(lambda h: h.squeeze(), init_hstate),
-                            traj_batch,
-                            order_swap,
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
                     total_loss, grads = grad_fn(
-                        train_state.params,
-                        init_hstate,
-                        traj_batch,
-                        advantages,
-                        targets,
-                        order_swap,
-                    )
-                    classifier_grads = jax.grad(_classifier_loss_fn)(
-                        train_state.params,
-                        init_hstate,
-                        traj_batch,
-                        order_swap,
-                    )
-                    grads = jax.tree.map(
-                        lambda main_grad, classifier_grad, is_classifier: (
-                            classifier_grad
-                            if is_classifier
-                            else main_grad
-                        ),
-                        grads,
-                        classifier_grads,
-                        classifier_param_mask,
+                        train_state.params, init_hstate, traj_batch, advantages, targets
                     )
                     optimizer_metrics = compute_optimizer_update_metrics(
                         gradients=grads,
@@ -1132,22 +916,16 @@ def make_train(
                     targets,
                     rng,
                 ) = update_state
-                rng, permutation_rng, order_rng = jax.random.split(rng, 3)
+                rng, _rng = jax.random.split(rng)
 
                 init_hstate = jax.tree.map(lambda h: jnp.reshape(h, (1, config["NUM_ACTORS"], -1)), init_hstate)
-                order_swap = jax.random.bernoulli(
-                    order_rng, shape=traj_batch.done.shape
-                )
                 batch = (
                     init_hstate,
                     traj_batch,
                     advantages.squeeze(),
                     targets.squeeze(),
-                    order_swap,
                 )
-                permutation = jax.random.permutation(
-                    permutation_rng, config["NUM_ACTORS"]
-                )
+                permutation = jax.random.permutation(_rng, config["NUM_ACTORS"])
 
                 shuffled_batch = jax.tree_util.tree_map(
                     lambda x: jnp.take(x, permutation, axis=1), batch
@@ -1192,6 +970,9 @@ def make_train(
             )
             train_state = update_state[0]
 
+            # Save the final model immediately after the last optimizer update.
+            # This mirrors ippo_general_gradient.py so later evaluation/logging
+            # cannot prevent the final checkpoint from being written.
             if save_info is not None:
                 num_updates_total = save_info["num_updates"]
 
@@ -1254,24 +1035,21 @@ def make_train(
 
             episode_returns_step = metric["returned_episode_returns"][:, :, 0]
             episode_done_step = metric["returned_episode"][:, :, 0].astype(bool)
+
             # Keep the scan output and host callback payload scalar-sized.
             metric = jax.tree.map(lambda x: x.mean(), metric)
-            ratio_0 = loss_info[1][7].at[0,0].get().mean()
+            ratio_0 = loss_info[1][3].at[0,0].get().mean()
             loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
                 "total_loss": loss_info[0],
                 "value_loss": loss_info[1][0],
                 "actor_loss": loss_info[1][1],
-                "advantage_loss": loss_info[1][2],
-                "order_loss": loss_info[1][3],
-                "order_classifier_loss": loss_info[1][4],
-                "order_classifier_accuracy": loss_info[1][5],
-                "entropy": loss_info[1][6],
-                "ratio": loss_info[1][7],
+                "entropy": loss_info[1][2],
+                "ratio": loss_info[1][3],
                 "ratio_0": ratio_0,
-                "approx_kl": loss_info[1][8],
-                "clip_frac": loss_info[1][9],
-                "moa_nll_loss": loss_info[1][10],
+                "approx_kl": loss_info[1][4],
+                "clip_frac": loss_info[1][5],
+                "moa_nll_loss": loss_info[1][6],
                 **loss_info[2],
                 **target_stats,
             }
@@ -1556,18 +1334,21 @@ def make_train(
 @hydra.main(version_base=None, config_path="repro_config", config_name="e3t_final_baseline")
 def main(config):
     config = OmegaConf.to_container(config)
-    config["model_name"] = "E3T_IDAAC"
+    config["model_name"] = "E3T"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
-        finetune_appendage = "_e3t_idaac_finetune"
+        finetune_appendage = "_e3t_finetune"
         fcp_prefix = "fcp_"
+    elif config['ENV_NAME'] == 'overcooked':
+        fcp_prefix = ""
+        finetune_appendage = "_e3t"
     else:
         fcp_prefix = ""
-        finetune_appendage = "_e3t_idaac"
+        finetune_appendage = "_e3t"
 
-    save_variant = "e3t_idaac"
+    save_variant = "e3t"
     if config["TRAIN_KWARGS"]["finetune"]:
         save_variant += "_finetune"
 
@@ -1579,7 +1360,7 @@ def main(config):
     resume_xpid = config.get("RESUME_XPID")
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/e3t_idaac/{config['ENV_NAME']}"
+    filepath_base = f"ckpts/e3t/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath_base += f"/{config['ENV_KWARGS']['layout']}"
     filepath_base += (
@@ -1617,11 +1398,11 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["E3T", "IDAAC", "RNN", "SP"],
+            tags=["E3T", "RNN", "SP"],
             config=config,
             mode=config["WANDB_MODE"],
             name=(
-                f"e3t_idaac_{config['ENV_KWARGS']['layout']}"
+                f"e3t_{config['ENV_KWARGS']['layout']}"
                 f"_seed{config['SEED']}"
             ),
         )
@@ -1696,7 +1477,7 @@ def main(config):
         )
         if previous_ckpt_path is None:
             raise FileNotFoundError(
-                "Previous E3T-IDAAC checkpoint was not found under "
+                "Previous E3T checkpoint was not found under "
                 f"{filepath!r}. Set RESUME_XPID to the run directory that "
                 "contains the previous checkpoint."
             )
@@ -1710,7 +1491,7 @@ def main(config):
         rng = previous_ckpt['key']
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/e3t/{config['ENV_NAME']}"
+        finetune_filepath = f"ckpts/e3t/{config['ENV_NAME']}"
         if config["ENV_NAME"] == "overcooked":
             finetune_filepath += f"/{config['ENV_KWARGS']['layout']}"
         finetune_filepath = f"{finetune_filepath}/ikFalse"
@@ -1753,20 +1534,15 @@ def main(config):
         int(config["ACTION_DIM"]), config=config
     )
     sharpness_batch = train_output["sharpness_batch"]
-    sharpness_order_swap = jax.random.bernoulli(
-        jax.random.PRNGKey(config["SEED"]),
-        shape=sharpness_batch.done.shape,
-    )
 
     def sharpness_loss(params):
-        loss, _ = e3t_idaac_loss(
+        loss, _ = e3t_ppo_loss(
             sharpness_network,
             params,
             sharpness_batch.initial_hstate,
             sharpness_batch,
             sharpness_batch.advantages,
             sharpness_batch.targets,
-            sharpness_order_swap,
             config,
         )
         return loss

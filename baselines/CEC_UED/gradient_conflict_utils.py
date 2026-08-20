@@ -108,11 +108,12 @@ def compute_layout_gradient_metrics(
 
         def _layout_losses(params, mask=actor_mask, sample_count=actor_sample_count):
 
-            _, policy, value = jax.checkpoint(network.apply)(
+            network_output = jax.checkpoint(network.apply)(
                 params,
                 initial_hstate,
                 (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
             )
+            _, policy, value = network_output[:3]
             log_prob = policy.log_prob(traj_batch.action)
 
             value_loss_per_sample = _ppo_value_loss(

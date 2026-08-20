@@ -25,6 +25,19 @@ class SharpnessBatch(NamedTuple):
     targets: jax.Array
 
 
+class E3TSharpnessBatch(NamedTuple):
+    initial_hstate: tuple[jax.Array, jax.Array]
+    obs: jax.Array
+    done: jax.Array
+    agent_positions: jax.Array
+    action: jax.Array
+    other_action: jax.Array
+    value: jax.Array
+    log_prob: jax.Array
+    advantages: jax.Array
+    targets: jax.Array
+
+
 def collect_final_sharpness_batch(
     env,
     network,
@@ -35,6 +48,7 @@ def collect_final_sharpness_batch(
     unbatchify_fn,
     value_mu=0.0,
     value_sigma=1.0,
+    include_other_action=False,
 ):
     """Collect a fixed post-training rollout and compute its GAE targets."""
     train_state, env_state, obs, done, hstate, rng = final_runner_state
@@ -64,7 +78,7 @@ def collect_final_sharpness_batch(
             env.agents,
             num_actors,
         )
-        next_hstate, pi, value = network.apply(
+        network_output = network.apply(
             train_state.params,
             hstate_s,
             (
@@ -73,6 +87,7 @@ def collect_final_sharpness_batch(
                 positions[jnp.newaxis, :],
             ),
         )
+        next_hstate, pi, value = network_output[:3]
         action = pi.sample(seed=action_rng).squeeze(0)
         log_prob = pi.log_prob(action).squeeze(0)
         env_action = unbatchify_fn(
@@ -93,11 +108,24 @@ def collect_final_sharpness_batch(
             next_done, env.agents, num_actors
         ).squeeze()
 
-        transition = (
+        transition_prefix = (
             jnp.take(obs_batch, actor_indices, axis=0),
             jnp.take(done_s, actor_indices, axis=0),
             jnp.take(positions, actor_indices, axis=0),
             jnp.take(action, actor_indices, axis=0),
+        )
+        if include_other_action:
+            other_env_action = {
+                "agent_0": env_action["agent_1"],
+                "agent_1": env_action["agent_0"],
+            }
+            other_action = batchify_fn(
+                other_env_action, env.agents, num_actors
+            ).squeeze()
+            transition_prefix += (
+                jnp.take(other_action, actor_indices, axis=0),
+            )
+        transition = transition_prefix + (
             jnp.take(value.squeeze(0), actor_indices, axis=0),
             jnp.take(log_prob, actor_indices, axis=0),
             jnp.take(reward_batch, actor_indices, axis=0),
@@ -128,7 +156,7 @@ def collect_final_sharpness_batch(
         env.agents,
         num_actors,
     )
-    _, _, final_value = network.apply(
+    final_network_output = network.apply(
         train_state.params,
         final_hstate,
         (
@@ -137,20 +165,34 @@ def collect_final_sharpness_batch(
             final_positions[jnp.newaxis, :],
         ),
     )
+    final_value = final_network_output[2]
     final_value = jnp.take(
         final_value.squeeze(0), actor_indices, axis=0
     )
     final_value_real = final_value * value_sigma + value_mu
-    (
-        obs_batch,
-        done_batch,
-        positions_batch,
-        actions,
-        old_values,
-        old_log_probs,
-        rewards,
-        global_dones,
-    ) = trajectory
+    if include_other_action:
+        (
+            obs_batch,
+            done_batch,
+            positions_batch,
+            actions,
+            other_actions,
+            old_values,
+            old_log_probs,
+            rewards,
+            global_dones,
+        ) = trajectory
+    else:
+        (
+            obs_batch,
+            done_batch,
+            positions_batch,
+            actions,
+            old_values,
+            old_log_probs,
+            rewards,
+            global_dones,
+        ) = trajectory
 
     def gae_step(carry, transition):
         gae, next_value = carry
@@ -178,17 +220,23 @@ def collect_final_sharpness_batch(
     )
     targets_real = advantages + old_values * value_sigma + value_mu
     targets_normalized = (targets_real - value_mu) / value_sigma
-    return SharpnessBatch(
-        initial_hstate=initial_hstate,
-        obs=obs_batch,
-        done=done_batch,
-        agent_positions=positions_batch,
-        action=actions,
-        value=old_values,
-        log_prob=old_log_probs,
-        advantages=advantages,
-        targets=targets_normalized,
-    )
+    batch_fields = {
+        "initial_hstate": initial_hstate,
+        "obs": obs_batch,
+        "done": done_batch,
+        "agent_positions": positions_batch,
+        "action": actions,
+        "value": old_values,
+        "log_prob": old_log_probs,
+        "advantages": advantages,
+        "targets": targets_normalized,
+    }
+    if include_other_action:
+        return E3TSharpnessBatch(
+            other_action=other_actions,
+            **batch_fields,
+        )
+    return SharpnessBatch(**batch_fields)
 
 
 def compute_keskar_sharpness(

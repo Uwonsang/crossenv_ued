@@ -52,6 +52,13 @@ from critic_loss_surface import (
     build_critic_loss_surface_settings,
     save_critic_loss_surface_snapshots,
 )
+from paper_stiffness import (
+    build_paper_stiffness_plan,
+    compute_paper_stiffness,
+    empty_paper_stiffness_metrics,
+    sampled_actor_indices,
+    select_stiffness_batch,
+)
 
 
 # Actor and critic use independent encoder/RNN trunks with identical topology.
@@ -533,6 +540,33 @@ def make_train(
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     config["ACTION_DIM"] = env.action_space(env.agents[0]).n
 
+    stiffness_config = config["STIFFNESS"]
+    stiffness_enabled = bool(stiffness_config["ENABLED"])
+    stiffness_plan = (
+        build_paper_stiffness_plan(
+            num_steps=int(config["NUM_STEPS"]),
+            num_actors=int(config["NUM_ACTORS"]),
+            sample_size=int(stiffness_config["SAMPLE_SIZE"]),
+            chunk_size=int(stiffness_config["CHUNK_SIZE"]),
+        )
+        if stiffness_enabled
+        else None
+    )
+    env_steps_per_update = int(config["NUM_ENVS"]) * int(
+        config["NUM_STEPS"]
+    )
+    stiffness_interval_env_steps = int(
+        stiffness_config.get("INTERVAL_ENV_STEPS", 0)
+    )
+    if stiffness_interval_env_steps <= 0:
+        stiffness_interval_env_steps = max(
+            1, int(config["TOTAL_TIMESTEPS"]) // 100
+        )
+    stiffness_interval_updates = max(
+        1,
+        int(np.ceil(stiffness_interval_env_steps / env_steps_per_update)),
+    )
+
     surface_settings = build_critic_loss_surface_settings(
         config,
         algorithm="IDAAC",
@@ -661,7 +695,7 @@ def make_train(
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
 
-            def _env_step(runner_state, unused):
+            def _env_step(runner_state, time_index):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
 
                 # layout BEFORE env.step: the layout this transition's action/reward belong to
@@ -679,6 +713,16 @@ def make_train(
                     last_done[np.newaxis, :],
                     agent_positions[np.newaxis, :],
                 )
+                if stiffness_enabled:
+                    stiffness_actor_indices = sampled_actor_indices(
+                        stiffness_plan, time_index, update_step
+                    )
+                    sampled_hstate = jax.tree.map(
+                        lambda value: jnp.take(
+                            value, stiffness_actor_indices, axis=0
+                        ),
+                        hstate,
+                    )
                 hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
@@ -715,14 +759,20 @@ def make_train(
                     layout_id,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
+                if stiffness_enabled:
+                    return runner_state, (transition, sampled_hstate)
                 return runner_state, transition
 
             initial_hstate = runner_state[-2]
             (train_state, env_state, obsv, done_batch, hstate, rng) = runner_state
             runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_steps)
-            runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+            runner_state, rollout_output = jax.lax.scan(
+                _env_step, runner_state, jnp.arange(config["NUM_STEPS"])
             )
+            if stiffness_enabled:
+                traj_batch, sampled_hstates = rollout_output
+            else:
+                traj_batch = rollout_output
 
             # CALCULATE ADVANTAGE
             train_state, env_state, last_obs, last_done, hstate, rng, update_steps = runner_state
@@ -792,6 +842,17 @@ def make_train(
                 ),
                 jnp.equal(update_steps, update_step),
             )
+            run_stiffness = jnp.logical_or(
+                jnp.logical_or(
+                    jnp.equal(
+                        update_steps % stiffness_interval_updates, 0
+                    ),
+                    jnp.equal(
+                        update_steps, int(config["NUM_UPDATES"]) - 1
+                    ),
+                ),
+                jnp.equal(update_steps, update_step),
+            )
 
             layout_gradient_window_steps = int(
                 config["GRAD_CONFLICT_WINDOW_STEPS"]
@@ -858,6 +919,44 @@ def make_train(
                 lambda _: empty_separate_trunk_penultimate_metrics(),
                 operand=None,
             )
+
+            if stiffness_enabled:
+                def _compute_stiffness(_):
+                    (
+                        stiffness_hstates,
+                        stiffness_observations,
+                        stiffness_dones,
+                        stiffness_agent_positions,
+                        stiffness_targets,
+                    ) = select_stiffness_batch(
+                        plan=stiffness_plan,
+                        sampled_hstates=sampled_hstates,
+                        observations=traj_batch.obs,
+                        dones=traj_batch.done,
+                        agent_positions=traj_batch.agent_positions,
+                        targets=targets,
+                        update_step=update_steps,
+                    )
+                    return compute_paper_stiffness(
+                        network=network,
+                        params=original_params,
+                        sampled_hstates=stiffness_hstates,
+                        observations=stiffness_observations,
+                        dones=stiffness_dones,
+                        agent_positions=stiffness_agent_positions,
+                        targets=stiffness_targets,
+                        value_param_keys=VALUE_TRUNK_KEYS,
+                        chunk_size=stiffness_plan.chunk_size,
+                    )
+
+                stiffness_metrics = jax.lax.cond(
+                    run_stiffness,
+                    _compute_stiffness,
+                    lambda _: empty_paper_stiffness_metrics(),
+                    operand=None,
+                )
+            else:
+                stiffness_metrics = empty_paper_stiffness_metrics()
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -1168,6 +1267,7 @@ def make_train(
                 **target_stats,
             }
             metric["layout_gradient"] = layout_gradient_metrics
+            metric["stiffness"] = stiffness_metrics
             rng = update_state[-1]
 
             def eval_layout(eval_env, params, eval_rng):
@@ -1350,6 +1450,11 @@ def make_train(
 
             def callback(metric):
                 step = int(metric["update_steps"])
+                is_standard_log_step = (
+                    step % LOG_INTERVAL == 0
+                    or step == int(config["NUM_UPDATES"]) - 1
+                    or step == update_step
+                )
                 snapshot_prefixes = (
                     "target_raw/",
                     "target_popart/",
@@ -1370,6 +1475,21 @@ def make_train(
                 for k, v in metric["loss"].items():
                     if not k.startswith(snapshot_prefixes):
                         _accumulate(k, v)
+
+                stiffness_log = {
+                    f"stiffness/paper_{k}": float(v)
+                    for k, v in metric["stiffness"].items()
+                    if np.isfinite(float(v))
+                }
+                if stiffness_log and not is_standard_log_step:
+                    wandb.log(
+                        {
+                            "update_step": step,
+                            "env_step": int(step * env_steps_per_update),
+                            **stiffness_log,
+                        },
+                        step=step,
+                    )
 
                 if "eval_returns" in metric:
                     if np.isfinite(float(metric["eval_returns"]["mean"])):
@@ -1399,11 +1519,7 @@ def make_train(
                         _log_accum["layout_sum"][label] = _log_accum["layout_sum"].get(label, 0.0) + float(ep_rets[t, e])
                         _log_accum["layout_count"][label] = _log_accum["layout_count"].get(label, 0) + 1
 
-                if (
-                    step % LOG_INTERVAL == 0
-                    or step == int(config["NUM_UPDATES"]) - 1
-                    or step == update_step
-                ):
+                if is_standard_log_step:
                     log_dict = {
                         "update_step": step,
                         "env_step": int(step * config["NUM_ENVS"] * config["NUM_STEPS"]),
@@ -1431,6 +1547,8 @@ def make_train(
                     for k, v in metric["representation"].items():
                         if np.isfinite(float(v)):
                             log_dict[k] = float(v)
+
+                    log_dict.update(stiffness_log)
 
                     if config["ENV_NAME"] == "overcooked":
                         for name in EVAL_LAYOUTS_9:

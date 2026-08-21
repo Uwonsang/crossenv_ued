@@ -43,11 +43,11 @@ if (( ${#SEEDS[@]} == 0 || ${#NUM_ENVS_VALUES[@]} == 0 )); then
     exit 1
 fi
 
-TOTAL_STEPS=8000000
-# With NUM_STEPS=400, this is exactly 8/4/2/1 updates for
+TOTAL_STEPS=100000000
+# With NUM_STEPS=400, this is exactly 80/40/20/10 updates for
 # NUM_ENVS=32/64/128/256, respectively.
-STIFFNESS_INTERVAL=${6:-102400}
-PROJECT_NAME="cec_stiffness_8m"
+STIFFNESS_INTERVAL=${6:-1024000}
+PROJECT_NAME="cec_stiffness_100m"
 
 if ! [[ "$STIFFNESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
     echo "interval_env_steps must be a positive integer." >&2

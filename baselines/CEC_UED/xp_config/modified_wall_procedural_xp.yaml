@@ -1,0 +1,35 @@
+"ENV_NAME": "ToyCoopNoPink"
+"NUM_STEPS": 100
+"FC_DIM_SIZE": 256
+"GRU_HIDDEN_DIM": 256
+"ACTIVATION": "relu"
+"CONV_NET": true
+"LSTM": true
+
+"ENV_KWARGS":
+  "max_steps": 100
+  "partial_obs": false
+  "incentivize_strat": 2
+
+"MODEL_GROUP": "ippo_empty"
+"SEEDS": [0, 1, 2, 3, 4, 5]
+"layout_names": ["empty", "wall_a"]
+"NUM_PROCEDURAL_TASKS": 100
+"ACTION_SEED": 2026
+"BETA": 1.0
+"ARGMAX": false
+
+"CEC_CKPT_TAG": "with_xp_numenv64"
+"IDAAC_CKPT_TAG": "with_xp_numenv256"
+
+"IDAAC_USE_NONLINEAR_CLF": false
+"IDAAC_CLF_HIDDEN_SIZE": 4
+
+"HELDOUT_PATH": "baselines/CEC_UED/results/procedural_xp/modified_wall_heldout_100.npz"
+"RESULTS_DIR": "baselines/CEC_UED/results/procedural_xp"
+
+"ENTITY": "overcooked_ai"
+"PROJECT": "crossenv_ued_ICLR_dual_destination"
+"WANDB_MODE": "online"
+"WANDB_GROUP": null
+

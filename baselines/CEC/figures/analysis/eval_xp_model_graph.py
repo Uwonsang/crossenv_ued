@@ -42,9 +42,13 @@ def fetch_model_histories(
     model_names,
     num_envs=None,
     seeds_by_model=None,
+    finished_only: bool = False,
+    deduplicate_seeds: bool = False,
 ):
     api = wandb.Api()
     filters = {"config.model_name": {"$in": list(model_names)}}
+    if finished_only:
+        filters["state"] = "finished"
     if num_envs is not None:
         if isinstance(num_envs, (list, tuple, set)):
             filters["config.NUM_ENVS"] = {"$in": [int(n) for n in num_envs]}
@@ -57,14 +61,25 @@ def fetch_model_histories(
 
     histories = []
     run_counts = {model_name: 0 for model_name in model_names}
+    seen_run_keys = set()
     for run in runs:
         model_name = run.config.get("model_name")
         if model_name not in run_counts:
             continue
+        num_envs_value = int(run.config.get("NUM_ENVS", -1))
+        seed_value = int(run.config.get("SEED", -1))
         if seeds_by_model is not None:
             allowed_seeds = seeds_by_model.get(model_name, ())
-            if int(run.config.get("SEED", -1)) not in allowed_seeds:
+            if seed_value not in allowed_seeds:
                 continue
+
+        run_key = (model_name, num_envs_value, seed_value)
+        if deduplicate_seeds and run_key in seen_run_keys:
+            print(
+                f"Skipping duplicate {run.id}: model={model_name}, "
+                f"NUM_ENVS={num_envs_value}, SEED={seed_value}"
+            )
+            continue
 
         history = run.history(
             keys=["_step", "env_step", "update_step", "eval_xp/mean"],
@@ -103,10 +118,19 @@ def fetch_model_histories(
         # trainers historically logged the raw update index under that name.
         history["env_step"] = history["update_step"] * steps_per_update
         history = history[["env_step", "eval_xp/mean"]].dropna()
+        if history.empty:
+            print(f"Skipping {run.id} ({model_name}): no usable XP history")
+            continue
+
+        # Retain the first usable run encountered for each graph series/seed.
+        # Mark it only after fully validating history so a broken earlier run
+        # does not hide a later finished run with usable metrics.
+        if deduplicate_seeds:
+            seen_run_keys.add(run_key)
         history["model_name"] = model_name
         history["run_id"] = run.id
-        history["num_envs"] = int(run.config["NUM_ENVS"])
-        history["seed"] = int(run.config["SEED"])
+        history["num_envs"] = num_envs_value
+        history["seed"] = seed_value
         histories.append(history)
         run_counts[model_name] += 1
 

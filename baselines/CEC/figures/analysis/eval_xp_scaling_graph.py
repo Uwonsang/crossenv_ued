@@ -79,10 +79,14 @@ def plot_scaling(histories, seeds, smooth_window, output):
     if smooth_window < 1:
         raise ValueError("smooth_window must be at least 1")
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.2), sharex=True, sharey=True)
     missing = []
-    for ax, model_name in zip(axes, MODEL_NAMES):
+    seed_label = ",".join(str(seed) for seed in seeds)
+    title_suffix = "mean with min–max range" if len(seeds) > 1 else "single seed"
+
+    for model_name in MODEL_NAMES:
+        fig, ax = plt.subplots(figsize=(7.2, 5.2))
         model_history = histories[histories["model_name"] == model_name]
+        plotted = 0
         for num_envs in NUM_ENVS_VALUES:
             curve = model_history[model_history["num_envs"] == num_envs]
             available_seeds = set(curve["seed"].unique())
@@ -119,25 +123,32 @@ def plot_scaling(histories, seeds, smooth_window, output):
                     alpha=0.18,
                     linewidth=0,
                 )
+            plotted += 1
 
-        ax.set_title(model_name)
+        if plotted == 0:
+            plt.close(fig)
+            print(f"Skipping {model_name}: no usable curves")
+            continue
+
+        ax.set_title(
+            f"{model_name} XP Environment Scaling\n"
+            f"(seeds={seed_label}; {title_suffix})"
+        )
         ax.set_xlabel("Environment Steps")
+        ax.set_ylabel("Eval XP Return")
         ax.margins(x=0)
         ax.grid(alpha=0.3)
         ax.legend(fontsize=9)
 
-    axes[0].set_ylabel("Eval XP Return")
-    seed_label = ",".join(str(seed) for seed in seeds)
-    title_suffix = "mean with min–max range" if len(seeds) > 1 else "single seed"
-    fig.suptitle(
-        f"XP Environment Scaling (seeds={seed_label}; {title_suffix})",
-        fontsize=15,
-    )
-    fig.tight_layout()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output, dpi=160, bbox_inches="tight")
-    plt.close(fig)
-    print(f"Saved: {output}")
+        model_output = output.with_name(
+            f"{output.stem}_{model_name}{output.suffix}"
+        )
+        model_output.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(model_output, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Saved: {model_output}")
+
     if missing:
         print("Missing runs: " + ", ".join(missing))
 
@@ -157,6 +168,8 @@ def main():
         model_names=MODEL_NAMES,
         num_envs=NUM_ENVS_VALUES,
         seeds_by_model={name: seeds for name in MODEL_NAMES},
+        finished_only=True,
+        deduplicate_seeds=True,
     )
     plot_scaling(
         histories=histories,

@@ -1,19 +1,19 @@
-"""Post-hoc loss-landscape sharpness for CEC and CEC_IDAAC checkpoints.
+"""Post-hoc critic-only sharpness for CEC and CEC_IDAAC checkpoints.
 
 Only the two model families below are supported:
 
-* CEC: ``ippo_general_gradient.ActorCriticRNN`` and its PPO loss
-* CEC_IDAAC: ``idaac_general_gradient.ActorCriticRNN`` and its main IDAAC loss
+* CEC: ``ippo_general_gradient.ActorCriticRNN``
+* CEC_IDAAC: ``idaac_general_gradient.ActorCriticRNN``
 
 The script creates a fresh, fixed on-policy CEC rollout for every checkpoint,
-then approximately maximizes the corresponding training loss in Keskar et
-al.'s parameter-wise box with L-BFGS-B.  The rollout does not change while an
-epsilon is optimized.
+then approximately maximizes the identical clipped critic loss in Keskar et
+al.'s parameter-wise box with L-BFGS-B. Only the equally-sized critic paths are
+perturbed. The rollout does not change while an epsilon is optimized.
 
 Example (run from the repository root)::
 
     python -m baselines.CEC_UED.measure_cec_sharpness \
-        --training-rollout-sizes 256 --seeds 0 1 2 3 4 5 \
+        --training-num-envs 256 --seeds 0 1 2 3 4 5 \
         --epsilons 0.001 0.0005 \
         --output sharpness_cec.json
 
@@ -61,7 +61,7 @@ def _ensure_legacy_import_path() -> None:
 @dataclass(frozen=True)
 class Checkpoint:
     model: str
-    training_num_steps: int
+    training_num_envs: int
     seed: int
     path: Path
 
@@ -69,10 +69,10 @@ class Checkpoint:
 def discover_checkpoints(
     roots: Mapping[str, Path],
     models: Iterable[str],
-    training_rollout_sizes: set[int] | None,
+    training_num_envs_filter: set[int] | None,
     seeds: set[int] | None,
 ) -> list[Checkpoint]:
-    """Discover ``<num_steps>/seedN/*.pkl`` checkpoint files."""
+    """Discover ``<num_envs>/seedN/*.pkl`` checkpoint files."""
     checkpoints: list[Checkpoint] = []
     for model in models:
         root = roots[model]
@@ -81,7 +81,7 @@ def discover_checkpoints(
         for path in root.glob("*/seed*/*.pkl"):
             relative = path.relative_to(root)
             try:
-                training_num_steps = int(relative.parts[0])
+                training_num_envs = int(relative.parts[0])
             except (ValueError, IndexError):
                 continue
             match = CHECKPOINT_RE.search(path.name)
@@ -89,19 +89,19 @@ def discover_checkpoints(
                 continue
             seed = int(match.group("seed"))
             if (
-                training_rollout_sizes is not None
-                and training_num_steps not in training_rollout_sizes
+                training_num_envs_filter is not None
+                and training_num_envs not in training_num_envs_filter
             ):
                 continue
             if seeds is not None and seed not in seeds:
                 continue
             checkpoints.append(
-                Checkpoint(model, training_num_steps, seed, path.resolve())
+                Checkpoint(model, training_num_envs, seed, path.resolve())
             )
     return sorted(
         checkpoints,
         key=lambda item: (
-            item.training_num_steps,
+            item.training_num_envs,
             item.seed,
             item.model,
             str(item.path),
@@ -128,7 +128,7 @@ def _checkpoint_updates(payload: Mapping[str, Any], item: Checkpoint) -> int:
         return int(match.group(1))
     # This only affects reward shaping. These are final checkpoints, so using
     # the expected final update count correctly makes its coefficient zero.
-    return int(3e9 // item.training_num_steps // 256)
+    return int(3e9 // 256 // item.training_num_envs)
 
 
 def _prepare_config(
@@ -145,7 +145,6 @@ def _prepare_config(
             config[key] = int(config[key])
         except (TypeError, ValueError):
             config[key] = int(float(config[key]))
-    config["TRAINING_NUM_ENVS"] = int(config["NUM_ENVS"])
     config["NUM_ENVS"] = int(eval_num_envs)
     config["NUM_ACTORS"] = 2 * int(eval_num_envs)
     config["NUM_STEPS"] = int(rollout_steps)
@@ -229,13 +228,10 @@ def _collect_batch(
         runner_key,
     )
 
-    # Reconstruct the training-time schedule using the original rollout length
-    # and environment count, not the smaller post-hoc evaluation values.
-    max_updates = int(
-        config["MAX_TRAIN_STEPS"]
-        // item.training_num_steps
-        // config["TRAINING_NUM_ENVS"]
-    )
+    # These are final checkpoints. Their recorded update count reconstructs the
+    # completed training schedule without conflating training NUM_ENVS with the
+    # smaller post-hoc evaluation environment count.
+    max_updates = _checkpoint_updates(payload, item)
     config["NUM_REWARD_SHAPING_STEPS"] = max(1, max_updates // 2)
     return network, collect_final_sharpness_batch(
         env=env,
@@ -348,6 +344,61 @@ def _idaac_loss(
     return loss
 
 
+def _critic_loss(network: Any, batch: Any, config: Mapping[str, Any]):
+    """The identical PPO clipped critic objective used by both models."""
+    import jax.numpy as jnp
+
+    def loss(params):
+        _, _, value = network.apply(
+            params,
+            batch.initial_hstate,
+            (batch.obs, batch.done, batch.agent_positions),
+        )
+        value_pred_clipped = batch.value + (value - batch.value).clip(
+            -config["CLIP_EPS"], config["CLIP_EPS"]
+        )
+        return 0.5 * jnp.maximum(
+            jnp.square(value - batch.targets),
+            jnp.square(value_pred_clipped - batch.targets),
+        ).mean()
+
+    return loss
+
+
+def _critic_parameter_scope(model: str, params: Any):
+    """Return critic-path variables and a function that merges them back."""
+    import flax
+
+    if model == "CEC":
+        from baselines.CEC_UED.ippo_general_gradient import VALUE_TRUNK_KEYS
+    elif model == "CEC_IDDAC":
+        from baselines.CEC_UED.idaac_general_gradient import VALUE_TRUNK_KEYS
+    else:
+        raise ValueError(f"Unsupported model: {model}")
+
+    was_frozen = isinstance(params, flax.core.FrozenDict)
+    full_variables = flax.core.unfreeze(params)
+    available = full_variables["params"]
+    missing = set(VALUE_TRUNK_KEYS).difference(available)
+    if missing:
+        raise ValueError(
+            f"Checkpoint is missing critic modules: {sorted(missing)}"
+        )
+    scoped_variables = {
+        "params": {key: available[key] for key in VALUE_TRUNK_KEYS}
+    }
+    if was_frozen:
+        scoped_variables = flax.core.freeze(scoped_variables)
+
+    def merge(candidate_scope):
+        merged = flax.core.unfreeze(params)
+        candidate = flax.core.unfreeze(candidate_scope)
+        merged["params"].update(candidate["params"])
+        return flax.core.freeze(merged) if was_frozen else merged
+
+    return scoped_variables, merge, tuple(VALUE_TRUNK_KEYS)
+
+
 def _write_results(path: Path, results: Sequence[Mapping[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
@@ -361,25 +412,29 @@ def summarize_results(
     results: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     """Aggregate successful sharpness values across seeds."""
-    grouped: dict[tuple[str, int, str], list[float]] = {}
+    grouped: dict[tuple[str, int, str, str], list[float]] = {}
     for result in results:
         if "error" in result:
             continue
         for metric, value in result["sharpness"].items():
             key = (
                 str(result["model"]),
-                int(result["training_num_steps"]),
+                int(result["training_num_envs"]),
+                str(result.get("loss_scope", "full")),
                 str(metric),
             )
             grouped.setdefault(key, []).append(float(value))
 
     summary = []
-    for (model, training_num_steps, metric), values in sorted(grouped.items()):
+    for (
+        model, training_num_envs, loss_scope, metric
+    ), values in sorted(grouped.items()):
         epsilon = float(metric.rsplit("eps_", maxsplit=1)[-1])
         summary.append(
             {
                 "model": model,
-                "training_num_steps": training_num_steps,
+                "training_num_envs": training_num_envs,
+                "loss_scope": loss_scope,
                 "epsilon": epsilon,
                 "metric": metric,
                 "num_seeds": len(values),
@@ -412,11 +467,12 @@ def _print_summary(summary: Sequence[Mapping[str, Any]]) -> None:
         print("\nNo successful results to summarize.")
         return
     print("\nAcross-seed sharpness summary (mean ± sample std)")
-    print("  model       train_steps  epsilon     n  mean ± std")
+    print("  model       train_envs  scope    epsilon     n  mean ± std")
     for row in summary:
         std = "N/A" if row["std"] is None else f"{row['std']:.6g}"
         print(
-            f"  {row['model']:<11s} {row['training_num_steps']:>11d}  "
+            f"  {row['model']:<11s} {row['training_num_envs']:>10d}  "
+            f"{row['loss_scope']:<7s}  "
             f"{row['epsilon']:<9g} {row['num_seeds']:>2d}  "
             f"{row['mean']:.6g} ± {std}"
         )
@@ -432,6 +488,7 @@ def measure_checkpoint(
     rollout_steps: int,
     sampled_actors: int,
     rollout_seed: int,
+    loss_scope: str,
 ) -> dict[str, Any]:
     import jax
 
@@ -447,27 +504,36 @@ def measure_checkpoint(
     network, batch = _collect_batch(
         item, payload, params, config, env, rollout_seed
     )
-    if item.model == "CEC":
-        loss_fn = _cec_loss(network, batch, config)
-    else:
-        loss_fn = _idaac_loss(
-            network, batch, config, order_seed=rollout_seed + 1
-        )
+    perturbation_modules: tuple[str, ...] | None = None
+    if loss_scope != "critic":
+        raise ValueError("Only critic sharpness is supported")
+    full_critic_loss = _critic_loss(network, batch, config)
+    sharpness_params, merge_scope, perturbation_modules = (
+        _critic_parameter_scope(item.model, params)
+    )
 
-    base_loss = float(loss_fn(params))
+    def loss_fn(candidate_scope):
+        return full_critic_loss(merge_scope(candidate_scope))
+
+    base_loss = float(loss_fn(sharpness_params))
     metrics = compute_keskar_sharpness(
-        loss_fn, params, epsilons, maxiter=maxiter
+        loss_fn, sharpness_params, epsilons, maxiter=maxiter
     )
     parameter_count = sum(
-        int(leaf.size) for leaf in jax.tree.leaves(params)
+        int(leaf.size) for leaf in jax.tree.leaves(sharpness_params)
     )
     result = {
         "model": item.model,
-        "training_num_steps": item.training_num_steps,
+        "training_num_envs": item.training_num_envs,
         "seed": item.seed,
         "checkpoint": str(item.path),
         "checkpoint_updates": _checkpoint_updates(payload, item),
         "parameter_count": parameter_count,
+        "total_parameter_count": sum(
+            int(leaf.size) for leaf in jax.tree.leaves(params)
+        ),
+        "loss_scope": loss_scope,
+        "perturbed_modules": perturbation_modules,
         "base_loss": base_loss,
         "eval_num_envs": eval_num_envs,
         "sampled_actors": min(sampled_actors, 2 * eval_num_envs),
@@ -496,12 +562,13 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument(
+        "--training-num-envs",
         "--training-rollout-sizes",
         "--batch-sizes",
-        dest="training_rollout_sizes",
+        dest="training_num_envs",
         nargs="+",
         type=int,
-        help="checkpoint directory names to include (training NUM_STEPS)",
+        help="checkpoint directory names to include (training NUM_ENVS)",
     )
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument(
@@ -512,6 +579,12 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--rollout-steps", type=int, default=400)
     parser.add_argument("--sampled-actors", type=int, default=16)
     parser.add_argument("--rollout-seed", type=int, default=20260823)
+    parser.add_argument(
+        "--loss-scope",
+        choices=("critic",),
+        default="critic",
+        help="critic-only (the sole supported sharpness scope)",
+    )
     parser.add_argument(
         "--output", type=Path, default=Path("sharpness_cec.json")
     )
@@ -541,8 +614,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         roots,
         args.models,
         (
-            set(args.training_rollout_sizes)
-            if args.training_rollout_sizes
+            set(args.training_num_envs)
+            if args.training_num_envs
             else None
         ),
         set(args.seeds) if args.seeds else None,
@@ -554,7 +627,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"Found {len(checkpoints)} checkpoint(s):")
     for item in checkpoints:
         print(
-            f"  {item.model:10s} train_steps={item.training_num_steps:<3d} "
+            f"  {item.model:10s} train_envs={item.training_num_envs:<3d} "
             f"seed={item.seed}: {item.path}"
         )
     if args.dry_run:
@@ -565,7 +638,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for index, item in enumerate(checkpoints, start=1):
         print(
             f"\n[{index}/{len(checkpoints)}] Measuring {item.model}, "
-            f"train_steps={item.training_num_steps}, seed={item.seed}"
+            f"train_envs={item.training_num_envs}, seed={item.seed}"
         )
         try:
             # The CEC held-out set is deterministic and expensive to compile.
@@ -592,6 +665,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 rollout_steps=args.rollout_steps,
                 sampled_actors=args.sampled_actors,
                 rollout_seed=args.rollout_seed,
+                loss_scope=args.loss_scope,
             )
             results.append(result)
             values = ", ".join(
@@ -602,9 +676,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as error:  # Preserve earlier expensive results.
             failure = {
                 "model": item.model,
-                "training_num_steps": item.training_num_steps,
+                "training_num_envs": item.training_num_envs,
                 "seed": item.seed,
                 "checkpoint": str(item.path),
+                "loss_scope": args.loss_scope,
                 "error": f"{type(error).__name__}: {error}",
             }
             results.append(failure)

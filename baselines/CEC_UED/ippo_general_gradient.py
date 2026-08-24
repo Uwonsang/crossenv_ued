@@ -868,6 +868,7 @@ def make_train(
 
             def callback(metric):
                 step = int(metric["update_steps"])
+                env_step = int(step * env_steps_per_update)
                 is_standard_log_step = (
                     step % LOG_INTERVAL == 0
                     or step == int(config["NUM_UPDATES"]) - 1
@@ -895,10 +896,10 @@ def make_train(
                     wandb.log(
                         {
                             "update_step": step,
-                            "env_step": int(step * env_steps_per_update),
+                            "env_step": env_step,
                             **stiffness_log,
                         },
-                        step=step,
+                        step=env_step,
                     )
 
                 if config["ENV_NAME"] == "overcooked":
@@ -913,7 +914,7 @@ def make_train(
                 if is_standard_log_step:
                     log_dict = {
                         "update_step": step,
-                        "env_step": int(step * config["NUM_ENVS"] * config["NUM_STEPS"]),
+                        "env_step": env_step,
                     }
                     for k, s in _log_accum["sum"].items():
                         cnt = _log_accum["count"][k]
@@ -928,9 +929,8 @@ def make_train(
                                 _log_accum["layout_sum"][name] / c if c > 0 else float("nan")
                             )
 
-                    # Use the actual PPO update as WandB's global x-axis, rather than
-                    # the number of times logging has occurred.
-                    wandb.log(log_dict, step=step)
+                    # Use environment interactions as WandB's global x-axis.
+                    wandb.log(log_dict, step=env_step)
 
                     _log_accum["sum"] = {}
                     _log_accum["count"] = {}

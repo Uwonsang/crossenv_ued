@@ -80,8 +80,6 @@ for train_script in "${TRAIN_SCRIPTS[@]}"; do
                 STIFFNESS.SAMPLE_SIZE=16384 \
                 STIFFNESS.CHUNK_SIZE=16 \
                 STIFFNESS.INTERVAL_ENV_STEPS="${STIFFNESS_INTERVAL}" \
-                SHARPNESS.ENABLED=False \
-                EVAL_KWARGS.eval_xp=False \
                 PROJECT="${PROJECT_NAME}" \
                 WANDB_MODE=online
         done

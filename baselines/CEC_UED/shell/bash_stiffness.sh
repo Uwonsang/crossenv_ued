@@ -77,7 +77,6 @@ for train_script in "${TRAIN_SCRIPTS[@]}"; do
                 TOTAL_TIMESTEPS="${TOTAL_STEPS}" \
                 MAX_TRAIN_STEPS="${SCHEDULE_STEPS}" \
                 STIFFNESS.ENABLED=True \
-                STIFFNESS.SAMPLE_SIZE=16384 \
                 STIFFNESS.CHUNK_SIZE=16 \
                 STIFFNESS.INTERVAL_ENV_STEPS="${STIFFNESS_INTERVAL}" \
                 PROJECT="${PROJECT_NAME}" \

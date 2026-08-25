@@ -30,10 +30,10 @@ import time
 import yaml
 from algo_utils import EVAL_LAYOUTS_9
 from paper_stiffness import (
-    build_paper_stiffness_plan,
+    advance_rollout_rng,
     compute_paper_stiffness,
     empty_paper_stiffness_metrics,
-    sampled_actor_indices,
+    first_minibatch_actor_indices,
     select_stiffness_batch,
 )
 
@@ -426,16 +426,21 @@ def make_train(
 
     stiffness_config = config["STIFFNESS"]
     stiffness_enabled = bool(stiffness_config["ENABLED"])
-    stiffness_plan = (
-        build_paper_stiffness_plan(
-            num_steps=int(config["NUM_STEPS"]),
-            num_actors=int(config["NUM_ACTORS"]),
-            sample_size=int(stiffness_config["SAMPLE_SIZE"]),
-            chunk_size=int(stiffness_config["CHUNK_SIZE"]),
-        )
-        if stiffness_enabled
-        else None
+    stiffness_chunk_size = int(stiffness_config["CHUNK_SIZE"])
+    if int(config["NUM_ACTORS"]) % int(config["NUM_MINIBATCHES"]) != 0:
+        raise ValueError("NUM_ACTORS must be divisible by NUM_MINIBATCHES.")
+    actors_per_minibatch = int(config["NUM_ACTORS"]) // int(
+        config["NUM_MINIBATCHES"]
     )
+    stiffness_sample_size = int(config["NUM_STEPS"]) * actors_per_minibatch
+    if stiffness_enabled and (
+        stiffness_chunk_size <= 0
+        or stiffness_sample_size % stiffness_chunk_size != 0
+    ):
+        raise ValueError(
+            "STIFFNESS.CHUNK_SIZE must be positive and evenly divide the "
+            "number of actor-states in one training minibatch."
+        )
     env_steps_per_update = int(config["NUM_ENVS"]) * int(
         config["NUM_STEPS"]
     )
@@ -532,8 +537,18 @@ def make_train(
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
+            if stiffness_enabled:
+                post_rollout_rng = advance_rollout_rng(
+                    runner_state[-1], int(config["NUM_STEPS"])
+                )
+                _, permutation_rng = jax.random.split(post_rollout_rng)
+                stiffness_actor_indices = first_minibatch_actor_indices(
+                    permutation_rng,
+                    int(config["NUM_ACTORS"]),
+                    int(config["NUM_MINIBATCHES"]),
+                )
 
-            def _env_step(runner_state, time_index):
+            def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step = runner_state
 
                 # layout BEFORE env.step: the layout this transition's action/reward belong to
@@ -552,9 +567,6 @@ def make_train(
                     agent_positions[np.newaxis, :],
                 )
                 if stiffness_enabled:
-                    stiffness_actor_indices = sampled_actor_indices(
-                        stiffness_plan, time_index, update_step
-                    )
                     sampled_hstate = jax.tree.map(
                         lambda value: jnp.take(
                             value, stiffness_actor_indices, axis=0
@@ -678,14 +690,15 @@ def make_train(
                         stiffness_dones,
                         stiffness_agent_positions,
                         stiffness_targets,
+                        stiffness_layout_ids,
                     ) = select_stiffness_batch(
-                        plan=stiffness_plan,
                         sampled_hstates=sampled_hstates,
                         observations=traj_batch.obs,
                         dones=traj_batch.done,
                         agent_positions=traj_batch.agent_positions,
                         targets=targets,
-                        update_step=update_steps,
+                        layout_ids=traj_batch.layout_id,
+                        actor_indices=stiffness_actor_indices,
                     )
                     return compute_paper_stiffness(
                         network=network,
@@ -695,8 +708,9 @@ def make_train(
                         dones=stiffness_dones,
                         agent_positions=stiffness_agent_positions,
                         targets=stiffness_targets,
+                        layout_ids=stiffness_layout_ids,
                         value_param_keys=VALUE_TRUNK_KEYS,
-                        chunk_size=stiffness_plan.chunk_size,
+                        chunk_size=stiffness_chunk_size,
                     )
 
                 stiffness_metrics = jax.lax.cond(

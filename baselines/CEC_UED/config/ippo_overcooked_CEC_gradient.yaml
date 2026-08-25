@@ -58,12 +58,11 @@
 "PROJECT": "crossenv_ued_gradient"
 "WANDB_MODE" : "disabled"
 "model_name": "CEC"
-# Moon et al. (2022), Sec. 3.1: fixed 2^14-state value-gradient minibatch.
-# SAMPLE_SIZE is global and is not fixed per environment. Its measurement
-# interval is expressed in environment steps so NUM_ENVS comparisons align.
+# Moon et al. (2022), Sec. 3.1: per-state value gradients from the complete
+# first recurrent training minibatch. The measurement interval is expressed
+# in environment steps so NUM_ENVS comparisons align.
 "STIFFNESS":
   "ENABLED": True
-  "SAMPLE_SIZE": 16384
   "CHUNK_SIZE": 16
   # 0 automatically uses TOTAL_TIMESTEPS / 100. Positive values measure at
   # approximately this many environment steps, rounded to a whole update.

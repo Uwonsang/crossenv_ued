@@ -32,6 +32,8 @@ from algo_utils import EVAL_LAYOUTS_9
 from paper_stiffness import (
     advance_rollout_rng,
     compute_paper_stiffness,
+    count_unique_static_signatures,
+    encode_static_grid_signature,
     empty_paper_stiffness_metrics,
     first_minibatch_actor_indices,
     select_stiffness_batch,
@@ -344,6 +346,7 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
     layout_id: jnp.ndarray
+    static_signature: jnp.ndarray
 
 
 def ppo_loss(
@@ -555,6 +558,15 @@ def make_train(
                 pre_maze_map = env_state.env_state.maze_map
                 layout_id = jax.vmap(_classify_layout_jax)(pre_maze_map[:, 4:13, 4:13, 0])  # (NUM_ENVS,)
                 layout_id = jnp.tile(layout_id, [env.num_agents])  # (NUM_ACTORS,), matches agent_positions
+                static_signature = jax.vmap(encode_static_grid_signature)(
+                    env_state.env_state.wall_map,
+                    pre_maze_map[:, 4:13, 4:13, 0],
+                    env_state.env_state.goal_pos,
+                    env_state.env_state.pot_pos,
+                )
+                static_signature = jnp.tile(
+                    static_signature, (env.num_agents, 1)
+                )
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -607,6 +619,7 @@ def make_train(
                     info,
                     agent_positions,
                     layout_id,
+                    static_signature,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step)
                 if stiffness_enabled:
@@ -683,6 +696,12 @@ def make_train(
             )
 
             if stiffness_enabled:
+                selected_static_signatures = jnp.take(
+                    traj_batch.static_signature,
+                    stiffness_actor_indices,
+                    axis=1,
+                ).reshape((-1, traj_batch.static_signature.shape[-1]))
+
                 def _compute_stiffness(_):
                     (
                         stiffness_hstates,
@@ -719,8 +738,17 @@ def make_train(
                     lambda _: empty_paper_stiffness_metrics(),
                     operand=None,
                 )
+                static_unique_count = jax.lax.cond(
+                    run_stiffness,
+                    lambda _: count_unique_static_signatures(
+                        selected_static_signatures
+                    ).astype(jnp.float32),
+                    lambda _: jnp.asarray(jnp.nan, dtype=jnp.float32),
+                    operand=None,
+                )
             else:
                 stiffness_metrics = empty_paper_stiffness_metrics()
+                static_unique_count = jnp.asarray(jnp.nan, dtype=jnp.float32)
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -878,6 +906,7 @@ def make_train(
                 "clip_frac": loss_info[1][5],
             }
             metric["stiffness"] = stiffness_metrics
+            metric["static_unique_count"] = static_unique_count
             rng = update_state[-1]
 
             def callback(metric):
@@ -906,12 +935,18 @@ def make_train(
                     for k, v in metric["stiffness"].items()
                     if np.isfinite(float(v))
                 }
-                if stiffness_log and not is_standard_log_step:
+                diversity_log = {}
+                if np.isfinite(float(metric["static_unique_count"])):
+                    diversity_log["diversity/static_grid_unique_count"] = int(
+                        metric["static_unique_count"]
+                    )
+                if (stiffness_log or diversity_log) and not is_standard_log_step:
                     wandb.log(
                         {
                             "update_step": step,
                             "env_step": env_step,
                             **stiffness_log,
+                            **diversity_log,
                         },
                         step=env_step,
                     )
@@ -935,6 +970,7 @@ def make_train(
                         log_dict[k] = s / cnt if cnt > 0 else float("nan")
 
                     log_dict.update(stiffness_log)
+                    log_dict.update(diversity_log)
 
                     if config["ENV_NAME"] == "overcooked":
                         for name in EVAL_LAYOUTS_9:

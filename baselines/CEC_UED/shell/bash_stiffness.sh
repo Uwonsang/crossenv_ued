@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-if (( $# < 3 || $# > 5 )); then
-    echo "Usage: bash $0 <gpu> <ippo|idaac|both> \"seed ...\" [\"num_envs ...\"] [interval_env_steps]" >&2
+if (( $# < 3 || $# > 4 )); then
+    echo "Usage: bash $0 <gpu> <ippo|idaac|both> \"seed ...\" [\"num_envs ...\"]" >&2
     echo "Example: bash $0 0 both \"0 1\" \"32 64 128 256\"" >&2
     exit 1
 fi
@@ -43,19 +43,11 @@ if (( ${#SEEDS[@]} == 0 || ${#NUM_ENVS_VALUES[@]} == 0 )); then
     exit 1
 fi
 
-TOTAL_STEPS=100000000
+TOTAL_STEPS=300000000
 # Keep reward-shaping and learning-rate annealing aligned with the original
-# 3B-step training run while collecting only its first 100M steps.
+# 3B-step training run while collecting only its first 300M steps.
 SCHEDULE_STEPS=3000000000
-# With NUM_STEPS=400, this is exactly 80/40/20/10 updates for
-# NUM_ENVS=32/64/128/256, respectively.
-STIFFNESS_INTERVAL=${5:-1024000}
 PROJECT_NAME="cec_stiffness_100m"
-
-if ! [[ "$STIFFNESS_INTERVAL" =~ ^[1-9][0-9]*$ ]]; then
-    echo "interval_env_steps must be a positive integer." >&2
-    exit 1
-fi
 
 echo "GPU: ${GPU_ID}"
 echo "Algorithm: ${ALGORITHM}"
@@ -64,7 +56,7 @@ echo "Seeds: ${SEEDS[*]}"
 echo "NUM_ENVS: ${NUM_ENVS_VALUES[*]}"
 echo "Total environment steps: ${TOTAL_STEPS}"
 echo "Reward/LR schedule horizon: ${SCHEDULE_STEPS} environment steps"
-echo "Stiffness interval: ${STIFFNESS_INTERVAL} environment steps"
+echo "Stiffness measurements: approximately 100 (interval computed automatically)"
 
 for train_script in "${TRAIN_SCRIPTS[@]}"; do
     for num_envs in "${NUM_ENVS_VALUES[@]}"; do
@@ -78,7 +70,7 @@ for train_script in "${TRAIN_SCRIPTS[@]}"; do
                 MAX_TRAIN_STEPS="${SCHEDULE_STEPS}" \
                 STIFFNESS.ENABLED=True \
                 STIFFNESS.CHUNK_SIZE=16 \
-                STIFFNESS.INTERVAL_ENV_STEPS="${STIFFNESS_INTERVAL}" \
+                STIFFNESS.INTERVAL_ENV_STEPS=0 \
                 PROJECT="${PROJECT_NAME}" \
                 WANDB_MODE=online
         done

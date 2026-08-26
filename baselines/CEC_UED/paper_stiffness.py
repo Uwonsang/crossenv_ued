@@ -20,6 +20,64 @@ STIFFNESS_METRIC_NAMES = (
 )
 
 
+def encode_static_grid_signature(
+    wall_map: jnp.ndarray,
+    maze_object_grid: jnp.ndarray,
+    goal_positions: jnp.ndarray,
+    pot_positions: jnp.ndarray,
+) -> jnp.ndarray:
+    """Losslessly encode the static 9x9 layout into seven uint32 values.
+
+    Cell codes distinguish floor, wall/counter, onion pile, plate pile,
+    goal, and pot. Twelve base-6 cells fit in one uint32, so the encoding
+    has no hash collisions.
+    """
+
+    codes = wall_map.astype(jnp.uint32)
+    codes = jnp.where(maze_object_grid == 4, 2, codes)  # onion pile
+    codes = jnp.where(maze_object_grid == 6, 3, codes)  # plate pile
+
+    goal_mask = jnp.zeros_like(wall_map, dtype=jnp.bool_).at[
+        goal_positions[:, 1], goal_positions[:, 0]
+    ].set(True)
+    pot_mask = jnp.zeros_like(wall_map, dtype=jnp.bool_).at[
+        pot_positions[:, 1], pot_positions[:, 0]
+    ].set(True)
+    codes = jnp.where(goal_mask, 4, codes)
+    codes = jnp.where(pot_mask, 5, codes)
+
+    flat_codes = jnp.pad(codes.reshape(-1), (0, 3)).reshape(7, 12)
+    base6_weights = jnp.asarray(
+        [6**power for power in range(12)], dtype=jnp.uint32
+    )
+    return jnp.sum(
+        flat_codes * base6_weights[None, :],
+        axis=1,
+        dtype=jnp.uint32,
+    )
+
+
+def count_unique_static_signatures(signatures: jnp.ndarray) -> jnp.ndarray:
+    """Count distinct static layouts in selected actor-state samples."""
+
+    signatures = signatures.reshape((-1, signatures.shape[-1]))
+    keys = tuple(signatures[:, index] for index in range(signatures.shape[-1]))
+    sorted_keys = jax.lax.sort(
+        keys,
+        dimension=0,
+        is_stable=True,
+        num_keys=len(keys),
+    )
+    adjacent_difference = jnp.zeros(
+        (signatures.shape[0] - 1,), dtype=jnp.bool_
+    )
+    for key in sorted_keys:
+        adjacent_difference = jnp.logical_or(
+            adjacent_difference, key[1:] != key[:-1]
+        )
+    return 1 + jnp.sum(adjacent_difference, dtype=jnp.int32)
+
+
 def advance_rollout_rng(rng: jax.Array, num_steps: int) -> jax.Array:
     """Predict the RNG carried out of a rollout without sampling tensors."""
 

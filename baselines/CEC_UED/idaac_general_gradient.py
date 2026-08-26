@@ -477,6 +477,98 @@ class Transition(NamedTuple):
     static_signature: jnp.ndarray
 
 
+IDAAC_POLICY_VALUE_METRIC_NAMES = (
+    "policy_grad_norm",
+    "weighted_value_grad_norm",
+)
+
+
+def empty_idaac_policy_value_metrics(dtype=jnp.float32):
+    return {
+        name: jnp.asarray(jnp.nan, dtype=dtype)
+        for name in IDAAC_POLICY_VALUE_METRIC_NAMES
+    }
+
+
+def compute_idaac_policy_value_norms(
+    *,
+    network,
+    params,
+    initial_hstate,
+    traj_batch,
+    advantages,
+    targets,
+    config,
+):
+    """Measure policy and value norms on IDAAC's disjoint trunks."""
+
+    def loss_components(candidate_params):
+        _, pi, value = network.apply(
+            candidate_params,
+            initial_hstate,
+            (
+                traj_batch.obs,
+                traj_batch.done,
+                traj_batch.agent_positions,
+            ),
+        )
+        log_prob = pi.log_prob(traj_batch.action)
+        value_pred_clipped = traj_batch.value + (
+            value - traj_batch.value
+        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+        value_loss = 0.5 * jnp.maximum(
+            jnp.square(value - targets),
+            jnp.square(value_pred_clipped - targets),
+        ).mean()
+
+        normalized_advantages = (
+            advantages - advantages.mean()
+        ) / (advantages.std() + 1e-8)
+        ratio = jnp.exp(log_prob - traj_batch.log_prob)
+        actor_loss = -jnp.minimum(
+            ratio * normalized_advantages,
+            jnp.clip(
+                ratio,
+                1.0 - config["CLIP_EPS"],
+                1.0 + config["CLIP_EPS"],
+            ) * normalized_advantages,
+        ).mean()
+        policy_loss = actor_loss - config["ENT_COEF"] * pi.entropy().mean()
+        return policy_loss, value_loss
+
+    policy_grads = jax.grad(lambda candidate: loss_components(candidate)[0])(
+        params
+    )
+    value_grads = jax.grad(lambda candidate: loss_components(candidate)[1])(
+        params
+    )
+
+    policy_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
+    for leaf in jax.tree_util.tree_leaves(
+        policy_grads["params"]["actor_trunk"]
+    ):
+        policy_squared_norm += jnp.sum(
+            jnp.square(leaf.astype(jnp.float32))
+        )
+
+    value_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
+    for leaf in jax.tree_util.tree_leaves(
+        value_grads["params"]["critic_trunk"]
+    ):
+        value_squared_norm += jnp.sum(
+            jnp.square(leaf.astype(jnp.float32))
+        )
+
+    policy_norm = jnp.sqrt(policy_squared_norm)
+    weighted_value_norm = jnp.abs(
+        jnp.asarray(config["VF_COEF"], dtype=jnp.float32)
+    ) * jnp.sqrt(value_squared_norm)
+    return {
+        "policy_grad_norm": policy_norm,
+        "weighted_value_grad_norm": weighted_value_norm,
+    }
+
+
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
     return x.reshape((num_actors, -1))
@@ -815,6 +907,24 @@ def make_train(
                     stiffness_actor_indices,
                     axis=1,
                 ).reshape((-1, traj_batch.static_signature.shape[-1]))
+                policy_value_hstate = jax.tree.map(
+                    lambda value: jnp.take(
+                        value, stiffness_actor_indices, axis=0
+                    ),
+                    initial_hstate,
+                )
+                policy_value_traj = jax.tree.map(
+                    lambda value: jnp.take(
+                        value, stiffness_actor_indices, axis=1
+                    ),
+                    traj_batch,
+                )
+                policy_value_advantages = jnp.take(
+                    advantages, stiffness_actor_indices, axis=1
+                )
+                policy_value_targets = jnp.take(
+                    targets, stiffness_actor_indices, axis=1
+                )
 
                 def _compute_stiffness(_):
                     (
@@ -860,9 +970,24 @@ def make_train(
                     lambda _: jnp.asarray(jnp.nan, dtype=jnp.float32),
                     operand=None,
                 )
+                policy_value_metrics = jax.lax.cond(
+                    run_stiffness,
+                    lambda _: compute_idaac_policy_value_norms(
+                        network=network,
+                        params=original_params,
+                        initial_hstate=policy_value_hstate,
+                        traj_batch=policy_value_traj,
+                        advantages=policy_value_advantages,
+                        targets=policy_value_targets,
+                        config=config,
+                    ),
+                    lambda _: empty_idaac_policy_value_metrics(),
+                    operand=None,
+                )
             else:
                 stiffness_metrics = empty_paper_stiffness_metrics()
                 static_unique_count = jnp.asarray(jnp.nan, dtype=jnp.float32)
+                policy_value_metrics = empty_idaac_policy_value_metrics()
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -1152,6 +1277,7 @@ def make_train(
             }
             metric["stiffness"] = stiffness_metrics
             metric["static_unique_count"] = static_unique_count
+            metric["policy_value"] = policy_value_metrics
             rng = update_state[-1]
 
             def callback(metric):
@@ -1185,13 +1311,21 @@ def make_train(
                     diversity_log["diversity/static_grid_unique_count"] = int(
                         metric["static_unique_count"]
                     )
-                if (stiffness_log or diversity_log) and not is_standard_log_step:
+                policy_value_log = {
+                    f"policy_value/{k}": float(v)
+                    for k, v in metric["policy_value"].items()
+                    if np.isfinite(float(v))
+                }
+                if (
+                    stiffness_log or diversity_log or policy_value_log
+                ) and not is_standard_log_step:
                     wandb.log(
                         {
                             "update_step": step,
                             "env_step": env_step,
                             **stiffness_log,
                             **diversity_log,
+                            **policy_value_log,
                         },
                         step=env_step,
                     )
@@ -1216,6 +1350,7 @@ def make_train(
 
                     log_dict.update(stiffness_log)
                     log_dict.update(diversity_log)
+                    log_dict.update(policy_value_log)
 
                     if config["ENV_NAME"] == "overcooked":
                         for name in EVAL_LAYOUTS_9:

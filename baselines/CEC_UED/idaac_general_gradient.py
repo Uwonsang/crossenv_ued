@@ -31,6 +31,10 @@ import yaml
 import flax.core
 import flax.traverse_util
 from algo_utils import EVAL_LAYOUTS_9
+from environment_gradient import (
+    compute_environment_conditioned_cosines,
+    environment_gradient_log_key,
+)
 from paper_stiffness import (
     advance_rollout_rng,
     compute_paper_stiffness,
@@ -482,11 +486,31 @@ IDAAC_POLICY_VALUE_METRIC_NAMES = (
     "weighted_value_grad_norm",
 )
 
+IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES = (
+    "policy_policy_mean_cosine",
+    "value_value_mean_cosine",
+    "policy_effective_rank",
+    "value_effective_rank",
+    "policy_effective_rank_ratio",
+    "value_effective_rank_ratio",
+    "policy_snr",
+    "value_snr",
+    "policy_log_snr",
+    "value_log_snr",
+)
+
 
 def empty_idaac_policy_value_metrics(dtype=jnp.float32):
     return {
         name: jnp.asarray(jnp.nan, dtype=dtype)
         for name in IDAAC_POLICY_VALUE_METRIC_NAMES
+    }
+
+
+def empty_idaac_environment_gradient_metrics(dtype=jnp.float32):
+    return {
+        name: jnp.asarray(jnp.nan, dtype=dtype)
+        for name in IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES
     }
 
 
@@ -926,6 +950,77 @@ def make_train(
                     targets, stiffness_actor_indices, axis=1
                 )
 
+                # Reassemble the selected actor trajectories by environment.
+                # batchify uses agent-major ordering: actor = agent * N + env.
+                environment_actor_indices = (
+                    jnp.arange(env.num_agents)[:, None]
+                    * int(config["NUM_ENVS"])
+                    + jnp.arange(int(config["NUM_ENVS"]))[None, :]
+                ).T
+                flat_environment_actor_indices = (
+                    environment_actor_indices.reshape(-1)
+                )
+                selected_actor_mask = jnp.zeros(
+                    (int(config["NUM_ACTORS"]),), dtype=jnp.bool_
+                ).at[stiffness_actor_indices].set(True)
+                environment_actor_mask = jnp.take(
+                    selected_actor_mask,
+                    environment_actor_indices,
+                    axis=0,
+                )
+
+                def group_actor_trajectories(values):
+                    gathered = jnp.take(
+                        values, flat_environment_actor_indices, axis=1
+                    )
+                    gathered = gathered.reshape(
+                        (gathered.shape[0], int(config["NUM_ENVS"]),
+                         env.num_agents) + gathered.shape[2:]
+                    )
+                    return jnp.swapaxes(gathered, 0, 1)
+
+                def group_actor_hstates(values):
+                    gathered = jnp.take(
+                        values, flat_environment_actor_indices, axis=0
+                    )
+                    return gathered.reshape(
+                        (int(config["NUM_ENVS"]), env.num_agents)
+                        + gathered.shape[1:]
+                    )
+
+                environment_hstates = jax.tree.map(
+                    group_actor_hstates, initial_hstate
+                )
+                environment_trajectories = jax.tree.map(
+                    group_actor_trajectories, traj_batch
+                )
+                selected_advantage_mean = policy_value_advantages.mean()
+                selected_advantage_std = policy_value_advantages.std()
+                normalized_advantages = (
+                    advantages - selected_advantage_mean
+                ) / (selected_advantage_std + 1e-8)
+                environment_advantages = group_actor_trajectories(
+                    normalized_advantages
+                )
+                environment_targets = group_actor_trajectories(targets)
+                environment_signatures = group_actor_trajectories(
+                    traj_batch.static_signature
+                )
+                initial_environment_signatures = (
+                    traj_batch.static_signature[
+                        0, :int(config["NUM_ENVS"])
+                    ]
+                )
+                same_static_environment = jnp.all(
+                    environment_signatures
+                    == initial_environment_signatures[:, None, None, :],
+                    axis=-1,
+                )
+                environment_sample_mask = jnp.logical_and(
+                    same_static_environment,
+                    environment_actor_mask[:, None, :],
+                )
+
                 def _compute_stiffness(_):
                     (
                         stiffness_hstates,
@@ -984,10 +1079,39 @@ def make_train(
                     lambda _: empty_idaac_policy_value_metrics(),
                     operand=None,
                 )
+
+                def _compute_idaac_environment_gradient_metrics(_):
+                    all_metrics = compute_environment_conditioned_cosines(
+                        network=network,
+                        params=original_params,
+                        initial_hstates=environment_hstates,
+                        trajectories=environment_trajectories,
+                        normalized_advantages=environment_advantages,
+                        targets=environment_targets,
+                        sample_mask=environment_sample_mask,
+                        shared_param_keys=("actor_trunk", "critic_trunk"),
+                        clip_eps=config["CLIP_EPS"],
+                        entropy_coef=config["ENT_COEF"],
+                        chunk_size=stiffness_chunk_size,
+                    )
+                    return {
+                        name: all_metrics[name]
+                        for name in IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES
+                    }
+
+                environment_gradient_metrics = jax.lax.cond(
+                    run_stiffness,
+                    _compute_idaac_environment_gradient_metrics,
+                    lambda _: empty_idaac_environment_gradient_metrics(),
+                    operand=None,
+                )
             else:
                 stiffness_metrics = empty_paper_stiffness_metrics()
                 static_unique_count = jnp.asarray(jnp.nan, dtype=jnp.float32)
                 policy_value_metrics = empty_idaac_policy_value_metrics()
+                environment_gradient_metrics = (
+                    empty_idaac_environment_gradient_metrics()
+                )
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -1278,6 +1402,7 @@ def make_train(
             metric["stiffness"] = stiffness_metrics
             metric["static_unique_count"] = static_unique_count
             metric["policy_value"] = policy_value_metrics
+            metric["environment_gradient"] = environment_gradient_metrics
             rng = update_state[-1]
 
             def callback(metric):
@@ -1316,8 +1441,16 @@ def make_train(
                     for k, v in metric["policy_value"].items()
                     if np.isfinite(float(v))
                 }
+                environment_gradient_log = {
+                    environment_gradient_log_key(k): float(v)
+                    for k, v in metric["environment_gradient"].items()
+                    if np.isfinite(float(v))
+                }
                 if (
-                    stiffness_log or diversity_log or policy_value_log
+                    stiffness_log
+                    or diversity_log
+                    or policy_value_log
+                    or environment_gradient_log
                 ) and not is_standard_log_step:
                     wandb.log(
                         {
@@ -1326,6 +1459,7 @@ def make_train(
                             **stiffness_log,
                             **diversity_log,
                             **policy_value_log,
+                            **environment_gradient_log,
                         },
                         step=env_step,
                     )
@@ -1351,6 +1485,7 @@ def make_train(
                     log_dict.update(stiffness_log)
                     log_dict.update(diversity_log)
                     log_dict.update(policy_value_log)
+                    log_dict.update(environment_gradient_log)
 
                     if config["ENV_NAME"] == "overcooked":
                         for name in EVAL_LAYOUTS_9:

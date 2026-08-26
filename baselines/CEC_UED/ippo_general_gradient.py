@@ -32,6 +32,7 @@ from algo_utils import EVAL_LAYOUTS_9
 from environment_gradient import (
     compute_environment_conditioned_cosines,
     empty_environment_gradient_metrics,
+    environment_gradient_log_key,
 )
 from paper_stiffness import (
     advance_rollout_rng,
@@ -1191,7 +1192,7 @@ def make_train(
                     if np.isfinite(float(v))
                 }
                 environment_gradient_log = {
-                    f"env_gradient/{k}": float(v)
+                    environment_gradient_log_key(k): float(v)
                     for k, v in metric["environment_gradient"].items()
                     if np.isfinite(float(v))
                 }

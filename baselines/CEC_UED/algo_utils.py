@@ -16,6 +16,23 @@ EVAL_LAYOUTS_9 = [
     "forced_coord_9",
 ]
 
+FINETUNE_UPDATES_BY_FOLDER = {
+    32: 366210,
+    64: 183105,
+    128: 91552,
+    256: 45776,
+}
+
+
+def get_finetune_checkpoint_path(checkpoint_root, seed):
+    folder_size = int(os.path.basename(os.path.normpath(checkpoint_root)))
+    num_updates = FINETUNE_UPDATES_BY_FOLDER[folder_size]
+    return os.path.join(
+        checkpoint_root,
+        f"seed{seed}",
+        f"seed{seed}_ckpt0_improved_updates{num_updates}.pkl",
+    )
+
 def classify_layout(maze_map_9x9_ch0: np.ndarray) -> str:
     passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
     n_passable = int(passable.sum())

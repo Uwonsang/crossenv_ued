@@ -30,7 +30,7 @@ import time
 import yaml
 import flax.core
 import flax.traverse_util
-from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
+from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy, get_finetune_checkpoint_path
 from gradient_conflict_utils import (
     compute_layout_gradient_metrics,
     empty_layout_gradient_metrics,
@@ -1641,10 +1641,9 @@ def main(config):
 
     elif config['TRAIN_KWARGS']['finetune']:
         seed = int(config['SEED'])
-        finetune_checkpoint = os.path.join(
+        finetune_checkpoint = get_finetune_checkpoint_path(
             config['TRAIN_KWARGS']['finetune_checkpoint_root'],
-            f"seed{seed}",
-            f"seed{seed}_ckpt0_improved_updates45776.pkl",
+            seed,
         )
         print(f"Loading CEC-IDAAC checkpoint for finetuning: {finetune_checkpoint}")
         with open(finetune_checkpoint, "rb") as f:

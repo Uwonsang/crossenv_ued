@@ -28,7 +28,7 @@ import functools
 from jax_tqdm import scan_tqdm
 import time
 import yaml
-from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
+from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy, get_finetune_checkpoint_path
 
 from gradient_conflict_utils import (
     compute_layout_gradient_metrics,
@@ -1342,11 +1342,19 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
-    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
-    filepath = f"{filepath_base}/{active_xpid}"
+    if config['TRAIN_KWARGS']['finetune']:
+        filepath = os.path.join(
+            "ckpts",
+            "ippo_finetune",
+            config['ENV_KWARGS']['layout'],
+            active_xpid,
+        )
+    else:
+        filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
+        if config["ENV_NAME"] == "overcooked":
+            filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+        filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+        filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
 
     config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
@@ -1422,24 +1430,19 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
-        if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/cramped_room_9"
-        if config['FCP']:
-            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
-            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
-        else:
-            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
-            finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
-        print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
+        seed = int(config['SEED'])
+        finetune_checkpoint = get_finetune_checkpoint_path(
+            config['TRAIN_KWARGS']['finetune_checkpoint_root'],
+            seed,
+        )
+        print(f"Loading CEC-IPPO checkpoint for finetuning: {finetune_checkpoint}")
+        with open(finetune_checkpoint, "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             opt_state = None
-            # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
-            rng = previous_ckpt['key']
-            rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
+            rng = jnp.asarray(previous_ckpt['key'], dtype=jnp.uint32)
+            rng, _rng = jax.random.split(rng)
     else:
         model_params = None
         opt_state = None

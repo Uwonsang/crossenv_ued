@@ -38,6 +38,7 @@
   "ckpt_id": 0 # loads from ckpt_id - 1 if available
   "overwrite_ckpt": True # if true, will overwrite ckpt_id
   "finetune": False # if true, load from opposing paradigm and cut learning rate by 10x
+  "finetune_checkpoint_root": "../ICRL/CEC_IDDAC/256"
   "e3t_beta": 0.55  # how much randomness to add to probabilities of one partner. If 0 then it's completely uniform, if 1 then it's same as original, if higher than 1 we're magnifying the extremes
 "TEST_KWARGS":
   "beta": 1.0

@@ -66,7 +66,6 @@ VALUE_TRUNK_KEYS = (
     "critic_hidden_3", "critic_output",
 )
 
-
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
@@ -1527,13 +1526,6 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
-    config.setdefault("DAAC_ADV_COEF", 0.25)
-    config.setdefault("DAAC_POLICY_LR", config["LR"])
-    config.setdefault("DAAC_VALUE_LR", config["LR"])
-    config.setdefault("IDAAC_ORDER_COEF", 0.001)
-    config.setdefault("IDAAC_CLF_LR", config["LR"])
-    config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
-    config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
     config["model_name"] = "CEC_IDAAC"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
@@ -1550,6 +1542,16 @@ def main(config):
     else:
         fcp_prefix = ""
         finetune_appendage = "_improved"
+
+    # IDAAC uses separate optimizers. Set their defaults only after reducing
+    # the base fine-tuning LR so all three groups receive the intended 10x cut.
+    config.setdefault("DAAC_ADV_COEF", 0.25)
+    config.setdefault("DAAC_POLICY_LR", config["LR"])
+    config.setdefault("DAAC_VALUE_LR", config["LR"])
+    config.setdefault("IDAAC_ORDER_COEF", 0.001)
+    config.setdefault("IDAAC_CLF_LR", config["LR"])
+    config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
+    config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
     
     if config['ENV_KWARGS']['partial_obs']:
         finetune_appendage += "_partial_obs"
@@ -1566,11 +1568,19 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/idaac/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
-    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
-    filepath = f"{filepath_base}/{active_xpid}"
+    if config['TRAIN_KWARGS']['finetune']:
+        filepath = os.path.join(
+            "ckpts",
+            "iddac_finetune",
+            config['ENV_KWARGS']['layout'],
+            active_xpid,
+        )
+    else:
+        filepath_base = f"ckpts/idaac/{config['ENV_NAME']}"
+        if config["ENV_NAME"] == "overcooked":
+            filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+        filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+        filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
 
     config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
@@ -1630,24 +1640,20 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
-        if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/cramped_room_9"
-        if config['FCP']:
-            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
-            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
-        else:
-            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
-            finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
-        print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
+        seed = int(config['SEED'])
+        finetune_checkpoint = os.path.join(
+            config['TRAIN_KWARGS']['finetune_checkpoint_root'],
+            f"seed{seed}",
+            f"seed{seed}_ckpt0_improved_updates45776.pkl",
+        )
+        print(f"Loading CEC-IDAAC checkpoint for finetuning: {finetune_checkpoint}")
+        with open(finetune_checkpoint, "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             opt_state = None
-            # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
-            rng = previous_ckpt['key']
-            rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
+            rng = jnp.asarray(previous_ckpt['key'], dtype=jnp.uint32)
+            rng, _rng = jax.random.split(rng)
     else:
         model_params = None
         opt_state = None

@@ -7,6 +7,16 @@ import jax
 import jax.numpy as jnp
 
 
+ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES = tuple(
+    f"{gradient_name}_{statistic}"
+    for gradient_name in (
+        "policy_norm",
+        "weighted_value_norm",
+    )
+    for statistic in ("mean", "cv", "p10", "p90", "iqm")
+)
+
+
 ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "policy_policy_mean_cosine",
     "value_value_mean_cosine",
@@ -24,7 +34,7 @@ ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "value_parameterwise_gsnr_mean",
     "policy_parameterwise_gsnr_mean_log10",
     "value_parameterwise_gsnr_mean_log10",
-)
+) + ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES
 
 
 def empty_environment_gradient_metrics(dtype=jnp.float32):
@@ -44,6 +54,8 @@ def environment_gradient_log_key(metric_name: str) -> str:
         namespace = "env_gradient_snr"
     elif "parameterwise_gsnr" in metric_name:
         namespace = "env_gradient_gsnr"
+    elif metric_name in ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES:
+        namespace = "env_gradient_norm"
     else:
         raise ValueError(
             f"Unknown environment-gradient metric: {metric_name}"
@@ -93,13 +105,15 @@ def compute_environment_conditioned_cosines(
     epsilon: float = 1e-12,
     policy_gsnr_param_keys: Sequence[str] = None,
     value_gsnr_param_keys: Sequence[str] = None,
+    value_loss_coefficient: float = 1.0,
 ):
-    """Compute alignment between gradients conditioned on static grids.
+    """Compute diagnostics across parallel-slot gradients.
 
     Inputs have a leading environment dimension. Each environment contains
     the selected agent trajectories assigned to the optimizer's first
     minibatch. ``sample_mask`` excludes unselected agents and states after a
-    mid-rollout reset changes the static grid.
+    mid-rollout reset changes the static grid. Slots with identical static
+    signatures remain separate observations in every distribution.
     """
 
     num_environments = int(sample_mask.shape[0])
@@ -268,9 +282,22 @@ def compute_environment_conditioned_cosines(
 
         policy_norm = jnp.sqrt(policy_squared_norm)
         value_norm = jnp.sqrt(value_squared_norm)
+        has_samples = batch_mask.sum(axis=(1, 2)) > 0
+        policy_distribution_valid = jnp.logical_and(
+            has_samples, jnp.isfinite(policy_norm)
+        )
+        value_distribution_valid = jnp.logical_and(
+            has_samples, jnp.isfinite(value_norm)
+        )
         valid = jnp.logical_and(
-            batch_mask.sum(axis=(1, 2)) > 0,
+            has_samples,
             jnp.logical_and(policy_norm > epsilon, value_norm > epsilon),
+        )
+        valid = jnp.logical_and(
+            valid,
+            jnp.logical_and(
+                policy_distribution_valid, value_distribution_valid
+            ),
         )
         policy_inverse_norm = jnp.where(
             valid, 1.0 / jnp.maximum(policy_norm, epsilon), 0.0
@@ -405,7 +432,14 @@ def compute_environment_conditioned_cosines(
             same_dot_sum + jnp.sum(chunk_same_dot),
             valid_count + jnp.sum(valid.astype(jnp.float32)),
         )
-        return next_state, (policy_sketch, value_sketch, valid)
+        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        return next_state, (
+            policy_sketch,
+            value_sketch,
+            valid,
+            jnp.where(policy_distribution_valid, policy_norm, nan),
+            jnp.where(value_distribution_valid, value_norm, nan),
+        )
 
     (
         policy_sum,
@@ -421,7 +455,13 @@ def compute_environment_conditioned_cosines(
     ), sketch_outputs = jax.lax.scan(
         accumulate_chunk, initial_state, chunked_inputs
     )
-    policy_sketches, value_sketches, valid_environments = sketch_outputs
+    (
+        policy_sketches,
+        value_sketches,
+        valid_environments,
+        policy_environment_norms,
+        raw_value_environment_norms,
+    ) = sketch_outputs
     policy_sketches = policy_sketches.reshape(
         (num_environments, int(sketch_size))
     )
@@ -429,6 +469,73 @@ def compute_environment_conditioned_cosines(
         (num_environments, int(sketch_size))
     )
     valid_environments = valid_environments.reshape((num_environments,))
+    policy_environment_norms = policy_environment_norms.reshape(
+        (num_environments,)
+    )
+    raw_value_environment_norms = raw_value_environment_norms.reshape(
+        (num_environments,)
+    )
+
+    def distribution_statistics(values):
+        """Return fixed-shape summaries over finite parallel-slot values."""
+        finite = jnp.isfinite(values)
+        count = jnp.sum(finite.astype(jnp.int32))
+        count_float = jnp.maximum(count.astype(jnp.float32), 1.0)
+        safe_values = jnp.where(finite, values, 0.0)
+        mean = jnp.sum(safe_values) / count_float
+        variance = jnp.sum(
+            jnp.where(finite, jnp.square(values - mean), 0.0)
+        ) / count_float
+        standard_deviation = jnp.sqrt(jnp.maximum(variance, 0.0))
+        cv = standard_deviation / jnp.maximum(jnp.abs(mean), epsilon)
+
+        sorted_values = jnp.sort(
+            jnp.where(finite, values, jnp.asarray(jnp.inf, values.dtype))
+        )
+
+        def quantile(probability):
+            position = probability * jnp.maximum(count_float - 1.0, 0.0)
+            lower = jnp.floor(position).astype(jnp.int32)
+            upper = jnp.ceil(position).astype(jnp.int32)
+            fraction = position - lower.astype(jnp.float32)
+            lower_value = sorted_values[lower]
+            upper_value = sorted_values[upper]
+            return lower_value + fraction * (upper_value - lower_value)
+
+        ranks = jnp.arange(num_environments, dtype=jnp.float32)
+        trim_start = 0.25 * count_float
+        trim_end = 0.75 * count_float
+        iqm_weights = jnp.maximum(
+            jnp.minimum(ranks + 1.0, trim_end)
+            - jnp.maximum(ranks, trim_start),
+            0.0,
+        )
+        iqm = jnp.sum(
+            jnp.where(iqm_weights > 0.0, sorted_values, 0.0)
+            * iqm_weights
+        ) / jnp.maximum(jnp.sum(iqm_weights), epsilon)
+
+        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        has_value = count > 0
+        return {
+            "mean": jnp.where(has_value, mean, nan),
+            "cv": jnp.where(has_value, cv, nan),
+            "p10": jnp.where(has_value, quantile(0.10), nan),
+            "p90": jnp.where(has_value, quantile(0.90), nan),
+            "iqm": jnp.where(has_value, iqm, nan),
+        }
+
+    norm_metrics = {}
+    norm_distributions = {
+        "policy_norm": policy_environment_norms,
+        "weighted_value_norm": (
+            jnp.abs(jnp.asarray(value_loss_coefficient, dtype=jnp.float32))
+            * raw_value_environment_norms
+        ),
+    }
+    for gradient_name, values in norm_distributions.items():
+        for statistic, result in distribution_statistics(values).items():
+            norm_metrics[f"{gradient_name}_{statistic}"] = result
 
     def normalize_sketches(sketches):
         norms = jnp.linalg.norm(sketches, axis=1, keepdims=True)
@@ -614,4 +721,5 @@ def compute_environment_conditioned_cosines(
         "value_parameterwise_gsnr_mean_log10": (
             value_parameterwise_gsnr_mean_log10
         ),
+        **norm_metrics,
     }

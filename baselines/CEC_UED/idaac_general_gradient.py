@@ -32,6 +32,7 @@ import flax.core
 import flax.traverse_util
 from algo_utils import EVAL_LAYOUTS_9
 from environment_gradient import (
+    ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES,
     compute_environment_conditioned_cosines,
     environment_gradient_log_key,
 )
@@ -501,7 +502,7 @@ IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "value_parameterwise_gsnr_mean",
     "policy_parameterwise_gsnr_mean_log10",
     "value_parameterwise_gsnr_mean_log10",
-)
+) + ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES
 
 
 def empty_idaac_policy_value_metrics(dtype=jnp.float32):
@@ -1096,6 +1097,7 @@ def make_train(
                         shared_param_keys=("actor_trunk", "critic_trunk"),
                         policy_gsnr_param_keys=("actor_trunk",),
                         value_gsnr_param_keys=("critic_trunk",),
+                        value_loss_coefficient=config["VF_COEF"],
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

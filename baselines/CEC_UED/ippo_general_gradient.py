@@ -981,6 +981,7 @@ def make_train(
                         shared_param_keys=SHARED_TRUNK_KEYS,
                         policy_gsnr_param_keys=SHARED_TRUNK_KEYS,
                         value_gsnr_param_keys=SHARED_TRUNK_KEYS,
+                        value_loss_coefficient=config["VF_COEF"],
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

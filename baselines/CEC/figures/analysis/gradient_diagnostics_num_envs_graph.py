@@ -51,6 +51,14 @@ METRIC_GROUPS = {
         "env_gradient_gsnr/policy_parameterwise_gsnr_mean_log10",
         "env_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
     ),
+    "env_gradient_norm": tuple(
+        f"env_gradient_norm/{gradient_name}_{statistic}"
+        for gradient_name in (
+            "policy_norm",
+            "weighted_value_norm",
+        )
+        for statistic in ("mean", "cv", "p10", "p90", "iqm")
+    ),
     "env_gradient_rank": (
         "env_gradient_rank/policy_effective_rank",
         "env_gradient_rank/value_effective_rank",

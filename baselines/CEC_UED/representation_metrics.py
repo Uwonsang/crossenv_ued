@@ -3,6 +3,8 @@
 import jax
 import jax.numpy as jnp
 
+from static_grid_grouping import unique_static_grid_signatures
+
 
 FEATURE_RANK_DISTRIBUTION_STATISTICS = ("mean", "cv", "p10", "p90", "iqm")
 
@@ -91,100 +93,29 @@ def _finite_distribution_statistics(values, epsilon=1e-12):
         "iqm": jnp.where(has_value, iqm, nan),
     }
 
-
-def parallel_slot_feature_rank_metrics(
+def static_grid_feature_metrics(
     features,
-    actor_indices,
-    num_slots,
-    num_agents,
-    epsilon=1e-12,
-):
-    """Compute within-slot rank distribution and rank between slot means."""
-    # features: (time, selected_actor, feature); actor-major storage maps an
-    # actor back to its parallel slot via actor_index % NUM_ENVS.
-    actor_features = jnp.swapaxes(features, 0, 1).astype(jnp.float32)
-    slot_ids = actor_indices.astype(jnp.int32) % int(num_slots)
-    time_size = int(actor_features.shape[1])
-    selected_actor_count = int(actor_features.shape[0])
-    actor_positions = jnp.arange(selected_actor_count, dtype=jnp.int32)
-
-    def compute_one_slot(slot_index):
-        candidate_positions = jnp.where(
-            slot_ids == slot_index,
-            actor_positions,
-            selected_actor_count,
-        )
-        selected_positions = jnp.sort(candidate_positions)[:int(num_agents)]
-        selected_valid = selected_positions < selected_actor_count
-        safe_positions = jnp.minimum(
-            selected_positions, selected_actor_count - 1
-        )
-        selected_features = actor_features[safe_positions]
-        selected_weights = selected_valid.astype(jnp.float32)[:, None, None]
-        selected_features = selected_features * selected_weights
-        sample_count = (
-            jnp.sum(selected_valid.astype(jnp.float32)) * float(time_size)
-        )
-        feature_sum = jnp.sum(selected_features, axis=(0, 1))
-        feature_mean = feature_sum / jnp.maximum(sample_count, 1.0)
-        centered_features = (
-            selected_features - feature_mean[None, None, :]
-        ) * selected_weights
-        covariance = jnp.einsum(
-            "atd,ate->de", centered_features, centered_features
-        ) / jnp.maximum(sample_count - 1.0, 1.0)
-        rank = jnp.where(
-            sample_count > 1.0,
-            _effective_rank_from_covariance(covariance, epsilon=epsilon),
-            jnp.asarray(jnp.nan, dtype=jnp.float32),
-        )
-        return rank, feature_mean, sample_count > 0.0
-
-    within_slot_ranks, slot_means, valid_slots = jax.lax.map(
-        compute_one_slot,
-        jnp.arange(int(num_slots), dtype=jnp.int32),
-    )
-    valid_slot_count = jnp.sum(valid_slots.astype(jnp.float32))
-    mean_of_slot_means = jnp.sum(
-        jnp.where(valid_slots[:, None], slot_means, 0.0), axis=0
-    ) / jnp.maximum(valid_slot_count, 1.0)
-    centered_slot_means = jnp.where(
-        valid_slots[:, None], slot_means - mean_of_slot_means, 0.0
-    )
-    between_covariance = (
-        centered_slot_means.T @ centered_slot_means
-    ) / jnp.maximum(valid_slot_count - 1.0, 1.0)
-    between_slot_rank = jnp.where(
-        valid_slot_count > 1.0,
-        _effective_rank_from_covariance(
-            between_covariance, epsilon=epsilon
-        ),
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    return (
-        _finite_distribution_statistics(within_slot_ranks, epsilon=epsilon),
-        between_slot_rank,
-    )
-
-
-def parallel_slot_covariance_alignment(
-    features,
-    actor_indices,
     sample_mask,
-    slot_layout_ids,
-    num_slots,
-    num_agents,
+    static_signatures,
+    sample_layout_ids,
+    max_groups,
     num_layouts=5,
     epsilon=1e-12,
 ):
-    """Average covariance alignment for same/different-layout slot pairs."""
-    actor_features = jnp.swapaxes(features, 0, 1).astype(jnp.float32)
-    actor_sample_mask = jnp.swapaxes(sample_mask, 0, 1).astype(jnp.bool_)
-    slot_ids = actor_indices.astype(jnp.int32) % int(num_slots)
-    selected_actor_count = int(actor_features.shape[0])
-    feature_size = int(actor_features.shape[2])
-    actor_positions = jnp.arange(selected_actor_count, dtype=jnp.int32)
+    """Aggregate feature statistics over every grid seen in the minibatch."""
+    features = features.astype(jnp.float32)
+    sample_mask = sample_mask.astype(jnp.bool_)
+    feature_size = int(features.shape[-1])
+    representatives, _, retained_count, _ = unique_static_grid_signatures(
+        static_signatures,
+        sample_mask,
+        max_groups=max_groups,
+    )
+    nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
     initial_state = (
+        jnp.full((int(max_groups),), jnp.nan, dtype=jnp.float32),
+        jnp.zeros((int(max_groups), feature_size), dtype=jnp.float32),
+        jnp.zeros((int(max_groups),), dtype=jnp.bool_),
         jnp.zeros(
             (int(num_layouts), feature_size, feature_size),
             dtype=jnp.float32,
@@ -192,52 +123,97 @@ def parallel_slot_covariance_alignment(
         jnp.zeros((int(num_layouts),), dtype=jnp.float32),
     )
 
-    def accumulate_slot(state, slot_index):
-        covariance_sum_by_layout, count_by_layout = state
-        candidate_positions = jnp.where(
-            slot_ids == slot_index,
-            actor_positions,
-            selected_actor_count,
+    def compute_group(group_index, state):
+        (
+            group_ranks,
+            group_means,
+            valid_groups,
+            covariance_sum_by_layout,
+            count_by_layout,
+        ) = state
+        retained = group_index < retained_count
+        signature_match = jnp.all(
+            static_signatures == representatives[group_index], axis=-1
         )
-        selected_positions = jnp.sort(candidate_positions)[:int(num_agents)]
-        selected_valid = selected_positions < selected_actor_count
-        safe_positions = jnp.minimum(
-            selected_positions, selected_actor_count - 1
+        group_mask = jnp.logical_and(
+            sample_mask, jnp.logical_and(retained, signature_match)
         )
-        selected_features = actor_features[safe_positions]
-        selected_mask = jnp.logical_and(
-            actor_sample_mask[safe_positions], selected_valid[:, None]
-        )
-        weights = selected_mask.astype(jnp.float32)[..., None]
-        sample_count = jnp.sum(selected_mask.astype(jnp.float32))
-        feature_sum = jnp.sum(selected_features * weights, axis=(0, 1))
+        weights = group_mask.astype(jnp.float32)[..., None]
+        sample_count = jnp.sum(group_mask.astype(jnp.float32))
+        feature_sum = jnp.sum(features * weights, axis=(0, 1))
         feature_mean = feature_sum / jnp.maximum(sample_count, 1.0)
-        centered_features = (selected_features - feature_mean) * weights
+        centered = (features - feature_mean) * weights
         covariance = jnp.einsum(
-            "atd,ate->de", centered_features, centered_features
+            "tad,tae->de", centered, centered
         ) / jnp.maximum(sample_count - 1.0, 1.0)
         covariance_norm = jnp.linalg.norm(covariance)
         valid = jnp.logical_and(
-            sample_count > 1.0, covariance_norm > epsilon
+            retained,
+            jnp.logical_and(sample_count > 1.0, covariance_norm > epsilon),
+        )
+        rank = jnp.where(
+            valid,
+            _effective_rank_from_covariance(covariance, epsilon=epsilon),
+            nan,
         )
         normalized_covariance = jnp.where(
             valid,
             covariance / jnp.maximum(covariance_norm, epsilon),
             jnp.zeros_like(covariance),
         )
-        layout_id = slot_layout_ids[slot_index].astype(jnp.int32)
+        layout_counts = jnp.sum(
+            jax.nn.one_hot(
+                sample_layout_ids.astype(jnp.int32),
+                int(num_layouts),
+                dtype=jnp.float32,
+            )
+            * group_mask.astype(jnp.float32)[..., None],
+            axis=(0, 1),
+        )
+        layout_id = jnp.argmax(layout_counts).astype(jnp.int32)
+        group_ranks = group_ranks.at[group_index].set(rank)
+        group_means = group_means.at[group_index].set(feature_mean)
+        valid_groups = valid_groups.at[group_index].set(valid)
         covariance_sum_by_layout = covariance_sum_by_layout.at[
             layout_id
         ].add(normalized_covariance)
         count_by_layout = count_by_layout.at[layout_id].add(
             valid.astype(jnp.float32)
         )
-        return (covariance_sum_by_layout, count_by_layout), None
+        return (
+            group_ranks,
+            group_means,
+            valid_groups,
+            covariance_sum_by_layout,
+            count_by_layout,
+        )
 
-    (covariance_sum_by_layout, count_by_layout), _ = jax.lax.scan(
-        accumulate_slot,
+    (
+        group_ranks,
+        group_means,
+        valid_groups,
+        covariance_sum_by_layout,
+        count_by_layout,
+    ) = jax.lax.fori_loop(
+        0,
+        retained_count,
+        compute_group,
         initial_state,
-        jnp.arange(int(num_slots), dtype=jnp.int32),
+    )
+    valid_group_count = jnp.sum(valid_groups.astype(jnp.float32))
+    mean_of_group_means = jnp.sum(
+        jnp.where(valid_groups[:, None], group_means, 0.0), axis=0
+    ) / jnp.maximum(valid_group_count, 1.0)
+    centered_group_means = jnp.where(
+        valid_groups[:, None], group_means - mean_of_group_means, 0.0
+    )
+    between_covariance = (
+        centered_group_means.T @ centered_group_means
+    ) / jnp.maximum(valid_group_count - 1.0, 1.0)
+    between_rank = jnp.where(
+        valid_group_count > 1.0,
+        _effective_rank_from_covariance(between_covariance, epsilon=epsilon),
+        nan,
     )
     squared_sum_by_layout = jnp.sum(
         jnp.square(covariance_sum_by_layout), axis=(1, 2)
@@ -252,12 +228,9 @@ def parallel_slot_covariance_alignment(
     total_pair_count = total_count * (total_count - 1.0)
     different_sum = total_sum - same_sum
     different_count = total_pair_count - same_count
-    nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
-    return {
+    alignment = {
         "same_layout_mean": jnp.where(
-            same_count > 0.0,
-            same_sum / jnp.maximum(same_count, 1.0),
-            nan,
+            same_count > 0.0, same_sum / jnp.maximum(same_count, 1.0), nan
         ),
         "different_layout_mean": jnp.where(
             different_count > 0.0,
@@ -265,6 +238,11 @@ def parallel_slot_covariance_alignment(
             nan,
         ),
     }
+    return (
+        _finite_distribution_statistics(group_ranks, epsilon=epsilon),
+        between_rank,
+        alignment,
+    )
 
 
 def compute_pooled_feature_rank_metrics(
@@ -273,11 +251,10 @@ def compute_pooled_feature_rank_metrics(
     initial_hstate,
     network_inputs,
     feature_names,
-    actor_indices,
     sample_mask,
-    slot_layout_ids,
-    num_slots,
-    num_agents,
+    static_signatures,
+    sample_layout_ids,
+    max_groups,
 ):
     """Capture named representations and compute their pooled ranks."""
     _, collections = network.apply(
@@ -294,22 +271,21 @@ def compute_pooled_feature_rank_metrics(
         metrics[f"{namespace}/effective_rank"] = (
             centered_effective_rank(features)
         )
-        within_statistics, between_rank = parallel_slot_feature_rank_metrics(
+        (
+            within_statistics,
+            between_rank,
+            covariance_alignment,
+        ) = static_grid_feature_metrics(
             features,
-            actor_indices=actor_indices,
-            num_slots=num_slots,
-            num_agents=num_agents,
+            sample_mask=sample_mask,
+            static_signatures=static_signatures,
+            sample_layout_ids=sample_layout_ids,
+            max_groups=max_groups,
         )
         for statistic, value in within_statistics.items():
-            metrics[f"{namespace}/within_slot_{statistic}"] = value
-        metrics[f"{namespace}/between_slot_effective_rank"] = between_rank
-        covariance_alignment = parallel_slot_covariance_alignment(
-            features,
-            actor_indices=actor_indices,
-            sample_mask=sample_mask,
-            slot_layout_ids=slot_layout_ids,
-            num_slots=num_slots,
-            num_agents=num_agents,
+            metrics[f"{namespace}/within_static_grid_{statistic}"] = value
+        metrics[f"{namespace}/between_static_grid_effective_rank"] = (
+            between_rank
         )
         for alignment_name, value in covariance_alignment.items():
             metrics[
@@ -326,13 +302,13 @@ def empty_pooled_feature_rank_metrics(feature_names, dtype=jnp.float32):
         )
         for metric_name, _ in feature_names
     } | {
-        f"feature_rank_{metric_name}/within_slot_{statistic}": jnp.asarray(
+        f"feature_rank_{metric_name}/within_static_grid_{statistic}": jnp.asarray(
             jnp.nan, dtype=dtype
         )
         for metric_name, _ in feature_names
         for statistic in FEATURE_RANK_DISTRIBUTION_STATISTICS
     } | {
-        f"feature_rank_{metric_name}/between_slot_effective_rank": (
+        f"feature_rank_{metric_name}/between_static_grid_effective_rank": (
             jnp.asarray(jnp.nan, dtype=dtype)
         )
         for metric_name, _ in feature_names

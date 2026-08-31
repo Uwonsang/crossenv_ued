@@ -30,7 +30,7 @@ import time
 import yaml
 from algo_utils import EVAL_LAYOUTS_9
 from environment_gradient import (
-    compute_environment_conditioned_cosines,
+    compute_static_grid_conditioned_gradients,
     empty_environment_gradient_metrics,
     environment_gradient_log_key,
 )
@@ -67,6 +67,7 @@ SHARED_TRUNK_KEYS = (
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
+    config["DIAGNOSTIC_AGGREGATION"] = "unique_static_grid"
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
@@ -836,34 +837,13 @@ def make_train(
                         (-1, traj_batch.static_signature.shape[-1])
                     )
                 )
-                selected_environment_ids_by_actor = (
-                    stiffness_actor_indices % int(config["NUM_ENVS"])
+                selected_layout_ids_by_state = jnp.take(
+                    traj_batch.layout_id, stiffness_actor_indices, axis=1
                 )
-                stiffness_environment_ids = jnp.broadcast_to(
-                    selected_environment_ids_by_actor[None, :],
+                selected_static_sample_mask_by_state = jnp.ones(
                     selected_static_signatures_by_state.shape[:2],
-                ).reshape(-1)
-                initial_environment_signatures = (
-                    traj_batch.static_signature[
-                        0, :int(config["NUM_ENVS"])
-                    ]
+                    dtype=jnp.bool_,
                 )
-                selected_initial_environment_signatures = jnp.take(
-                    initial_environment_signatures,
-                    selected_environment_ids_by_actor,
-                    axis=0,
-                )
-                stiffness_environment_sample_mask_by_state = jnp.all(
-                    selected_static_signatures_by_state
-                    == selected_initial_environment_signatures[None, :, :],
-                    axis=-1,
-                )
-                stiffness_environment_sample_mask = (
-                    stiffness_environment_sample_mask_by_state.reshape(-1)
-                )
-                stiffness_environment_layout_ids = traj_batch.layout_id[
-                    0, :int(config["NUM_ENVS"])
-                ]
                 policy_value_hstate = jax.tree.map(
                     lambda value: jnp.take(
                         value, stiffness_actor_indices, axis=0
@@ -894,13 +874,10 @@ def make_train(
                             policy_value_traj.agent_positions,
                         ),
                         feature_names=IPPO_FEATURE_RANK_NAMES,
-                        actor_indices=stiffness_actor_indices,
-                        sample_mask=(
-                            stiffness_environment_sample_mask_by_state
-                        ),
-                        slot_layout_ids=stiffness_environment_layout_ids,
-                        num_slots=config["NUM_ENVS"],
-                        num_agents=env.num_agents,
+                        sample_mask=selected_static_sample_mask_by_state,
+                        static_signatures=selected_static_signatures_by_state,
+                        sample_layout_ids=selected_layout_ids_by_state,
+                        max_groups=stiffness_sample_size,
                     ),
                     lambda _: empty_pooled_feature_rank_metrics(
                         IPPO_FEATURE_RANK_NAMES
@@ -908,71 +885,8 @@ def make_train(
                     operand=None,
                 )
 
-                # Reassemble the selected actor trajectories by environment.
-                # batchify uses agent-major ordering: actor = agent * N + env.
-                environment_actor_indices = (
-                    jnp.arange(env.num_agents)[:, None]
-                    * int(config["NUM_ENVS"])
-                    + jnp.arange(int(config["NUM_ENVS"]))[None, :]
-                ).T
-                flat_environment_actor_indices = (
-                    environment_actor_indices.reshape(-1)
-                )
-                selected_actor_mask = jnp.zeros(
-                    (int(config["NUM_ACTORS"]),), dtype=jnp.bool_
-                ).at[stiffness_actor_indices].set(True)
-                environment_actor_mask = jnp.take(
-                    selected_actor_mask,
-                    environment_actor_indices,
-                    axis=0,
-                )
-
-                def group_actor_trajectories(values):
-                    gathered = jnp.take(
-                        values, flat_environment_actor_indices, axis=1
-                    )
-                    gathered = gathered.reshape(
-                        (gathered.shape[0], int(config["NUM_ENVS"]),
-                         env.num_agents) + gathered.shape[2:]
-                    )
-                    return jnp.swapaxes(gathered, 0, 1)
-
-                def group_actor_hstates(values):
-                    gathered = jnp.take(
-                        values, flat_environment_actor_indices, axis=0
-                    )
-                    return gathered.reshape(
-                        (int(config["NUM_ENVS"]), env.num_agents)
-                        + gathered.shape[1:]
-                    )
-
-                environment_hstates = jax.tree.map(
-                    group_actor_hstates, initial_hstate
-                )
-                environment_trajectories = jax.tree.map(
-                    group_actor_trajectories, traj_batch
-                )
                 selected_advantage_mean = policy_value_advantages.mean()
                 selected_advantage_std = policy_value_advantages.std()
-                normalized_advantages = (
-                    advantages - selected_advantage_mean
-                ) / (selected_advantage_std + 1e-8)
-                environment_advantages = group_actor_trajectories(
-                    normalized_advantages
-                )
-                environment_targets = group_actor_trajectories(targets)
-                environment_signatures = group_actor_trajectories(
-                    traj_batch.static_signature
-                )
-                same_static_environment = jnp.all(
-                    environment_signatures
-                    == initial_environment_signatures[:, None, None, :],
-                    axis=-1,
-                )
-                environment_sample_mask = jnp.logical_and(
-                    same_static_environment,
-                    environment_actor_mask[:, None, :],
-                )
 
                 def _compute_stiffness(_):
                     (
@@ -997,13 +911,10 @@ def make_train(
                         dones=stiffness_dones,
                         agent_positions=stiffness_agent_positions,
                         targets=stiffness_targets,
-                        environment_ids=stiffness_environment_ids,
-                        environment_sample_mask=(
-                            stiffness_environment_sample_mask
-                        ),
-                        environment_layout_ids=(
-                            stiffness_environment_layout_ids
-                        ),
+                        sample_static_signatures=selected_static_signatures,
+                        sample_layout_ids=selected_layout_ids_by_state.reshape(-1),
+                        sample_mask=selected_static_sample_mask_by_state.reshape(-1),
+                        max_static_grids=stiffness_sample_size,
                         value_param_keys=VALUE_TRUNK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
@@ -1038,14 +949,19 @@ def make_train(
                 )
                 environment_gradient_metrics = jax.lax.cond(
                     run_stiffness,
-                    lambda _: compute_environment_conditioned_cosines(
+                    lambda _: compute_static_grid_conditioned_gradients(
                         network=network,
                         params=original_params,
-                        initial_hstates=environment_hstates,
-                        trajectories=environment_trajectories,
-                        normalized_advantages=environment_advantages,
-                        targets=environment_targets,
-                        sample_mask=environment_sample_mask,
+                        initial_hstates=policy_value_hstate,
+                        trajectories=policy_value_traj,
+                        normalized_advantages=(
+                            policy_value_advantages
+                            - selected_advantage_mean
+                        ) / (selected_advantage_std + 1e-8),
+                        targets=policy_value_targets,
+                        sample_mask=selected_static_sample_mask_by_state,
+                        static_signatures=selected_static_signatures_by_state,
+                        max_static_grids=stiffness_sample_size,
                         shared_param_keys=SHARED_TRUNK_KEYS,
                         policy_gsnr_param_keys=SHARED_TRUNK_KEYS,
                         value_gsnr_param_keys=SHARED_TRUNK_KEYS,
@@ -1479,7 +1395,7 @@ def main(config):
         wandb.init(
             entity=config["ENTITY"],
             project=config["PROJECT"],
-            tags=["IPPO", "RNN", "SP"],
+            tags=["IPPO", "RNN", "SP", "UNIQUE_STATIC_GRID"],
             config=config,
             mode=config["WANDB_MODE"],
             name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"

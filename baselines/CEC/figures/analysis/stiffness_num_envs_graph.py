@@ -25,17 +25,17 @@ DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "stiffness_results" / "stiff
 
 METRICS = {
     "off_diagonal": "stiffness/paper_value_off_diagonal",
-    "same_layout_per_environment": (
-        "stiffness/paper_value_same_layout_per_environment"
+    "same_layout_per_static_grid": (
+        "stiffness/paper_value_same_layout_per_static_grid"
     ),
-    "different_layout_per_environment": (
-        "stiffness/paper_value_different_layout_per_environment"
+    "different_layout_per_static_grid": (
+        "stiffness/paper_value_different_layout_per_static_grid"
     ),
 }
 PANEL_TITLES = {
     "off_diagonal": "Off-diagonal",
-    "same_layout_per_environment": "Same-layout (per environment)",
-    "different_layout_per_environment": "Different-layout (per environment)",
+    "same_layout_per_static_grid": "Same-layout (per static grid)",
+    "different_layout_per_static_grid": "Different-layout (per static grid)",
 }
 COLORS = {"CEC": "#4c9a3a", "CEC_IDAAC": "#377eb8"}
 MARKERS = {"CEC": "o", "CEC_IDAAC": "o"}
@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--target-timesteps", type=int, default=DEFAULT_TARGET_TIMESTEPS
+    )
+    parser.add_argument(
+        "--aggregation",
+        default="unique_static_grid",
+        help="Required DIAGNOSTIC_AGGREGATION value in the W&B run config.",
     )
     parser.add_argument(
         "--min-progress",
@@ -114,6 +119,11 @@ def fetch_run_means(args: argparse.Namespace):
     keys = list(METRICS.values())
 
     for run in runs:
+        if (
+            args.aggregation
+            and run.config.get("DIAGNOSTIC_AGGREGATION") != args.aggregation
+        ):
+            continue
         if not args.include_running and run.state == "running":
             print(f"Skipping running run: {run.id} ({run.name})")
             continue

@@ -11,11 +11,13 @@ import flax
 import jax
 import jax.numpy as jnp
 
+from static_grid_grouping import unique_static_grid_signatures
+
 
 STIFFNESS_METRIC_NAMES = (
     "value_off_diagonal",
-    "value_same_layout_per_environment",
-    "value_different_layout_per_environment",
+    "value_same_layout_per_static_grid",
+    "value_different_layout_per_static_grid",
 )
 
 
@@ -191,9 +193,10 @@ def compute_paper_stiffness(
     dones: jnp.ndarray,
     agent_positions: jnp.ndarray,
     targets: jnp.ndarray,
-    environment_ids: jnp.ndarray,
-    environment_sample_mask: jnp.ndarray,
-    environment_layout_ids: jnp.ndarray,
+    sample_static_signatures: jnp.ndarray,
+    sample_layout_ids: jnp.ndarray,
+    sample_mask: jnp.ndarray,
+    max_static_grids: int,
     value_param_keys: Sequence[str],
     chunk_size: int,
     num_layouts: int = 5,
@@ -212,7 +215,18 @@ def compute_paper_stiffness(
         raise ValueError("chunk_size must evenly divide the sampled batch.")
     if int(sketch_size) <= 0:
         raise ValueError("sketch_size must be positive.")
-    num_environments = int(environment_layout_ids.shape[0])
+    (
+        _,
+        _,
+        retained_static_grid_count,
+        sample_static_grid_ids,
+    ) = (
+        unique_static_grid_signatures(
+            sample_static_signatures,
+            sample_mask,
+            max_groups=max_static_grids,
+        )
+    )
 
     value_params, merge_params = _partition_value_params(
         params, value_param_keys
@@ -262,25 +276,30 @@ def compute_paper_stiffness(
         chunk(dones),
         chunk(agent_positions),
         chunk(targets),
-        chunk(environment_ids),
-        chunk(environment_sample_mask),
+        chunk(sample_static_grid_ids),
+        chunk(sample_layout_ids),
+        chunk(sample_mask),
     )
     normalized_gradient_sum = jax.tree.map(jnp.zeros_like, value_params)
     initial_state = (
         normalized_gradient_sum,
         jnp.asarray(0.0, dtype=jnp.float32),
         jnp.zeros(
-            (num_environments, int(sketch_size)), dtype=jnp.float32
+            (int(max_static_grids), int(sketch_size)), dtype=jnp.float32
         ),
-        jnp.zeros((num_environments,), dtype=jnp.float32),
+        jnp.zeros((int(max_static_grids),), dtype=jnp.float32),
+        jnp.zeros(
+            (int(max_static_grids), int(num_layouts)), dtype=jnp.float32
+        ),
     )
 
     def accumulate_chunk(state, batch):
         (
             normalized_sum,
             valid_count,
-            raw_gradient_sketch_by_environment,
-            sample_count_by_environment,
+            raw_gradient_sketch_by_static_grid,
+            sample_count_by_static_grid,
+            layout_count_by_static_grid,
         ) = state
         (
             batch_hstates,
@@ -288,8 +307,9 @@ def compute_paper_stiffness(
             batch_dones,
             batch_agent_positions,
             batch_targets,
-            batch_environment_ids,
-            batch_environment_sample_mask,
+            batch_static_grid_ids,
+            batch_layout_ids,
+            batch_sample_mask,
         ) = batch
         gradients = jax.vmap(
             individual_gradient,
@@ -367,32 +387,43 @@ def compute_paper_stiffness(
             raw_gradient_sketches += jax.vmap(add_to_sketch)(flat_gradient)
             parameter_offset += int(flat_gradient.shape[1])
 
-        valid_environment_sample = jnp.logical_and(
-            valid, batch_environment_sample_mask.astype(jnp.bool_)
+        retained_sample = jnp.logical_and(
+            batch_static_grid_ids >= 0,
+            jnp.logical_and(valid, batch_sample_mask.astype(jnp.bool_)),
         )
-        raw_gradient_sketch_by_environment = (
-            raw_gradient_sketch_by_environment.at[
-                batch_environment_ids.astype(jnp.int32)
-            ].add(
-                raw_gradient_sketches
-                * valid_environment_sample.astype(jnp.float32)[:, None]
+        safe_group_ids = jnp.clip(
+            batch_static_grid_ids, 0, int(max_static_grids) - 1
+        )
+        sample_weights = retained_sample.astype(jnp.float32)
+        raw_gradient_sketch_by_static_grid = (
+            raw_gradient_sketch_by_static_grid.at[safe_group_ids].add(
+                raw_gradient_sketches * sample_weights[:, None]
             )
         )
-        sample_count_by_environment = sample_count_by_environment.at[
-            batch_environment_ids.astype(jnp.int32)
-        ].add(valid_environment_sample.astype(jnp.float32))
+        sample_count_by_static_grid = sample_count_by_static_grid.at[
+            safe_group_ids
+        ].add(sample_weights)
+        layout_count_by_static_grid = layout_count_by_static_grid.at[
+            safe_group_ids
+        ].add(jax.nn.one_hot(
+            batch_layout_ids.astype(jnp.int32),
+            int(num_layouts),
+            dtype=jnp.float32,
+        ) * sample_weights[:, None])
         return (
             normalized_sum,
             valid_count + jnp.sum(valid.astype(jnp.float32)),
-            raw_gradient_sketch_by_environment,
-            sample_count_by_environment,
+            raw_gradient_sketch_by_static_grid,
+            sample_count_by_static_grid,
+            layout_count_by_static_grid,
         ), None
 
     (
         normalized_gradient_sum,
         valid_sample_count,
-        raw_gradient_sketch_by_environment,
-        sample_count_by_environment,
+        raw_gradient_sketch_by_static_grid,
+        sample_count_by_static_grid,
+        layout_count_by_static_grid,
     ), _ = jax.lax.scan(accumulate_chunk, initial_state, chunked_inputs)
 
     squared_sum_norm = sum(
@@ -412,60 +443,68 @@ def compute_paper_stiffness(
 
     off_diagonal = safe_mean(off_diagonal_sum, off_diagonal_count)
 
-    environment_sketch_norms = jnp.linalg.norm(
-        raw_gradient_sketch_by_environment, axis=1
+    static_grid_layout_ids = jnp.argmax(
+        layout_count_by_static_grid, axis=1
+    ).astype(jnp.int32)
+    static_grid_indices = jnp.arange(int(max_static_grids), dtype=jnp.int32)
+    valid_group_index = static_grid_indices < retained_static_grid_count
+    static_grid_sketch_norms = jnp.linalg.norm(
+        raw_gradient_sketch_by_static_grid, axis=1
     )
-    valid_environments = jnp.logical_and(
-        sample_count_by_environment > 0.0,
-        environment_sketch_norms > epsilon,
+    valid_static_grids = jnp.logical_and(
+        valid_group_index,
+        jnp.logical_and(
+            sample_count_by_static_grid > 0.0,
+            static_grid_sketch_norms > epsilon,
+        ),
     )
-    normalized_environment_sketches = jnp.where(
-        valid_environments[:, None],
-        raw_gradient_sketch_by_environment
-        / jnp.maximum(environment_sketch_norms[:, None], epsilon),
-        0.0,
+    normalized_static_grid_sketches = jnp.where(
+        valid_static_grids[:, None],
+        raw_gradient_sketch_by_static_grid
+        / jnp.maximum(static_grid_sketch_norms[:, None], epsilon),
+        jnp.zeros_like(raw_gradient_sketch_by_static_grid),
     )
-    environment_layout_weights = jax.nn.one_hot(
-        environment_layout_ids.astype(jnp.int32),
+    static_grid_layout_weights = jax.nn.one_hot(
+        static_grid_layout_ids.astype(jnp.int32),
         num_layouts,
         dtype=jnp.float32,
-    ) * valid_environments.astype(jnp.float32)[:, None]
-    normalized_environment_sum_by_layout = (
-        environment_layout_weights.T @ normalized_environment_sketches
+    ) * valid_static_grids.astype(jnp.float32)[:, None]
+    normalized_static_grid_sum_by_layout = (
+        static_grid_layout_weights.T @ normalized_static_grid_sketches
     )
-    environment_count_by_layout = jnp.sum(
-        environment_layout_weights, axis=0
+    static_grid_count_by_layout = jnp.sum(
+        static_grid_layout_weights, axis=0
     )
-    environment_squared_sum_by_layout = jnp.sum(
-        jnp.square(normalized_environment_sum_by_layout), axis=1
+    static_grid_squared_sum_by_layout = jnp.sum(
+        jnp.square(normalized_static_grid_sum_by_layout), axis=1
     )
-    environment_count = jnp.sum(environment_count_by_layout)
-    environment_same_layout_sum = jnp.sum(
-        environment_squared_sum_by_layout - environment_count_by_layout
+    static_grid_count = jnp.sum(static_grid_count_by_layout)
+    static_grid_same_layout_sum = jnp.sum(
+        static_grid_squared_sum_by_layout - static_grid_count_by_layout
     )
-    environment_same_layout_count = jnp.sum(
-        environment_count_by_layout * (environment_count_by_layout - 1.0)
+    static_grid_same_layout_count = jnp.sum(
+        static_grid_count_by_layout * (static_grid_count_by_layout - 1.0)
     )
-    environment_total_sum = (
+    static_grid_total_sum = (
         jnp.sum(jnp.square(jnp.sum(
-            normalized_environment_sum_by_layout, axis=0
+            normalized_static_grid_sum_by_layout, axis=0
         )))
-        - environment_count
+        - static_grid_count
     )
-    environment_total_count = environment_count * (environment_count - 1.0)
-    environment_different_layout_sum = (
-        environment_total_sum - environment_same_layout_sum
+    static_grid_total_count = static_grid_count * (static_grid_count - 1.0)
+    static_grid_different_layout_sum = (
+        static_grid_total_sum - static_grid_same_layout_sum
     )
-    environment_different_layout_count = (
-        environment_total_count - environment_same_layout_count
+    static_grid_different_layout_count = (
+        static_grid_total_count - static_grid_same_layout_count
     )
     return {
         "value_off_diagonal": off_diagonal,
-        "value_same_layout_per_environment": safe_mean(
-            environment_same_layout_sum, environment_same_layout_count
+        "value_same_layout_per_static_grid": safe_mean(
+            static_grid_same_layout_sum, static_grid_same_layout_count
         ),
-        "value_different_layout_per_environment": safe_mean(
-            environment_different_layout_sum,
-            environment_different_layout_count,
+        "value_different_layout_per_static_grid": safe_mean(
+            static_grid_different_layout_sum,
+            static_grid_different_layout_count,
         ),
     }

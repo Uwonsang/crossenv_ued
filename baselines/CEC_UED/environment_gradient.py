@@ -6,6 +6,8 @@ import flax
 import jax
 import jax.numpy as jnp
 
+from static_grid_grouping import unique_static_grid_signatures
+
 
 ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES = tuple(
     f"{gradient_name}_{statistic}"
@@ -20,8 +22,8 @@ ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES = tuple(
 ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "policy_policy_mean_cosine",
     "value_value_mean_cosine",
-    "policy_value_same_env_cosine",
-    "policy_value_cross_env_cosine",
+    "policy_value_same_static_grid_cosine",
+    "policy_value_cross_static_grid_cosine",
     "policy_effective_rank",
     "value_effective_rank",
     "policy_effective_rank_ratio",
@@ -42,7 +44,6 @@ def empty_environment_gradient_metrics(dtype=jnp.float32):
         name: jnp.asarray(jnp.nan, dtype=dtype)
         for name in ENVIRONMENT_GRADIENT_METRIC_NAMES
     }
-
 
 def environment_gradient_log_key(metric_name: str) -> str:
     """Group environment-gradient metrics by their analysis purpose."""
@@ -88,7 +89,7 @@ def _partition_params(params, selected_param_keys: Sequence[str]):
     return flax.core.freeze(selected_params), merge
 
 
-def compute_environment_conditioned_cosines(
+def compute_static_grid_conditioned_gradients(
     *,
     network,
     params,
@@ -97,6 +98,8 @@ def compute_environment_conditioned_cosines(
     normalized_advantages: jnp.ndarray,
     targets: jnp.ndarray,
     sample_mask: jnp.ndarray,
+    static_signatures: jnp.ndarray,
+    max_static_grids: int,
     shared_param_keys: Sequence[str],
     clip_eps: float,
     entropy_coef: float,
@@ -107,22 +110,18 @@ def compute_environment_conditioned_cosines(
     value_gsnr_param_keys: Sequence[str] = None,
     value_loss_coefficient: float = 1.0,
 ):
-    """Compute diagnostics across parallel-slot gradients.
+    """Compute diagnostics over distinct static-grid gradients.
 
-    Inputs have a leading environment dimension. Each environment contains
-    the selected agent trajectories assigned to the optimizer's first
-    minibatch. ``sample_mask`` excludes unselected agents and states after a
-    mid-rollout reset changes the static grid. Slots with identical static
-    signatures remain separate observations in every distribution.
+    Every actor-state in the first recurrent minibatch is assigned using its
+    current signature, including configurations introduced by rollout resets.
+    The implementation differentiates one configuration at a time and never
+    materializes a ``unique_grids x parameters`` tensor.
     """
-
-    num_environments = int(sample_mask.shape[0])
-    if num_environments % int(chunk_size) != 0:
-        raise ValueError("chunk_size must evenly divide NUM_ENVS.")
-
-    shared_params, merge_params = _partition_params(
-        params, shared_param_keys
-    )
+    del chunk_size
+    num_slots = int(max_static_grids)
+    if int(sketch_size) <= 0:
+        raise ValueError("sketch_size must be positive.")
+    shared_params, merge_params = _partition_params(params, shared_param_keys)
     policy_gsnr_param_keys = tuple(
         shared_param_keys
         if policy_gsnr_param_keys is None else policy_gsnr_param_keys
@@ -136,590 +135,326 @@ def compute_environment_conditioned_cosines(
         raise ValueError("policy GSNR keys must be in shared_param_keys.")
     if not set(value_gsnr_param_keys).issubset(selected_key_set):
         raise ValueError("value GSNR keys must be in shared_param_keys.")
-    if int(sketch_size) <= 0:
-        raise ValueError("sketch_size must be positive.")
 
-    def losses_for_environment(
-        candidate_shared_params,
-        initial_hstate,
-        trajectory,
-        environment_advantages,
-        environment_targets,
-        environment_mask,
-    ):
-        full_params = merge_params(candidate_shared_params)
+    def losses_for_slot(candidate_shared_params, hstate, trajectory, adv, target, mask):
         _, pi, value = network.apply(
-            full_params,
-            initial_hstate,
-            (
-                trajectory.obs,
-                trajectory.done,
-                trajectory.agent_positions,
-            ),
+            merge_params(candidate_shared_params),
+            hstate,
+            (trajectory.obs, trajectory.done, trajectory.agent_positions),
         )
-        mask = environment_mask.astype(jnp.float32)
-        denominator = jnp.maximum(mask.sum(), 1.0)
-
-        log_prob = pi.log_prob(trajectory.action)
-        ratio = jnp.exp(log_prob - trajectory.log_prob)
+        weights = mask.astype(jnp.float32)
+        denominator = jnp.maximum(jnp.sum(weights), 1.0)
+        ratio = jnp.exp(pi.log_prob(trajectory.action) - trajectory.log_prob)
         actor_terms = -jnp.minimum(
-            ratio * environment_advantages,
-            jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-            * environment_advantages,
+            ratio * adv,
+            jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv,
         )
-        policy_terms = actor_terms - entropy_coef * pi.entropy()
-        policy_loss = jnp.sum(policy_terms * mask) / denominator
-
-        value_pred_clipped = trajectory.value + (
-            value - trajectory.value
-        ).clip(-clip_eps, clip_eps)
+        policy_loss = jnp.sum(
+            (actor_terms - entropy_coef * pi.entropy()) * weights
+        ) / denominator
+        clipped_value = trajectory.value + (value - trajectory.value).clip(
+            -clip_eps, clip_eps
+        )
         value_terms = 0.5 * jnp.maximum(
-            jnp.square(value - environment_targets),
-            jnp.square(value_pred_clipped - environment_targets),
+            jnp.square(value - target), jnp.square(clipped_value - target)
         )
-        value_loss = jnp.sum(value_terms * mask) / denominator
+        value_loss = jnp.sum(value_terms * weights) / denominator
         return policy_loss, value_loss
 
     policy_gradient = jax.grad(
-        lambda candidate, *args: losses_for_environment(
-            candidate, *args
-        )[0]
+        lambda candidate, *args: losses_for_slot(candidate, *args)[0]
     )
     value_gradient = jax.grad(
-        lambda candidate, *args: losses_for_environment(
-            candidate, *args
-        )[1]
+        lambda candidate, *args: losses_for_slot(candidate, *args)[1]
     )
-
-    num_chunks = num_environments // int(chunk_size)
-
-    def chunk(values):
-        return values.reshape(
-            (num_chunks, int(chunk_size)) + values.shape[1:]
+    representatives, _, retained_group_count, _ = (
+        unique_static_grid_signatures(
+            static_signatures,
+            sample_mask,
+            max_groups=max_static_grids,
         )
-
-    chunked_inputs = (
-        jax.tree.map(chunk, initial_hstates),
-        jax.tree.map(chunk, trajectories),
-        chunk(normalized_advantages),
-        chunk(targets),
-        chunk(sample_mask),
     )
-    zero_sum = jax.tree.map(jnp.zeros_like, shared_params)
+    zero_tree = jax.tree.map(jnp.zeros_like, shared_params)
+    nan_vector = jnp.full((num_slots,), jnp.nan, dtype=jnp.float32)
     initial_state = (
-        zero_sum,
-        zero_sum,
-        zero_sum,
-        zero_sum,
-        zero_sum,
-        zero_sum,
-        jnp.asarray(0.0, dtype=jnp.float32),
-        jnp.asarray(0.0, dtype=jnp.float32),
-        jnp.asarray(0.0, dtype=jnp.float32),
-        jnp.asarray(0.0, dtype=jnp.float32),
+        zero_tree, zero_tree, jnp.asarray(0.0, jnp.float32),
+        zero_tree, zero_tree,
+        zero_tree, zero_tree, zero_tree, zero_tree,
+        jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32),
+        jnp.asarray(0.0, jnp.float32), jnp.asarray(0.0, jnp.float32),
+        jnp.zeros((int(sketch_size), int(sketch_size)), jnp.float32),
+        jnp.zeros((int(sketch_size), int(sketch_size)), jnp.float32),
+        nan_vector, nan_vector,
+        jnp.asarray(0, jnp.int32),
     )
 
-    def accumulate_chunk(state, batch):
+    def finalize_group(state):
         (
-            policy_sum,
-            value_sum,
-            raw_policy_sum,
-            raw_value_sum,
-            raw_policy_squared_sum,
-            raw_value_squared_sum,
-            raw_policy_squared_norm_sum,
-            raw_value_squared_norm_sum,
-            same_dot_sum,
-            valid_count,
+            current_policy, current_value, current_sample_count,
+            normalized_policy_sum, normalized_value_sum,
+            raw_policy_sum, raw_value_sum,
+            raw_policy_squared_sum, raw_value_squared_sum,
+            raw_policy_squared_norm_sum, raw_value_squared_norm_sum,
+            same_dot_sum, valid_count,
+            policy_sketch_covariance, value_sketch_covariance,
+            policy_norms, value_norms, group_index,
         ) = state
-        (
-            batch_hstates,
-            batch_trajectories,
-            batch_advantages,
-            batch_targets,
-            batch_mask,
-        ) = batch
-        policy_grads = jax.vmap(
-            policy_gradient,
-            in_axes=(None, 0, 0, 0, 0, 0),
-        )(
-            shared_params,
-            batch_hstates,
-            batch_trajectories,
-            batch_advantages,
-            batch_targets,
-            batch_mask,
+        denominator = jnp.maximum(current_sample_count, 1.0)
+        policy = jax.tree.map(lambda x: x / denominator, current_policy)
+        value = jax.tree.map(lambda x: x / denominator, current_value)
+        policy_squared_norm = sum(
+            jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(policy)
         )
-        value_grads = jax.vmap(
-            value_gradient,
-            in_axes=(None, 0, 0, 0, 0, 0),
-        )(
-            shared_params,
-            batch_hstates,
-            batch_trajectories,
-            batch_advantages,
-            batch_targets,
-            batch_mask,
+        value_squared_norm = sum(
+            jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(value)
         )
-
-        policy_squared_norm = jnp.zeros(
-            (int(chunk_size),), dtype=jnp.float32
-        )
-        value_squared_norm = jnp.zeros(
-            (int(chunk_size),), dtype=jnp.float32
-        )
-        for policy_leaf, value_leaf in zip(
-            jax.tree_util.tree_leaves(policy_grads),
-            jax.tree_util.tree_leaves(value_grads),
-        ):
-            axes = tuple(range(1, policy_leaf.ndim))
-            policy_squared_norm += jnp.sum(
-                jnp.square(policy_leaf), axis=axes
-            )
-            value_squared_norm += jnp.sum(
-                jnp.square(value_leaf), axis=axes
-            )
-
         policy_norm = jnp.sqrt(policy_squared_norm)
         value_norm = jnp.sqrt(value_squared_norm)
-        has_samples = batch_mask.sum(axis=(1, 2)) > 0
-        policy_distribution_valid = jnp.logical_and(
-            has_samples, jnp.isfinite(policy_norm)
-        )
-        value_distribution_valid = jnp.logical_and(
-            has_samples, jnp.isfinite(value_norm)
-        )
+        has_samples = current_sample_count > 0.0
+        policy_finite = jnp.logical_and(has_samples, jnp.isfinite(policy_norm))
+        value_finite = jnp.logical_and(has_samples, jnp.isfinite(value_norm))
         valid = jnp.logical_and(
-            has_samples,
+            jnp.logical_and(policy_finite, value_finite),
             jnp.logical_and(policy_norm > epsilon, value_norm > epsilon),
         )
-        valid = jnp.logical_and(
-            valid,
-            jnp.logical_and(
-                policy_distribution_valid, value_distribution_valid
-            ),
-        )
-        policy_inverse_norm = jnp.where(
-            valid, 1.0 / jnp.maximum(policy_norm, epsilon), 0.0
-        )
-        value_inverse_norm = jnp.where(
-            valid, 1.0 / jnp.maximum(value_norm, epsilon), 0.0
-        )
-
-        chunk_same_dot = jnp.zeros(
-            (int(chunk_size),), dtype=jnp.float32
-        )
-        policy_sketch = jnp.zeros(
-            (int(chunk_size), int(sketch_size)), dtype=jnp.float32
-        )
-        value_sketch = jnp.zeros_like(policy_sketch)
-
-        def add_normalized(total, gradient_leaf, inverse_norm):
-            shape = (int(chunk_size),) + (1,) * (gradient_leaf.ndim - 1)
-            return total + jnp.sum(
-                gradient_leaf * inverse_norm.reshape(shape), axis=0
-            )
-
-        parameter_offset = 0
-        for policy_leaf, value_leaf in zip(
-            jax.tree_util.tree_leaves(policy_grads),
-            jax.tree_util.tree_leaves(value_grads),
-        ):
-            shape = (int(chunk_size),) + (1,) * (policy_leaf.ndim - 1)
-            normalized_policy = (
-                policy_leaf * policy_inverse_norm.reshape(shape)
-            )
-            normalized_value = (
-                value_leaf * value_inverse_norm.reshape(shape)
-            )
-            axes = tuple(range(1, policy_leaf.ndim))
-            chunk_same_dot += jnp.sum(
-                normalized_policy * normalized_value, axis=axes
-            )
-
-            flat_policy = normalized_policy.reshape(
-                (int(chunk_size), -1)
-            )
-            flat_value = normalized_value.reshape(
-                (int(chunk_size), -1)
-            )
-            parameter_indices = (
-                jnp.arange(flat_policy.shape[1], dtype=jnp.uint32)
-                + jnp.asarray(parameter_offset, dtype=jnp.uint32)
-            )
-            mixed_indices = parameter_indices + jnp.uint32(0x9E3779B9)
-            mixed_indices = mixed_indices ^ (mixed_indices >> jnp.uint32(16))
-            mixed_indices = mixed_indices * jnp.uint32(0x7FEB352D)
-            mixed_indices = mixed_indices ^ (mixed_indices >> jnp.uint32(15))
-            mixed_indices = mixed_indices * jnp.uint32(0x846CA68B)
-            mixed_indices = mixed_indices ^ (mixed_indices >> jnp.uint32(16))
-            sketch_bins = (
-                mixed_indices % jnp.uint32(int(sketch_size))
-            ).astype(jnp.int32)
-            sign_hash = mixed_indices ^ jnp.uint32(0xA5A5A5A5)
-            sign_hash = sign_hash * jnp.uint32(0x27D4EB2D)
-            sign_hash = sign_hash ^ (sign_hash >> jnp.uint32(15))
-            sign_bits = sign_hash & jnp.uint32(1)
-            sketch_signs = jnp.where(
-                sign_bits == 0, 1.0, -1.0
-            ).astype(jnp.float32)
-
-            def add_to_sketch(row):
-                return jnp.zeros(
-                    (int(sketch_size),), dtype=jnp.float32
-                ).at[sketch_bins].add(row * sketch_signs)
-
-            policy_sketch += jax.vmap(add_to_sketch)(flat_policy)
-            value_sketch += jax.vmap(add_to_sketch)(flat_value)
-            parameter_offset += int(flat_policy.shape[1])
-
-        policy_sum = jax.tree.map(
-            lambda total, gradient: add_normalized(
-                total, gradient, policy_inverse_norm
-            ),
-            policy_sum,
-            policy_grads,
-        )
-        value_sum = jax.tree.map(
-            lambda total, gradient: add_normalized(
-                total, gradient, value_inverse_norm
-            ),
-            value_sum,
-            value_grads,
-        )
-
-        def add_raw(total, gradient):
-            shape = (int(chunk_size),) + (1,) * (gradient.ndim - 1)
-            return total + jnp.sum(
-                gradient * valid.astype(gradient.dtype).reshape(shape),
-                axis=0,
-            )
-
-        raw_policy_sum = jax.tree.map(
-            add_raw, raw_policy_sum, policy_grads
-        )
-        raw_value_sum = jax.tree.map(
-            add_raw, raw_value_sum, value_grads
-        )
-
-        def add_raw_squared(total, gradient):
-            shape = (int(chunk_size),) + (1,) * (gradient.ndim - 1)
-            return total + jnp.sum(
-                jnp.square(gradient)
-                * valid.astype(gradient.dtype).reshape(shape),
-                axis=0,
-            )
-
+        policy_inverse = jnp.where(valid, 1.0 / jnp.maximum(policy_norm, epsilon), 0.0)
+        value_inverse = jnp.where(valid, 1.0 / jnp.maximum(value_norm, epsilon), 0.0)
+        normalized_policy = jax.tree.map(lambda x: x * policy_inverse, policy)
+        normalized_value = jax.tree.map(lambda x: x * value_inverse, value)
+        normalized_policy_sum = jax.tree.map(jnp.add, normalized_policy_sum, normalized_policy)
+        normalized_value_sum = jax.tree.map(jnp.add, normalized_value_sum, normalized_value)
+        valid_float = valid.astype(jnp.float32)
+        raw_policy_sum = jax.tree.map(lambda total, x: total + x * valid_float, raw_policy_sum, policy)
+        raw_value_sum = jax.tree.map(lambda total, x: total + x * valid_float, raw_value_sum, value)
         raw_policy_squared_sum = jax.tree.map(
-            add_raw_squared, raw_policy_squared_sum, policy_grads
+            lambda total, x: total + jnp.square(x) * valid_float,
+            raw_policy_squared_sum, policy,
         )
         raw_value_squared_sum = jax.tree.map(
-            add_raw_squared, raw_value_squared_sum, value_grads
+            lambda total, x: total + jnp.square(x) * valid_float,
+            raw_value_squared_sum, value,
         )
-        next_state = (
-            policy_sum,
-            value_sum,
-            raw_policy_sum,
-            raw_value_sum,
-            raw_policy_squared_sum,
-            raw_value_squared_sum,
-            raw_policy_squared_norm_sum + jnp.sum(
-                jnp.where(valid, policy_squared_norm, 0.0)
-            ),
-            raw_value_squared_norm_sum + jnp.sum(
-                jnp.where(valid, value_squared_norm, 0.0)
-            ),
-            same_dot_sum + jnp.sum(chunk_same_dot),
-            valid_count + jnp.sum(valid.astype(jnp.float32)),
+        same_dot = sum(
+            jnp.sum(p * v) for p, v in zip(
+                jax.tree_util.tree_leaves(normalized_policy),
+                jax.tree_util.tree_leaves(normalized_value),
+            )
         )
-        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
-        return next_state, (
-            policy_sketch,
-            value_sketch,
+        policy_sketch = jnp.zeros((int(sketch_size),), dtype=jnp.float32)
+        value_sketch = jnp.zeros_like(policy_sketch)
+        parameter_offset = 0
+        for policy_leaf, value_leaf in zip(
+            jax.tree_util.tree_leaves(normalized_policy),
+            jax.tree_util.tree_leaves(normalized_value),
+        ):
+            flat_policy = policy_leaf.reshape(-1)
+            flat_value = value_leaf.reshape(-1)
+            parameter_indices = (
+                jnp.arange(flat_policy.size, dtype=jnp.uint32)
+                + jnp.asarray(parameter_offset, dtype=jnp.uint32)
+            )
+            mixed = parameter_indices + jnp.uint32(0x9E3779B9)
+            mixed = (mixed ^ (mixed >> jnp.uint32(16))) * jnp.uint32(0x7FEB352D)
+            mixed = (mixed ^ (mixed >> jnp.uint32(15))) * jnp.uint32(0x846CA68B)
+            mixed = mixed ^ (mixed >> jnp.uint32(16))
+            bins = (mixed % jnp.uint32(int(sketch_size))).astype(jnp.int32)
+            sign_hash = (mixed ^ jnp.uint32(0xA5A5A5A5)) * jnp.uint32(0x27D4EB2D)
+            signs = jnp.where(
+                ((sign_hash ^ (sign_hash >> jnp.uint32(15))) & jnp.uint32(1)) == 0,
+                1.0, -1.0,
+            ).astype(jnp.float32)
+            policy_sketch = policy_sketch.at[bins].add(flat_policy * signs)
+            value_sketch = value_sketch.at[bins].add(flat_value * signs)
+            parameter_offset += int(flat_policy.size)
+        policy_sketch_norm = jnp.linalg.norm(policy_sketch)
+        value_sketch_norm = jnp.linalg.norm(value_sketch)
+        normalized_policy_sketch = jnp.where(
             valid,
-            jnp.where(policy_distribution_valid, policy_norm, nan),
-            jnp.where(value_distribution_valid, value_norm, nan),
+            policy_sketch / jnp.maximum(policy_sketch_norm, epsilon),
+            jnp.zeros_like(policy_sketch),
+        )
+        normalized_value_sketch = jnp.where(
+            valid,
+            value_sketch / jnp.maximum(value_sketch_norm, epsilon),
+            jnp.zeros_like(value_sketch),
+        )
+        policy_sketch_covariance += jnp.outer(
+            normalized_policy_sketch, normalized_policy_sketch
+        )
+        value_sketch_covariance += jnp.outer(
+            normalized_value_sketch, normalized_value_sketch
+        )
+        policy_norms = policy_norms.at[group_index].set(jnp.where(policy_finite, policy_norm, jnp.nan))
+        value_norms = value_norms.at[group_index].set(jnp.where(value_finite, value_norm, jnp.nan))
+        return (
+            zero_tree, zero_tree, jnp.asarray(0.0, jnp.float32),
+            normalized_policy_sum, normalized_value_sum,
+            raw_policy_sum, raw_value_sum,
+            raw_policy_squared_sum, raw_value_squared_sum,
+            raw_policy_squared_norm_sum + policy_squared_norm * valid_float,
+            raw_value_squared_norm_sum + value_squared_norm * valid_float,
+            same_dot_sum + same_dot, valid_count + valid_float,
+            policy_sketch_covariance, value_sketch_covariance,
+            policy_norms, value_norms,
+            group_index + 1,
         )
 
-    (
-        policy_sum,
-        value_sum,
-        raw_policy_sum,
-        raw_value_sum,
-        raw_policy_squared_sum,
-        raw_value_squared_sum,
-        raw_policy_squared_norm_sum,
-        raw_value_squared_norm_sum,
-        same_dot_sum,
-        valid_count,
-    ), sketch_outputs = jax.lax.scan(
-        accumulate_chunk, initial_state, chunked_inputs
+    def accumulate_group(group_index, state):
+        signature_match = jnp.all(
+            static_signatures == representatives[group_index], axis=-1
+        )
+        mask = jnp.logical_and(sample_mask, signature_match)
+        policy_gradient_value = policy_gradient(
+            shared_params,
+            initial_hstates,
+            trajectories,
+            normalized_advantages,
+            targets,
+            mask,
+        )
+        value_gradient_value = value_gradient(
+            shared_params,
+            initial_hstates,
+            trajectories,
+            normalized_advantages,
+            targets,
+            mask,
+        )
+        sample_count = jnp.sum(mask.astype(jnp.float32))
+        current_policy = jax.tree.map(
+            lambda value: value * sample_count, policy_gradient_value
+        )
+        current_value = jax.tree.map(
+            lambda value: value * sample_count, value_gradient_value
+        )
+        state = (
+            current_policy, current_value, sample_count, *state[3:]
+        )
+        return finalize_group(state)
+
+    state = jax.lax.fori_loop(
+        0,
+        retained_group_count,
+        accumulate_group,
+        initial_state,
     )
     (
-        policy_sketches,
-        value_sketches,
-        valid_environments,
-        policy_environment_norms,
-        raw_value_environment_norms,
-    ) = sketch_outputs
-    policy_sketches = policy_sketches.reshape(
-        (num_environments, int(sketch_size))
-    )
-    value_sketches = value_sketches.reshape(
-        (num_environments, int(sketch_size))
-    )
-    valid_environments = valid_environments.reshape((num_environments,))
-    policy_environment_norms = policy_environment_norms.reshape(
-        (num_environments,)
-    )
-    raw_value_environment_norms = raw_value_environment_norms.reshape(
-        (num_environments,)
-    )
+        _, _, _, normalized_policy_sum, normalized_value_sum,
+        raw_policy_sum, raw_value_sum,
+        raw_policy_squared_sum, raw_value_squared_sum,
+        raw_policy_squared_norm_sum, raw_value_squared_norm_sum,
+        same_dot_sum, valid_count,
+        policy_sketch_covariance, value_sketch_covariance,
+        policy_norms, value_norms, _,
+    ) = state
 
     def distribution_statistics(values):
-        """Return fixed-shape summaries over finite parallel-slot values."""
         finite = jnp.isfinite(values)
         count = jnp.sum(finite.astype(jnp.int32))
         count_float = jnp.maximum(count.astype(jnp.float32), 1.0)
-        safe_values = jnp.where(finite, values, 0.0)
-        mean = jnp.sum(safe_values) / count_float
-        variance = jnp.sum(
-            jnp.where(finite, jnp.square(values - mean), 0.0)
-        ) / count_float
-        standard_deviation = jnp.sqrt(jnp.maximum(variance, 0.0))
-        cv = standard_deviation / jnp.maximum(jnp.abs(mean), epsilon)
-
-        sorted_values = jnp.sort(
-            jnp.where(finite, values, jnp.asarray(jnp.inf, values.dtype))
-        )
-
+        mean = jnp.sum(jnp.where(finite, values, 0.0)) / count_float
+        variance = jnp.sum(jnp.where(finite, jnp.square(values - mean), 0.0)) / count_float
+        sorted_values = jnp.sort(jnp.where(finite, values, jnp.inf))
         def quantile(probability):
             position = probability * jnp.maximum(count_float - 1.0, 0.0)
             lower = jnp.floor(position).astype(jnp.int32)
             upper = jnp.ceil(position).astype(jnp.int32)
             fraction = position - lower.astype(jnp.float32)
-            lower_value = sorted_values[lower]
-            upper_value = sorted_values[upper]
-            return lower_value + fraction * (upper_value - lower_value)
-
-        ranks = jnp.arange(num_environments, dtype=jnp.float32)
-        trim_start = 0.25 * count_float
-        trim_end = 0.75 * count_float
-        iqm_weights = jnp.maximum(
-            jnp.minimum(ranks + 1.0, trim_end)
-            - jnp.maximum(ranks, trim_start),
-            0.0,
-        )
-        iqm = jnp.sum(
-            jnp.where(iqm_weights > 0.0, sorted_values, 0.0)
-            * iqm_weights
-        ) / jnp.maximum(jnp.sum(iqm_weights), epsilon)
-
-        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
-        has_value = count > 0
+            return sorted_values[lower] + fraction * (sorted_values[upper] - sorted_values[lower])
+        ranks = jnp.arange(num_slots, dtype=jnp.float32)
+        trim_start, trim_end = 0.25 * count_float, 0.75 * count_float
+        weights = jnp.maximum(jnp.minimum(ranks + 1.0, trim_end) - jnp.maximum(ranks, trim_start), 0.0)
+        iqm = jnp.sum(jnp.where(weights > 0.0, sorted_values, 0.0) * weights) / jnp.maximum(jnp.sum(weights), epsilon)
+        nan = jnp.asarray(jnp.nan, jnp.float32)
         return {
-            "mean": jnp.where(has_value, mean, nan),
-            "cv": jnp.where(has_value, cv, nan),
-            "p10": jnp.where(has_value, quantile(0.10), nan),
-            "p90": jnp.where(has_value, quantile(0.90), nan),
-            "iqm": jnp.where(has_value, iqm, nan),
+            "mean": jnp.where(count > 0, mean, nan),
+            "cv": jnp.where(count > 0, jnp.sqrt(jnp.maximum(variance, 0.0)) / jnp.maximum(jnp.abs(mean), epsilon), nan),
+            "p10": jnp.where(count > 0, quantile(0.10), nan),
+            "p90": jnp.where(count > 0, quantile(0.90), nan),
+            "iqm": jnp.where(count > 0, iqm, nan),
         }
 
     norm_metrics = {}
-    norm_distributions = {
-        "policy_norm": policy_environment_norms,
-        "weighted_value_norm": (
-            jnp.abs(jnp.asarray(value_loss_coefficient, dtype=jnp.float32))
-            * raw_value_environment_norms
-        ),
-    }
-    for gradient_name, values in norm_distributions.items():
+    for name, values in {
+        "policy_norm": policy_norms,
+        "weighted_value_norm": jnp.abs(jnp.asarray(value_loss_coefficient, jnp.float32)) * value_norms,
+    }.items():
         for statistic, result in distribution_statistics(values).items():
-            norm_metrics[f"{gradient_name}_{statistic}"] = result
+            norm_metrics[f"{name}_{statistic}"] = result
 
-    def normalize_sketches(sketches):
-        norms = jnp.linalg.norm(sketches, axis=1, keepdims=True)
-        return jnp.where(
-            valid_environments[:, None],
-            sketches / jnp.maximum(norms, epsilon),
-            jnp.zeros_like(sketches),
+    def effective_rank(sketch_covariance):
+        # G G^T and G^T G share the same non-zero eigenvalues. Using the
+        # sketch-space covariance keeps this matrix 512 x 512 even when the
+        # first minibatch contains more than NUM_ENVS unique grids.
+        eigenvalues = jnp.maximum(
+            jnp.linalg.eigvalsh(sketch_covariance), 0.0
         )
-
-    policy_sketches = normalize_sketches(policy_sketches)
-    value_sketches = normalize_sketches(value_sketches)
-
-    def effective_rank(sketches):
-        gram = sketches @ sketches.T
-        eigenvalues = jnp.maximum(jnp.linalg.eigvalsh(gram), 0.0)
         eigenvalue_sum = jnp.sum(eigenvalues)
         probabilities = eigenvalues / jnp.maximum(eigenvalue_sum, epsilon)
-        entropy = -jnp.sum(
-            jnp.where(
-                probabilities > 0,
-                probabilities * jnp.log(
-                    jnp.maximum(probabilities, epsilon)
-                ),
-                0.0,
-            )
-        )
-        return jnp.where(
-            eigenvalue_sum > epsilon,
-            jnp.exp(entropy),
-            jnp.asarray(jnp.nan, dtype=jnp.float32),
-        )
+        entropy = -jnp.sum(jnp.where(probabilities > 0.0, probabilities * jnp.log(jnp.maximum(probabilities, epsilon)), 0.0))
+        return jnp.where(eigenvalue_sum > epsilon, jnp.exp(entropy), jnp.nan)
 
-    policy_effective_rank = effective_rank(policy_sketches)
-    value_effective_rank = effective_rank(value_sketches)
-    policy_effective_rank_ratio = jnp.where(
-        valid_count > 0,
-        policy_effective_rank / valid_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    value_effective_rank_ratio = jnp.where(
-        valid_count > 0,
-        value_effective_rank / valid_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-
-    def gradient_snr(raw_sum, raw_squared_norm_sum):
+    policy_effective_rank = effective_rank(policy_sketch_covariance)
+    value_effective_rank = effective_rank(value_sketch_covariance)
+    def gradient_snr(raw_sum, squared_norm_sum):
         count = jnp.maximum(valid_count, 1.0)
-        mean_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-        for leaf in jax.tree_util.tree_leaves(raw_sum):
-            mean_squared_norm += jnp.sum(jnp.square(leaf / count))
-        mean_noise_squared_norm = jnp.maximum(
-            raw_squared_norm_sum / count - mean_squared_norm,
-            0.0,
-        )
-        snr = jnp.sqrt(mean_squared_norm) / jnp.sqrt(
-            jnp.maximum(mean_noise_squared_norm, epsilon)
-        )
-        return jnp.where(
-            valid_count > 1,
-            snr,
-            jnp.asarray(jnp.nan, dtype=jnp.float32),
-        )
-
-    policy_snr = gradient_snr(
-        raw_policy_sum, raw_policy_squared_norm_sum
-    )
-    value_snr = gradient_snr(
-        raw_value_sum, raw_value_squared_norm_sum
-    )
-    policy_log_snr = jnp.log10(jnp.maximum(policy_snr, epsilon))
-    value_log_snr = jnp.log10(jnp.maximum(value_snr, epsilon))
+        mean_squared_norm = sum(jnp.sum(jnp.square(x / count)) for x in jax.tree_util.tree_leaves(raw_sum))
+        noise = jnp.maximum(squared_norm_sum / count - mean_squared_norm, 0.0)
+        result = jnp.sqrt(mean_squared_norm) / jnp.sqrt(jnp.maximum(noise, epsilon))
+        return jnp.where(valid_count > 1.0, result, jnp.nan)
+    policy_snr = gradient_snr(raw_policy_sum, raw_policy_squared_norm_sum)
+    value_snr = gradient_snr(raw_value_sum, raw_value_squared_norm_sum)
 
     def parameterwise_gsnr(raw_sum, raw_squared_sum, param_keys):
         count = jnp.maximum(valid_count, 1.0)
         variance_denominator = jnp.maximum(valid_count - 1.0, 1.0)
-        gsnr_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        log10_gsnr_sum = jnp.asarray(0.0, dtype=jnp.float32)
-        active_parameter_count = jnp.asarray(0.0, dtype=jnp.float32)
-        for param_key in param_keys:
-            for sum_leaf, squared_sum_leaf in zip(
-                jax.tree_util.tree_leaves(raw_sum[param_key]),
-                jax.tree_util.tree_leaves(raw_squared_sum[param_key]),
+        total = jnp.asarray(0.0, jnp.float32)
+        log_total = jnp.asarray(0.0, jnp.float32)
+        parameter_count = jnp.asarray(0.0, jnp.float32)
+        for key in param_keys:
+            for sum_leaf, squared_leaf in zip(
+                jax.tree_util.tree_leaves(raw_sum[key]),
+                jax.tree_util.tree_leaves(raw_squared_sum[key]),
             ):
-                sum_leaf = sum_leaf.astype(jnp.float32)
-                squared_sum_leaf = squared_sum_leaf.astype(jnp.float32)
                 mean = sum_leaf / count
-                centered_squared_sum = jnp.maximum(
-                    squared_sum_leaf - count * jnp.square(mean), 0.0
-                )
-                sample_variance = (
-                    centered_squared_sum / variance_denominator
-                )
-                coordinate_gsnr = jnp.square(mean) / (
-                    sample_variance + epsilon
-                )
-                gsnr_sum += jnp.sum(coordinate_gsnr)
-                log10_gsnr_sum += jnp.sum(
-                    jnp.log10(jnp.maximum(coordinate_gsnr, epsilon))
-                )
-                active_parameter_count += jnp.asarray(
-                    sum_leaf.size, dtype=jnp.float32
-                )
-
-        valid_result = jnp.logical_and(
-            valid_count > 1, active_parameter_count > 0
-        )
-        denominator = jnp.maximum(active_parameter_count, 1.0)
-        mean_gsnr = gsnr_sum / denominator
-        mean_log10_gsnr = log10_gsnr_sum / denominator
-        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+                variance = jnp.maximum(squared_leaf - count * jnp.square(mean), 0.0) / variance_denominator
+                coordinate = jnp.square(mean) / (variance + epsilon)
+                total += jnp.sum(coordinate)
+                log_total += jnp.sum(jnp.log10(jnp.maximum(coordinate, epsilon)))
+                parameter_count += jnp.asarray(sum_leaf.size, jnp.float32)
+        valid_result = jnp.logical_and(valid_count > 1.0, parameter_count > 0.0)
         return (
-            jnp.where(valid_result, mean_gsnr, nan),
-            jnp.where(valid_result, mean_log10_gsnr, nan),
+            jnp.where(valid_result, total / jnp.maximum(parameter_count, 1.0), jnp.nan),
+            jnp.where(valid_result, log_total / jnp.maximum(parameter_count, 1.0), jnp.nan),
         )
-
-    (
-        policy_parameterwise_gsnr_mean,
-        policy_parameterwise_gsnr_mean_log10,
-    ) = parameterwise_gsnr(
-        raw_policy_sum,
-        raw_policy_squared_sum,
-        policy_gsnr_param_keys,
+    policy_gsnr, policy_log_gsnr = parameterwise_gsnr(raw_policy_sum, raw_policy_squared_sum, policy_gsnr_param_keys)
+    value_gsnr, value_log_gsnr = parameterwise_gsnr(raw_value_sum, raw_value_squared_sum, value_gsnr_param_keys)
+    policy_sum_norm = sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(normalized_policy_sum))
+    value_sum_norm = sum(jnp.sum(jnp.square(x)) for x in jax.tree_util.tree_leaves(normalized_value_sum))
+    policy_value_sum_dot = sum(
+        jnp.sum(p * v) for p, v in zip(
+            jax.tree_util.tree_leaves(normalized_policy_sum),
+            jax.tree_util.tree_leaves(normalized_value_sum),
+        )
     )
-    (
-        value_parameterwise_gsnr_mean,
-        value_parameterwise_gsnr_mean_log10,
-    ) = parameterwise_gsnr(
-        raw_value_sum,
-        raw_value_squared_sum,
-        value_gsnr_param_keys,
-    )
-
-    policy_sum_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-    value_sum_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-    policy_value_sum_dot = jnp.asarray(0.0, dtype=jnp.float32)
-    for policy_leaf, value_leaf in zip(
-        jax.tree_util.tree_leaves(policy_sum),
-        jax.tree_util.tree_leaves(value_sum),
-    ):
-        policy_sum_squared_norm += jnp.sum(jnp.square(policy_leaf))
-        value_sum_squared_norm += jnp.sum(jnp.square(value_leaf))
-        policy_value_sum_dot += jnp.sum(policy_leaf * value_leaf)
-
     off_diagonal_count = valid_count * (valid_count - 1.0)
-    policy_policy = jnp.where(
-        off_diagonal_count > 0,
-        (policy_sum_squared_norm - valid_count) / off_diagonal_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    value_value = jnp.where(
-        off_diagonal_count > 0,
-        (value_sum_squared_norm - valid_count) / off_diagonal_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    policy_value_same = jnp.where(
-        valid_count > 0,
-        same_dot_sum / valid_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    policy_value_cross = jnp.where(
-        off_diagonal_count > 0,
-        (policy_value_sum_dot - same_dot_sum) / off_diagonal_count,
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
+    nan = jnp.asarray(jnp.nan, jnp.float32)
     return {
-        "policy_policy_mean_cosine": policy_policy,
-        "value_value_mean_cosine": value_value,
-        "policy_value_same_env_cosine": policy_value_same,
-        "policy_value_cross_env_cosine": policy_value_cross,
+        "policy_policy_mean_cosine": jnp.where(off_diagonal_count > 0.0, (policy_sum_norm - valid_count) / off_diagonal_count, nan),
+        "value_value_mean_cosine": jnp.where(off_diagonal_count > 0.0, (value_sum_norm - valid_count) / off_diagonal_count, nan),
+        "policy_value_same_static_grid_cosine": jnp.where(valid_count > 0.0, same_dot_sum / valid_count, nan),
+        "policy_value_cross_static_grid_cosine": jnp.where(off_diagonal_count > 0.0, (policy_value_sum_dot - same_dot_sum) / off_diagonal_count, nan),
         "policy_effective_rank": policy_effective_rank,
         "value_effective_rank": value_effective_rank,
-        "policy_effective_rank_ratio": policy_effective_rank_ratio,
-        "value_effective_rank_ratio": value_effective_rank_ratio,
+        "policy_effective_rank_ratio": jnp.where(valid_count > 0.0, policy_effective_rank / valid_count, nan),
+        "value_effective_rank_ratio": jnp.where(valid_count > 0.0, value_effective_rank / valid_count, nan),
         "policy_snr": policy_snr,
         "value_snr": value_snr,
-        "policy_log_snr": policy_log_snr,
-        "value_log_snr": value_log_snr,
-        "policy_parameterwise_gsnr_mean": policy_parameterwise_gsnr_mean,
-        "value_parameterwise_gsnr_mean": value_parameterwise_gsnr_mean,
-        "policy_parameterwise_gsnr_mean_log10": (
-            policy_parameterwise_gsnr_mean_log10
-        ),
-        "value_parameterwise_gsnr_mean_log10": (
-            value_parameterwise_gsnr_mean_log10
-        ),
+        "policy_log_snr": jnp.log10(jnp.maximum(policy_snr, epsilon)),
+        "value_log_snr": jnp.log10(jnp.maximum(value_snr, epsilon)),
+        "policy_parameterwise_gsnr_mean": policy_gsnr,
+        "value_parameterwise_gsnr_mean": value_gsnr,
+        "policy_parameterwise_gsnr_mean_log10": policy_log_gsnr,
+        "value_parameterwise_gsnr_mean_log10": value_log_gsnr,
         **norm_metrics,
     }

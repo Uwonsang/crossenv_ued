@@ -62,9 +62,9 @@ METRIC_GROUPS = {
     **{
         f"feature_rank_{role}": (
             f"feature_rank_{role}/effective_rank",
-            f"feature_rank_{role}/between_slot_effective_rank",
+            f"feature_rank_{role}/between_static_grid_effective_rank",
         ) + tuple(
-            f"feature_rank_{role}/within_slot_{statistic}"
+            f"feature_rank_{role}/within_static_grid_{statistic}"
             for statistic in ("mean", "cv", "p10", "p90", "iqm")
         )
         for role in ("shared", "policy", "value")
@@ -85,8 +85,8 @@ METRIC_GROUPS = {
     "env_gradient_cosine": (
         "env_gradient_cosine/policy_policy_mean_cosine",
         "env_gradient_cosine/value_value_mean_cosine",
-        "env_gradient_cosine/policy_value_same_env_cosine",
-        "env_gradient_cosine/policy_value_cross_env_cosine",
+        "env_gradient_cosine/policy_value_same_static_grid_cosine",
+        "env_gradient_cosine/policy_value_cross_static_grid_cosine",
     ),
 }
 ALL_METRICS = tuple(
@@ -101,6 +101,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--project", default=DEFAULT_PROJECT)
     parser.add_argument(
         "--target-timesteps", type=int, default=DEFAULT_TARGET_TIMESTEPS
+    )
+    parser.add_argument(
+        "--aggregation",
+        default="unique_static_grid",
+        help="Required DIAGNOSTIC_AGGREGATION value in the W&B run config.",
     )
     parser.add_argument(
         "--tail-window-steps",
@@ -172,6 +177,11 @@ def fetch_history(args: argparse.Namespace):
     run_rows = []
 
     for run in runs:
+        if (
+            args.aggregation
+            and run.config.get("DIAGNOSTIC_AGGREGATION") != args.aggregation
+        ):
+            continue
         total_timesteps = run.config.get(
             "TOTAL_TIMESTEPS", run.config.get("total_timesteps")
         )

@@ -59,6 +59,16 @@ METRIC_GROUPS = {
         )
         for statistic in ("mean", "cv", "p10", "p90", "iqm")
     ),
+    **{
+        f"feature_rank_{role}": (
+            f"feature_rank_{role}/effective_rank",
+            f"feature_rank_{role}/between_slot_effective_rank",
+        ) + tuple(
+            f"feature_rank_{role}/within_slot_{statistic}"
+            for statistic in ("mean", "cv", "p10", "p90", "iqm")
+        )
+        for role in ("shared", "policy", "value")
+    },
     "env_gradient_rank": (
         "env_gradient_rank/policy_effective_rank",
         "env_gradient_rank/value_effective_rank",

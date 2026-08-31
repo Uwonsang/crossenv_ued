@@ -45,6 +45,10 @@ from paper_stiffness import (
     first_minibatch_actor_indices,
     select_stiffness_batch,
 )
+from representation_metrics import (
+    compute_pooled_feature_rank_metrics,
+    empty_pooled_feature_rank_metrics,
+)
 
 
 # Actor and critic use independent encoder/RNN trunks with identical topology.
@@ -318,6 +322,13 @@ class ActorCriticRNN(nn.Module):
             name="critic_trunk",
         )(critic_hidden, obs, dones)
 
+        if (
+            not self.is_initializing()
+            and self.is_mutable_collection("feature_rank")
+        ):
+            self.sow("feature_rank", "policy", actor_embedding)
+            self.sow("feature_rank", "value", critic_embedding)
+
         if collect_intermediates:
             self.sow(
                 "intermediates", "actor_trunk_penultimate", actor_embedding
@@ -503,6 +514,10 @@ IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "policy_parameterwise_gsnr_mean_log10",
     "value_parameterwise_gsnr_mean_log10",
 ) + ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES
+IDAAC_FEATURE_RANK_NAMES = (
+    ("policy", "policy"),
+    ("value", "value"),
+)
 
 
 def empty_idaac_policy_value_metrics(dtype=jnp.float32):
@@ -954,6 +969,27 @@ def make_train(
                 policy_value_targets = jnp.take(
                     targets, stiffness_actor_indices, axis=1
                 )
+                feature_rank_metrics = jax.lax.cond(
+                    run_stiffness,
+                    lambda _: compute_pooled_feature_rank_metrics(
+                        network=network,
+                        params=original_params,
+                        initial_hstate=policy_value_hstate,
+                        network_inputs=(
+                            policy_value_traj.obs,
+                            policy_value_traj.done,
+                            policy_value_traj.agent_positions,
+                        ),
+                        feature_names=IDAAC_FEATURE_RANK_NAMES,
+                        actor_indices=stiffness_actor_indices,
+                        num_slots=config["NUM_ENVS"],
+                        num_agents=env.num_agents,
+                    ),
+                    lambda _: empty_pooled_feature_rank_metrics(
+                        IDAAC_FEATURE_RANK_NAMES
+                    ),
+                    operand=None,
+                )
 
                 # Reassemble the selected actor trajectories by environment.
                 # batchify uses agent-major ordering: actor = agent * N + env.
@@ -1117,6 +1153,9 @@ def make_train(
                 stiffness_metrics = empty_paper_stiffness_metrics()
                 static_unique_count = jnp.asarray(jnp.nan, dtype=jnp.float32)
                 policy_value_metrics = empty_idaac_policy_value_metrics()
+                feature_rank_metrics = empty_pooled_feature_rank_metrics(
+                    IDAAC_FEATURE_RANK_NAMES
+                )
                 environment_gradient_metrics = (
                     empty_idaac_environment_gradient_metrics()
                 )
@@ -1410,6 +1449,7 @@ def make_train(
             metric["stiffness"] = stiffness_metrics
             metric["static_unique_count"] = static_unique_count
             metric["policy_value"] = policy_value_metrics
+            metric["feature_rank"] = feature_rank_metrics
             metric["environment_gradient"] = environment_gradient_metrics
             rng = update_state[-1]
 
@@ -1449,6 +1489,11 @@ def make_train(
                     for k, v in metric["policy_value"].items()
                     if np.isfinite(float(v))
                 }
+                feature_rank_log = {
+                    k: float(v)
+                    for k, v in metric["feature_rank"].items()
+                    if np.isfinite(float(v))
+                }
                 environment_gradient_log = {
                     environment_gradient_log_key(k): float(v)
                     for k, v in metric["environment_gradient"].items()
@@ -1458,6 +1503,7 @@ def make_train(
                     stiffness_log
                     or diversity_log
                     or policy_value_log
+                    or feature_rank_log
                     or environment_gradient_log
                 ) and not is_standard_log_step:
                     wandb.log(
@@ -1467,6 +1513,7 @@ def make_train(
                             **stiffness_log,
                             **diversity_log,
                             **policy_value_log,
+                            **feature_rank_log,
                             **environment_gradient_log,
                         },
                         step=env_step,
@@ -1493,6 +1540,7 @@ def make_train(
                     log_dict.update(stiffness_log)
                     log_dict.update(diversity_log)
                     log_dict.update(policy_value_log)
+                    log_dict.update(feature_rank_log)
                     log_dict.update(environment_gradient_log)
 
                     if config["ENV_NAME"] == "overcooked":

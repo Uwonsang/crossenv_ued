@@ -4,6 +4,227 @@ import jax
 import jax.numpy as jnp
 
 
+FEATURE_RANK_DISTRIBUTION_STATISTICS = ("mean", "cv", "p10", "p90", "iqm")
+
+
+def _effective_rank_from_covariance(covariance, epsilon=1e-12):
+    """Entropy effective rank for one covariance or a covariance batch."""
+    eigenvalues = jnp.maximum(jnp.linalg.eigvalsh(covariance), 0.0)
+    eigenvalue_sum = jnp.sum(eigenvalues, axis=-1, keepdims=True)
+    probabilities = eigenvalues / jnp.maximum(eigenvalue_sum, epsilon)
+    entropy = -jnp.sum(
+        jnp.where(
+            probabilities > 0.0,
+            probabilities * jnp.log(jnp.maximum(probabilities, epsilon)),
+            0.0,
+        ),
+        axis=-1,
+    )
+    return jnp.where(
+        jnp.squeeze(eigenvalue_sum, axis=-1) > epsilon,
+        jnp.exp(entropy),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
+
+
+def centered_effective_rank(features, epsilon=1e-12):
+    """Entropy effective rank of every feature in the first minibatch."""
+    feature_matrix = features.reshape((-1, features.shape[-1])).astype(
+        jnp.float32
+    )
+    sample_count = int(feature_matrix.shape[0])
+    if sample_count <= 1:
+        return jnp.asarray(jnp.nan, dtype=jnp.float32)
+    centered = feature_matrix - jnp.mean(
+        feature_matrix, axis=0, keepdims=True
+    )
+    covariance = (centered.T @ centered) / jnp.asarray(
+        sample_count - 1, dtype=jnp.float32
+    )
+    return _effective_rank_from_covariance(covariance, epsilon=epsilon)
+
+
+def _finite_distribution_statistics(values, epsilon=1e-12):
+    """Summarize a fixed-size vector while ignoring non-finite entries."""
+    finite = jnp.isfinite(values)
+    count = jnp.sum(finite.astype(jnp.int32))
+    count_float = jnp.maximum(count.astype(jnp.float32), 1.0)
+    safe_values = jnp.where(finite, values, 0.0)
+    mean = jnp.sum(safe_values) / count_float
+    variance = jnp.sum(
+        jnp.where(finite, jnp.square(values - mean), 0.0)
+    ) / count_float
+    cv = jnp.sqrt(jnp.maximum(variance, 0.0)) / jnp.maximum(
+        jnp.abs(mean), epsilon
+    )
+    sorted_values = jnp.sort(
+        jnp.where(finite, values, jnp.asarray(jnp.inf, values.dtype))
+    )
+
+    def quantile(probability):
+        position = probability * jnp.maximum(count_float - 1.0, 0.0)
+        lower = jnp.floor(position).astype(jnp.int32)
+        upper = jnp.ceil(position).astype(jnp.int32)
+        fraction = position - lower.astype(jnp.float32)
+        return sorted_values[lower] + fraction * (
+            sorted_values[upper] - sorted_values[lower]
+        )
+
+    ranks = jnp.arange(values.shape[0], dtype=jnp.float32)
+    trim_start = 0.25 * count_float
+    trim_end = 0.75 * count_float
+    iqm_weights = jnp.maximum(
+        jnp.minimum(ranks + 1.0, trim_end)
+        - jnp.maximum(ranks, trim_start),
+        0.0,
+    )
+    iqm = jnp.sum(
+        jnp.where(iqm_weights > 0.0, sorted_values, 0.0) * iqm_weights
+    ) / jnp.maximum(jnp.sum(iqm_weights), epsilon)
+    nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+    has_value = count > 0
+    return {
+        "mean": jnp.where(has_value, mean, nan),
+        "cv": jnp.where(has_value, cv, nan),
+        "p10": jnp.where(has_value, quantile(0.10), nan),
+        "p90": jnp.where(has_value, quantile(0.90), nan),
+        "iqm": jnp.where(has_value, iqm, nan),
+    }
+
+
+def parallel_slot_feature_rank_metrics(
+    features,
+    actor_indices,
+    num_slots,
+    num_agents,
+    epsilon=1e-12,
+):
+    """Compute within-slot rank distribution and rank between slot means."""
+    # features: (time, selected_actor, feature); actor-major storage maps an
+    # actor back to its parallel slot via actor_index % NUM_ENVS.
+    actor_features = jnp.swapaxes(features, 0, 1).astype(jnp.float32)
+    slot_ids = actor_indices.astype(jnp.int32) % int(num_slots)
+    time_size = int(actor_features.shape[1])
+    selected_actor_count = int(actor_features.shape[0])
+    actor_positions = jnp.arange(selected_actor_count, dtype=jnp.int32)
+
+    def compute_one_slot(slot_index):
+        candidate_positions = jnp.where(
+            slot_ids == slot_index,
+            actor_positions,
+            selected_actor_count,
+        )
+        selected_positions = jnp.sort(candidate_positions)[:int(num_agents)]
+        selected_valid = selected_positions < selected_actor_count
+        safe_positions = jnp.minimum(
+            selected_positions, selected_actor_count - 1
+        )
+        selected_features = actor_features[safe_positions]
+        selected_weights = selected_valid.astype(jnp.float32)[:, None, None]
+        selected_features = selected_features * selected_weights
+        sample_count = (
+            jnp.sum(selected_valid.astype(jnp.float32)) * float(time_size)
+        )
+        feature_sum = jnp.sum(selected_features, axis=(0, 1))
+        feature_mean = feature_sum / jnp.maximum(sample_count, 1.0)
+        centered_features = (
+            selected_features - feature_mean[None, None, :]
+        ) * selected_weights
+        covariance = jnp.einsum(
+            "atd,ate->de", centered_features, centered_features
+        ) / jnp.maximum(sample_count - 1.0, 1.0)
+        rank = jnp.where(
+            sample_count > 1.0,
+            _effective_rank_from_covariance(covariance, epsilon=epsilon),
+            jnp.asarray(jnp.nan, dtype=jnp.float32),
+        )
+        return rank, feature_mean, sample_count > 0.0
+
+    within_slot_ranks, slot_means, valid_slots = jax.lax.map(
+        compute_one_slot,
+        jnp.arange(int(num_slots), dtype=jnp.int32),
+    )
+    valid_slot_count = jnp.sum(valid_slots.astype(jnp.float32))
+    mean_of_slot_means = jnp.sum(
+        jnp.where(valid_slots[:, None], slot_means, 0.0), axis=0
+    ) / jnp.maximum(valid_slot_count, 1.0)
+    centered_slot_means = jnp.where(
+        valid_slots[:, None], slot_means - mean_of_slot_means, 0.0
+    )
+    between_covariance = (
+        centered_slot_means.T @ centered_slot_means
+    ) / jnp.maximum(valid_slot_count - 1.0, 1.0)
+    between_slot_rank = jnp.where(
+        valid_slot_count > 1.0,
+        _effective_rank_from_covariance(
+            between_covariance, epsilon=epsilon
+        ),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
+    return (
+        _finite_distribution_statistics(within_slot_ranks, epsilon=epsilon),
+        between_slot_rank,
+    )
+
+
+def compute_pooled_feature_rank_metrics(
+    network,
+    params,
+    initial_hstate,
+    network_inputs,
+    feature_names,
+    actor_indices,
+    num_slots,
+    num_agents,
+):
+    """Capture named representations and compute their pooled ranks."""
+    _, collections = network.apply(
+        params,
+        initial_hstate,
+        network_inputs,
+        mutable=["feature_rank"],
+    )
+    captured = collections["feature_rank"]
+    metrics = {}
+    for metric_name, capture_name in feature_names:
+        features = captured[capture_name][0]
+        namespace = f"feature_rank_{metric_name}"
+        metrics[f"{namespace}/effective_rank"] = (
+            centered_effective_rank(features)
+        )
+        within_statistics, between_rank = parallel_slot_feature_rank_metrics(
+            features,
+            actor_indices=actor_indices,
+            num_slots=num_slots,
+            num_agents=num_agents,
+        )
+        for statistic, value in within_statistics.items():
+            metrics[f"{namespace}/within_slot_{statistic}"] = value
+        metrics[f"{namespace}/between_slot_effective_rank"] = between_rank
+    return metrics
+
+
+def empty_pooled_feature_rank_metrics(feature_names, dtype=jnp.float32):
+    """Shape-compatible result for updates without rank measurement."""
+    return {
+        f"feature_rank_{metric_name}/effective_rank": jnp.asarray(
+            jnp.nan, dtype=dtype
+        )
+        for metric_name, _ in feature_names
+    } | {
+        f"feature_rank_{metric_name}/within_slot_{statistic}": jnp.asarray(
+            jnp.nan, dtype=dtype
+        )
+        for metric_name, _ in feature_names
+        for statistic in FEATURE_RANK_DISTRIBUTION_STATISTICS
+    } | {
+        f"feature_rank_{metric_name}/between_slot_effective_rank": (
+            jnp.asarray(jnp.nan, dtype=dtype)
+        )
+        for metric_name, _ in feature_names
+    }
+
+
 INTERMEDIATE_FEATURE_GROUPS = {
     "shared": (
         "shared_conv_0",

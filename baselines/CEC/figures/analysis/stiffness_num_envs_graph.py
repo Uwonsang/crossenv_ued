@@ -24,16 +24,18 @@ DEFAULT_TARGET_TIMESTEPS = 300_000_000
 DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "stiffness_results" / "stiffness_num_envs"
 
 METRICS = {
-    "same_layout": "stiffness/paper_value_same_layout",
-    "different_layout": "stiffness/paper_value_different_layout",
     "off_diagonal": "stiffness/paper_value_off_diagonal",
-    "layout_gap": "stiffness/paper_value_layout_gap",
+    "same_layout_per_environment": (
+        "stiffness/paper_value_same_layout_per_environment"
+    ),
+    "different_layout_per_environment": (
+        "stiffness/paper_value_different_layout_per_environment"
+    ),
 }
 PANEL_TITLES = {
-    "same_layout": "Same-layout",
-    "different_layout": "Different-layout",
     "off_diagonal": "Off-diagonal",
-    "layout_gap": "Layout gap",
+    "same_layout_per_environment": "Same-layout (per environment)",
+    "different_layout_per_environment": "Different-layout (per environment)",
 }
 COLORS = {"CEC": "#4c9a3a", "CEC_IDAAC": "#377eb8"}
 MARKERS = {"CEC": "o", "CEC_IDAAC": "o"}
@@ -226,7 +228,9 @@ def plot(rows, output_path: Path, target_timesteps: int):
     num_envs_values = sorted({row["num_envs"] for row in rows})
     lookup = {(r["metric"], r["algorithm"], r["num_envs"]): r for r in rows}
 
-    fig, axes = plt.subplots(1, len(METRICS), figsize=(13.2, 3.55), sharex=True)
+    fig, axes = plt.subplots(
+        1, len(METRICS), figsize=(3.3 * len(METRICS), 3.55), sharex=True
+    )
     for ax, metric in zip(axes, METRICS):
         for index, algorithm in enumerate(algorithms):
             points = [lookup.get((metric, algorithm, num_envs)) for num_envs in num_envs_values]

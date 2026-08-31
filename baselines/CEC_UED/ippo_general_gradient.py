@@ -826,11 +826,41 @@ def make_train(
             )
 
             if stiffness_enabled:
-                selected_static_signatures = jnp.take(
+                selected_static_signatures_by_state = jnp.take(
                     traj_batch.static_signature,
                     stiffness_actor_indices,
                     axis=1,
-                ).reshape((-1, traj_batch.static_signature.shape[-1]))
+                )
+                selected_static_signatures = (
+                    selected_static_signatures_by_state.reshape(
+                        (-1, traj_batch.static_signature.shape[-1])
+                    )
+                )
+                selected_environment_ids_by_actor = (
+                    stiffness_actor_indices % int(config["NUM_ENVS"])
+                )
+                stiffness_environment_ids = jnp.broadcast_to(
+                    selected_environment_ids_by_actor[None, :],
+                    selected_static_signatures_by_state.shape[:2],
+                ).reshape(-1)
+                initial_environment_signatures = (
+                    traj_batch.static_signature[
+                        0, :int(config["NUM_ENVS"])
+                    ]
+                )
+                selected_initial_environment_signatures = jnp.take(
+                    initial_environment_signatures,
+                    selected_environment_ids_by_actor,
+                    axis=0,
+                )
+                stiffness_environment_sample_mask = jnp.all(
+                    selected_static_signatures_by_state
+                    == selected_initial_environment_signatures[None, :, :],
+                    axis=-1,
+                ).reshape(-1)
+                stiffness_environment_layout_ids = traj_batch.layout_id[
+                    0, :int(config["NUM_ENVS"])
+                ]
                 policy_value_hstate = jax.tree.map(
                     lambda value: jnp.take(
                         value, stiffness_actor_indices, axis=0
@@ -927,11 +957,6 @@ def make_train(
                 environment_signatures = group_actor_trajectories(
                     traj_batch.static_signature
                 )
-                initial_environment_signatures = (
-                    traj_batch.static_signature[
-                        0, :int(config["NUM_ENVS"])
-                    ]
-                )
                 same_static_environment = jnp.all(
                     environment_signatures
                     == initial_environment_signatures[:, None, None, :],
@@ -949,14 +974,12 @@ def make_train(
                         stiffness_dones,
                         stiffness_agent_positions,
                         stiffness_targets,
-                        stiffness_layout_ids,
                     ) = select_stiffness_batch(
                         sampled_hstates=sampled_hstates,
                         observations=traj_batch.obs,
                         dones=traj_batch.done,
                         agent_positions=traj_batch.agent_positions,
                         targets=targets,
-                        layout_ids=traj_batch.layout_id,
                         actor_indices=stiffness_actor_indices,
                     )
                     return compute_paper_stiffness(
@@ -967,7 +990,13 @@ def make_train(
                         dones=stiffness_dones,
                         agent_positions=stiffness_agent_positions,
                         targets=stiffness_targets,
-                        layout_ids=stiffness_layout_ids,
+                        environment_ids=stiffness_environment_ids,
+                        environment_sample_mask=(
+                            stiffness_environment_sample_mask
+                        ),
+                        environment_layout_ids=(
+                            stiffness_environment_layout_ids
+                        ),
                         value_param_keys=VALUE_TRUNK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )

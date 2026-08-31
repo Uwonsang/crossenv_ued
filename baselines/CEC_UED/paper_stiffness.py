@@ -14,9 +14,8 @@ import jax.numpy as jnp
 
 STIFFNESS_METRIC_NAMES = (
     "value_off_diagonal",
-    "value_same_layout",
-    "value_different_layout",
-    "value_layout_gap",
+    "value_same_layout_per_environment",
+    "value_different_layout_per_environment",
 )
 
 
@@ -114,7 +113,6 @@ def select_stiffness_batch(
     dones: jnp.ndarray,
     agent_positions: jnp.ndarray,
     targets: jnp.ndarray,
-    layout_ids: jnp.ndarray,
     actor_indices: jax.Array,
 ):
     """Flatten every actor-state from the selected recurrent minibatch."""
@@ -132,7 +130,6 @@ def select_stiffness_batch(
         select_and_flatten(dones),
         select_and_flatten(agent_positions),
         select_and_flatten(targets),
-        select_and_flatten(layout_ids),
     )
 
 
@@ -194,10 +191,13 @@ def compute_paper_stiffness(
     dones: jnp.ndarray,
     agent_positions: jnp.ndarray,
     targets: jnp.ndarray,
-    layout_ids: jnp.ndarray,
+    environment_ids: jnp.ndarray,
+    environment_sample_mask: jnp.ndarray,
+    environment_layout_ids: jnp.ndarray,
     value_param_keys: Sequence[str],
     chunk_size: int,
     num_layouts: int = 5,
+    sketch_size: int = 512,
     epsilon: float = 1e-12,
 ):
     """Compute mean cosine similarity between distinct per-state value grads.
@@ -210,6 +210,9 @@ def compute_paper_stiffness(
     sample_size = int(observations.shape[0])
     if sample_size % int(chunk_size) != 0:
         raise ValueError("chunk_size must evenly divide the sampled batch.")
+    if int(sketch_size) <= 0:
+        raise ValueError("sketch_size must be positive.")
+    num_environments = int(environment_layout_ids.shape[0])
 
     value_params, merge_params = _partition_value_params(
         params, value_param_keys
@@ -259,28 +262,34 @@ def compute_paper_stiffness(
         chunk(dones),
         chunk(agent_positions),
         chunk(targets),
-        chunk(layout_ids),
+        chunk(environment_ids),
+        chunk(environment_sample_mask),
     )
-    normalized_gradient_sum_by_layout = jax.tree.map(
-        lambda value: jnp.zeros(
-            (num_layouts,) + value.shape, dtype=value.dtype
-        ),
-        value_params,
-    )
+    normalized_gradient_sum = jax.tree.map(jnp.zeros_like, value_params)
     initial_state = (
-        normalized_gradient_sum_by_layout,
-        jnp.zeros((num_layouts,), dtype=jnp.float32),
+        normalized_gradient_sum,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        jnp.zeros(
+            (num_environments, int(sketch_size)), dtype=jnp.float32
+        ),
+        jnp.zeros((num_environments,), dtype=jnp.float32),
     )
 
     def accumulate_chunk(state, batch):
-        normalized_sum_by_layout, valid_count_by_layout = state
+        (
+            normalized_sum,
+            valid_count,
+            raw_gradient_sketch_by_environment,
+            sample_count_by_environment,
+        ) = state
         (
             batch_hstates,
             batch_observations,
             batch_dones,
             batch_agent_positions,
             batch_targets,
-            batch_layout_ids,
+            batch_environment_ids,
+            batch_environment_sample_mask,
         ) = batch
         gradients = jax.vmap(
             individual_gradient,
@@ -306,75 +315,94 @@ def compute_paper_stiffness(
             valid, 1.0 / jnp.maximum(gradient_norms, epsilon), 0.0
         )
 
-        layout_one_hot = jax.nn.one_hot(
-            batch_layout_ids.astype(jnp.int32),
-            num_layouts,
-            dtype=jnp.float32,
-        )
-        valid_layout_weights = layout_one_hot * valid[:, None]
-
-        def add_normalized_by_layout(total, gradient_leaf):
+        def add_normalized(total, gradient_leaf):
             broadcast_shape = (chunk_size,) + (1,) * (gradient_leaf.ndim - 1)
             normalized = gradient_leaf * inverse_norms.reshape(
                 broadcast_shape
             )
-            return total + jnp.tensordot(
-                valid_layout_weights.T,
-                normalized,
-                axes=((1,), (0,)),
-            )
+            return total + jnp.sum(normalized, axis=0)
 
-        normalized_sum_by_layout = jax.tree.map(
-            add_normalized_by_layout,
-            normalized_sum_by_layout,
+        normalized_sum = jax.tree.map(
+            add_normalized,
+            normalized_sum,
             gradients,
         )
+        raw_gradient_sketches = jnp.zeros(
+            (int(chunk_size), int(sketch_size)), dtype=jnp.float32
+        )
+        parameter_offset = 0
+        for gradient_leaf in jax.tree_util.tree_leaves(gradients):
+            flat_gradient = gradient_leaf.reshape((int(chunk_size), -1))
+            parameter_indices = (
+                jnp.arange(flat_gradient.shape[1], dtype=jnp.uint32)
+                + jnp.asarray(parameter_offset, dtype=jnp.uint32)
+            )
+            mixed_indices = parameter_indices + jnp.uint32(0x9E3779B9)
+            mixed_indices = mixed_indices ^ (
+                mixed_indices >> jnp.uint32(16)
+            )
+            mixed_indices = mixed_indices * jnp.uint32(0x7FEB352D)
+            mixed_indices = mixed_indices ^ (
+                mixed_indices >> jnp.uint32(15)
+            )
+            mixed_indices = mixed_indices * jnp.uint32(0x846CA68B)
+            mixed_indices = mixed_indices ^ (
+                mixed_indices >> jnp.uint32(16)
+            )
+            sketch_bins = (
+                mixed_indices % jnp.uint32(int(sketch_size))
+            ).astype(jnp.int32)
+            sign_hash = mixed_indices ^ jnp.uint32(0xA5A5A5A5)
+            sign_hash = sign_hash * jnp.uint32(0x27D4EB2D)
+            sign_hash = sign_hash ^ (sign_hash >> jnp.uint32(15))
+            sketch_signs = jnp.where(
+                (sign_hash & jnp.uint32(1)) == 0, 1.0, -1.0
+            ).astype(jnp.float32)
+
+            def add_to_sketch(row):
+                return jnp.zeros(
+                    (int(sketch_size),), dtype=jnp.float32
+                ).at[sketch_bins].add(row * sketch_signs)
+
+            raw_gradient_sketches += jax.vmap(add_to_sketch)(flat_gradient)
+            parameter_offset += int(flat_gradient.shape[1])
+
+        valid_environment_sample = jnp.logical_and(
+            valid, batch_environment_sample_mask.astype(jnp.bool_)
+        )
+        raw_gradient_sketch_by_environment = (
+            raw_gradient_sketch_by_environment.at[
+                batch_environment_ids.astype(jnp.int32)
+            ].add(
+                raw_gradient_sketches
+                * valid_environment_sample.astype(jnp.float32)[:, None]
+            )
+        )
+        sample_count_by_environment = sample_count_by_environment.at[
+            batch_environment_ids.astype(jnp.int32)
+        ].add(valid_environment_sample.astype(jnp.float32))
         return (
-            normalized_sum_by_layout,
-            valid_count_by_layout + jnp.sum(
-                valid_layout_weights, axis=0
-            ),
+            normalized_sum,
+            valid_count + jnp.sum(valid.astype(jnp.float32)),
+            raw_gradient_sketch_by_environment,
+            sample_count_by_environment,
         ), None
 
     (
-        normalized_gradient_sum_by_layout,
-        valid_sample_count_by_layout,
+        normalized_gradient_sum,
+        valid_sample_count,
+        raw_gradient_sketch_by_environment,
+        sample_count_by_environment,
     ), _ = jax.lax.scan(accumulate_chunk, initial_state, chunked_inputs)
 
-    squared_sum_norm_by_layout = sum(
-        jnp.sum(
-            jnp.square(leaf),
-            axis=tuple(range(1, leaf.ndim)),
-        )
-        for leaf in jax.tree_util.tree_leaves(
-            normalized_gradient_sum_by_layout
-        )
-    )
-    normalized_gradient_sum = jax.tree.map(
-        lambda leaf: jnp.sum(leaf, axis=0),
-        normalized_gradient_sum_by_layout,
-    )
     squared_sum_norm = sum(
         jnp.sum(jnp.square(leaf))
         for leaf in jax.tree_util.tree_leaves(normalized_gradient_sum)
     )
-    valid_sample_count = jnp.sum(valid_sample_count_by_layout)
     # For normalized gradients u_i, ||sum_i u_i||^2 contains every ordered
     # pair cosine. Subtracting the valid count removes the i == j terms.
     off_diagonal_sum = squared_sum_norm - valid_sample_count
     off_diagonal_count = valid_sample_count * (valid_sample_count - 1.0)
-    same_layout_sum = jnp.sum(
-        squared_sum_norm_by_layout - valid_sample_count_by_layout
-    )
-    same_layout_count = jnp.sum(
-        valid_sample_count_by_layout
-        * (valid_sample_count_by_layout - 1.0)
-    )
-    # Removing the within-layout contribution from all distinct pairs leaves
-    # exactly the pairs whose layout-family IDs differ.
-    different_layout_sum = off_diagonal_sum - same_layout_sum
-    different_layout_count = off_diagonal_count - same_layout_count
-
     def safe_mean(total, count):
         return jnp.where(
             count > 0.0,
@@ -383,13 +411,61 @@ def compute_paper_stiffness(
         )
 
     off_diagonal = safe_mean(off_diagonal_sum, off_diagonal_count)
-    same_layout = safe_mean(same_layout_sum, same_layout_count)
-    different_layout = safe_mean(
-        different_layout_sum, different_layout_count
+
+    environment_sketch_norms = jnp.linalg.norm(
+        raw_gradient_sketch_by_environment, axis=1
+    )
+    valid_environments = jnp.logical_and(
+        sample_count_by_environment > 0.0,
+        environment_sketch_norms > epsilon,
+    )
+    normalized_environment_sketches = jnp.where(
+        valid_environments[:, None],
+        raw_gradient_sketch_by_environment
+        / jnp.maximum(environment_sketch_norms[:, None], epsilon),
+        0.0,
+    )
+    environment_layout_weights = jax.nn.one_hot(
+        environment_layout_ids.astype(jnp.int32),
+        num_layouts,
+        dtype=jnp.float32,
+    ) * valid_environments.astype(jnp.float32)[:, None]
+    normalized_environment_sum_by_layout = (
+        environment_layout_weights.T @ normalized_environment_sketches
+    )
+    environment_count_by_layout = jnp.sum(
+        environment_layout_weights, axis=0
+    )
+    environment_squared_sum_by_layout = jnp.sum(
+        jnp.square(normalized_environment_sum_by_layout), axis=1
+    )
+    environment_count = jnp.sum(environment_count_by_layout)
+    environment_same_layout_sum = jnp.sum(
+        environment_squared_sum_by_layout - environment_count_by_layout
+    )
+    environment_same_layout_count = jnp.sum(
+        environment_count_by_layout * (environment_count_by_layout - 1.0)
+    )
+    environment_total_sum = (
+        jnp.sum(jnp.square(jnp.sum(
+            normalized_environment_sum_by_layout, axis=0
+        )))
+        - environment_count
+    )
+    environment_total_count = environment_count * (environment_count - 1.0)
+    environment_different_layout_sum = (
+        environment_total_sum - environment_same_layout_sum
+    )
+    environment_different_layout_count = (
+        environment_total_count - environment_same_layout_count
     )
     return {
         "value_off_diagonal": off_diagonal,
-        "value_same_layout": same_layout,
-        "value_different_layout": different_layout,
-        "value_layout_gap": same_layout - different_layout,
+        "value_same_layout_per_environment": safe_mean(
+            environment_same_layout_sum, environment_same_layout_count
+        ),
+        "value_different_layout_per_environment": safe_mean(
+            environment_different_layout_sum,
+            environment_different_layout_count,
+        ),
     }

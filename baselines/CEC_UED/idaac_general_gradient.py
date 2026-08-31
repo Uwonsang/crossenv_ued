@@ -973,11 +973,14 @@ def make_train(
                     selected_environment_ids_by_actor,
                     axis=0,
                 )
-                stiffness_environment_sample_mask = jnp.all(
+                stiffness_environment_sample_mask_by_state = jnp.all(
                     selected_static_signatures_by_state
                     == selected_initial_environment_signatures[None, :, :],
                     axis=-1,
-                ).reshape(-1)
+                )
+                stiffness_environment_sample_mask = (
+                    stiffness_environment_sample_mask_by_state.reshape(-1)
+                )
                 stiffness_environment_layout_ids = traj_batch.layout_id[
                     0, :int(config["NUM_ENVS"])
                 ]
@@ -1012,6 +1015,10 @@ def make_train(
                         ),
                         feature_names=IDAAC_FEATURE_RANK_NAMES,
                         actor_indices=stiffness_actor_indices,
+                        sample_mask=(
+                            stiffness_environment_sample_mask_by_state
+                        ),
+                        slot_layout_ids=stiffness_environment_layout_ids,
                         num_slots=config["NUM_ENVS"],
                         num_agents=env.num_agents,
                     ),

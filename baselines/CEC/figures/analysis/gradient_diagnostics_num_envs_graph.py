@@ -69,6 +69,13 @@ METRIC_GROUPS = {
         )
         for role in ("shared", "policy", "value")
     },
+    **{
+        f"covariance_alignment_{role}": (
+            f"covariance_alignment_{role}/same_layout_mean",
+            f"covariance_alignment_{role}/different_layout_mean",
+        )
+        for role in ("shared", "policy", "value")
+    },
     "env_gradient_rank": (
         "env_gradient_rank/policy_effective_rank",
         "env_gradient_rank/value_effective_rank",

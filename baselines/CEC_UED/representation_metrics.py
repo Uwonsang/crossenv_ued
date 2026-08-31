@@ -167,6 +167,106 @@ def parallel_slot_feature_rank_metrics(
     )
 
 
+def parallel_slot_covariance_alignment(
+    features,
+    actor_indices,
+    sample_mask,
+    slot_layout_ids,
+    num_slots,
+    num_agents,
+    num_layouts=5,
+    epsilon=1e-12,
+):
+    """Average covariance alignment for same/different-layout slot pairs."""
+    actor_features = jnp.swapaxes(features, 0, 1).astype(jnp.float32)
+    actor_sample_mask = jnp.swapaxes(sample_mask, 0, 1).astype(jnp.bool_)
+    slot_ids = actor_indices.astype(jnp.int32) % int(num_slots)
+    selected_actor_count = int(actor_features.shape[0])
+    feature_size = int(actor_features.shape[2])
+    actor_positions = jnp.arange(selected_actor_count, dtype=jnp.int32)
+    initial_state = (
+        jnp.zeros(
+            (int(num_layouts), feature_size, feature_size),
+            dtype=jnp.float32,
+        ),
+        jnp.zeros((int(num_layouts),), dtype=jnp.float32),
+    )
+
+    def accumulate_slot(state, slot_index):
+        covariance_sum_by_layout, count_by_layout = state
+        candidate_positions = jnp.where(
+            slot_ids == slot_index,
+            actor_positions,
+            selected_actor_count,
+        )
+        selected_positions = jnp.sort(candidate_positions)[:int(num_agents)]
+        selected_valid = selected_positions < selected_actor_count
+        safe_positions = jnp.minimum(
+            selected_positions, selected_actor_count - 1
+        )
+        selected_features = actor_features[safe_positions]
+        selected_mask = jnp.logical_and(
+            actor_sample_mask[safe_positions], selected_valid[:, None]
+        )
+        weights = selected_mask.astype(jnp.float32)[..., None]
+        sample_count = jnp.sum(selected_mask.astype(jnp.float32))
+        feature_sum = jnp.sum(selected_features * weights, axis=(0, 1))
+        feature_mean = feature_sum / jnp.maximum(sample_count, 1.0)
+        centered_features = (selected_features - feature_mean) * weights
+        covariance = jnp.einsum(
+            "atd,ate->de", centered_features, centered_features
+        ) / jnp.maximum(sample_count - 1.0, 1.0)
+        covariance_norm = jnp.linalg.norm(covariance)
+        valid = jnp.logical_and(
+            sample_count > 1.0, covariance_norm > epsilon
+        )
+        normalized_covariance = jnp.where(
+            valid,
+            covariance / jnp.maximum(covariance_norm, epsilon),
+            jnp.zeros_like(covariance),
+        )
+        layout_id = slot_layout_ids[slot_index].astype(jnp.int32)
+        covariance_sum_by_layout = covariance_sum_by_layout.at[
+            layout_id
+        ].add(normalized_covariance)
+        count_by_layout = count_by_layout.at[layout_id].add(
+            valid.astype(jnp.float32)
+        )
+        return (covariance_sum_by_layout, count_by_layout), None
+
+    (covariance_sum_by_layout, count_by_layout), _ = jax.lax.scan(
+        accumulate_slot,
+        initial_state,
+        jnp.arange(int(num_slots), dtype=jnp.int32),
+    )
+    squared_sum_by_layout = jnp.sum(
+        jnp.square(covariance_sum_by_layout), axis=(1, 2)
+    )
+    same_sum = jnp.sum(squared_sum_by_layout - count_by_layout)
+    same_count = jnp.sum(count_by_layout * (count_by_layout - 1.0))
+    total_count = jnp.sum(count_by_layout)
+    total_sum = (
+        jnp.sum(jnp.square(jnp.sum(covariance_sum_by_layout, axis=0)))
+        - total_count
+    )
+    total_pair_count = total_count * (total_count - 1.0)
+    different_sum = total_sum - same_sum
+    different_count = total_pair_count - same_count
+    nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+    return {
+        "same_layout_mean": jnp.where(
+            same_count > 0.0,
+            same_sum / jnp.maximum(same_count, 1.0),
+            nan,
+        ),
+        "different_layout_mean": jnp.where(
+            different_count > 0.0,
+            different_sum / jnp.maximum(different_count, 1.0),
+            nan,
+        ),
+    }
+
+
 def compute_pooled_feature_rank_metrics(
     network,
     params,
@@ -174,6 +274,8 @@ def compute_pooled_feature_rank_metrics(
     network_inputs,
     feature_names,
     actor_indices,
+    sample_mask,
+    slot_layout_ids,
     num_slots,
     num_agents,
 ):
@@ -201,6 +303,18 @@ def compute_pooled_feature_rank_metrics(
         for statistic, value in within_statistics.items():
             metrics[f"{namespace}/within_slot_{statistic}"] = value
         metrics[f"{namespace}/between_slot_effective_rank"] = between_rank
+        covariance_alignment = parallel_slot_covariance_alignment(
+            features,
+            actor_indices=actor_indices,
+            sample_mask=sample_mask,
+            slot_layout_ids=slot_layout_ids,
+            num_slots=num_slots,
+            num_agents=num_agents,
+        )
+        for alignment_name, value in covariance_alignment.items():
+            metrics[
+                f"covariance_alignment_{metric_name}/{alignment_name}"
+            ] = value
     return metrics
 
 
@@ -222,6 +336,12 @@ def empty_pooled_feature_rank_metrics(feature_names, dtype=jnp.float32):
             jnp.asarray(jnp.nan, dtype=dtype)
         )
         for metric_name, _ in feature_names
+    } | {
+        f"covariance_alignment_{metric_name}/{alignment_name}": jnp.asarray(
+            jnp.nan, dtype=dtype
+        )
+        for metric_name, _ in feature_names
+        for alignment_name in ("same_layout_mean", "different_layout_mean")
     }
 
 

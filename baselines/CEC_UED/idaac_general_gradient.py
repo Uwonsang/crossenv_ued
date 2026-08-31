@@ -497,6 +497,10 @@ IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "value_snr",
     "policy_log_snr",
     "value_log_snr",
+    "policy_parameterwise_gsnr_mean",
+    "value_parameterwise_gsnr_mean",
+    "policy_parameterwise_gsnr_mean_log10",
+    "value_parameterwise_gsnr_mean_log10",
 )
 
 
@@ -1090,6 +1094,8 @@ def make_train(
                         targets=environment_targets,
                         sample_mask=environment_sample_mask,
                         shared_param_keys=("actor_trunk", "critic_trunk"),
+                        policy_gsnr_param_keys=("actor_trunk",),
+                        value_gsnr_param_keys=("critic_trunk",),
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

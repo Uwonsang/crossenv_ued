@@ -45,6 +45,12 @@ METRIC_GROUPS = {
         "env_gradient_snr/policy_log_snr",
         "env_gradient_snr/value_log_snr",
     ),
+    "env_gradient_gsnr": (
+        "env_gradient_gsnr/policy_parameterwise_gsnr_mean",
+        "env_gradient_gsnr/value_parameterwise_gsnr_mean",
+        "env_gradient_gsnr/policy_parameterwise_gsnr_mean_log10",
+        "env_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
+    ),
     "env_gradient_rank": (
         "env_gradient_rank/policy_effective_rank",
         "env_gradient_rank/value_effective_rank",

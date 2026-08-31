@@ -979,6 +979,8 @@ def make_train(
                         targets=environment_targets,
                         sample_mask=environment_sample_mask,
                         shared_param_keys=SHARED_TRUNK_KEYS,
+                        policy_gsnr_param_keys=SHARED_TRUNK_KEYS,
+                        value_gsnr_param_keys=SHARED_TRUNK_KEYS,
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

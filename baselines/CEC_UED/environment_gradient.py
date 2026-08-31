@@ -20,6 +20,10 @@ ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "value_snr",
     "policy_log_snr",
     "value_log_snr",
+    "policy_parameterwise_gsnr_mean",
+    "value_parameterwise_gsnr_mean",
+    "policy_parameterwise_gsnr_mean_log10",
+    "value_parameterwise_gsnr_mean_log10",
 )
 
 
@@ -38,6 +42,8 @@ def environment_gradient_log_key(metric_name: str) -> str:
         namespace = "env_gradient_rank"
     elif metric_name.endswith("_snr"):
         namespace = "env_gradient_snr"
+    elif "parameterwise_gsnr" in metric_name:
+        namespace = "env_gradient_gsnr"
     else:
         raise ValueError(
             f"Unknown environment-gradient metric: {metric_name}"
@@ -85,6 +91,8 @@ def compute_environment_conditioned_cosines(
     chunk_size: int,
     sketch_size: int = 512,
     epsilon: float = 1e-12,
+    policy_gsnr_param_keys: Sequence[str] = None,
+    value_gsnr_param_keys: Sequence[str] = None,
 ):
     """Compute alignment between gradients conditioned on static grids.
 
@@ -101,6 +109,19 @@ def compute_environment_conditioned_cosines(
     shared_params, merge_params = _partition_params(
         params, shared_param_keys
     )
+    policy_gsnr_param_keys = tuple(
+        shared_param_keys
+        if policy_gsnr_param_keys is None else policy_gsnr_param_keys
+    )
+    value_gsnr_param_keys = tuple(
+        shared_param_keys
+        if value_gsnr_param_keys is None else value_gsnr_param_keys
+    )
+    selected_key_set = set(shared_param_keys)
+    if not set(policy_gsnr_param_keys).issubset(selected_key_set):
+        raise ValueError("policy GSNR keys must be in shared_param_keys.")
+    if not set(value_gsnr_param_keys).issubset(selected_key_set):
+        raise ValueError("value GSNR keys must be in shared_param_keys.")
     if int(sketch_size) <= 0:
         raise ValueError("sketch_size must be positive.")
 
@@ -176,6 +197,8 @@ def compute_environment_conditioned_cosines(
         zero_sum,
         zero_sum,
         zero_sum,
+        zero_sum,
+        zero_sum,
         jnp.asarray(0.0, dtype=jnp.float32),
         jnp.asarray(0.0, dtype=jnp.float32),
         jnp.asarray(0.0, dtype=jnp.float32),
@@ -188,6 +211,8 @@ def compute_environment_conditioned_cosines(
             value_sum,
             raw_policy_sum,
             raw_value_sum,
+            raw_policy_squared_sum,
+            raw_value_squared_sum,
             raw_policy_squared_norm_sum,
             raw_value_squared_norm_sum,
             same_dot_sum,
@@ -349,11 +374,28 @@ def compute_environment_conditioned_cosines(
         raw_value_sum = jax.tree.map(
             add_raw, raw_value_sum, value_grads
         )
+
+        def add_raw_squared(total, gradient):
+            shape = (int(chunk_size),) + (1,) * (gradient.ndim - 1)
+            return total + jnp.sum(
+                jnp.square(gradient)
+                * valid.astype(gradient.dtype).reshape(shape),
+                axis=0,
+            )
+
+        raw_policy_squared_sum = jax.tree.map(
+            add_raw_squared, raw_policy_squared_sum, policy_grads
+        )
+        raw_value_squared_sum = jax.tree.map(
+            add_raw_squared, raw_value_squared_sum, value_grads
+        )
         next_state = (
             policy_sum,
             value_sum,
             raw_policy_sum,
             raw_value_sum,
+            raw_policy_squared_sum,
+            raw_value_squared_sum,
             raw_policy_squared_norm_sum + jnp.sum(
                 jnp.where(valid, policy_squared_norm, 0.0)
             ),
@@ -370,6 +412,8 @@ def compute_environment_conditioned_cosines(
         value_sum,
         raw_policy_sum,
         raw_value_sum,
+        raw_policy_squared_sum,
+        raw_value_squared_sum,
         raw_policy_squared_norm_sum,
         raw_value_squared_norm_sum,
         same_dot_sum,
@@ -457,6 +501,66 @@ def compute_environment_conditioned_cosines(
     policy_log_snr = jnp.log10(jnp.maximum(policy_snr, epsilon))
     value_log_snr = jnp.log10(jnp.maximum(value_snr, epsilon))
 
+    def parameterwise_gsnr(raw_sum, raw_squared_sum, param_keys):
+        count = jnp.maximum(valid_count, 1.0)
+        variance_denominator = jnp.maximum(valid_count - 1.0, 1.0)
+        gsnr_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        log10_gsnr_sum = jnp.asarray(0.0, dtype=jnp.float32)
+        active_parameter_count = jnp.asarray(0.0, dtype=jnp.float32)
+        for param_key in param_keys:
+            for sum_leaf, squared_sum_leaf in zip(
+                jax.tree_util.tree_leaves(raw_sum[param_key]),
+                jax.tree_util.tree_leaves(raw_squared_sum[param_key]),
+            ):
+                sum_leaf = sum_leaf.astype(jnp.float32)
+                squared_sum_leaf = squared_sum_leaf.astype(jnp.float32)
+                mean = sum_leaf / count
+                centered_squared_sum = jnp.maximum(
+                    squared_sum_leaf - count * jnp.square(mean), 0.0
+                )
+                sample_variance = (
+                    centered_squared_sum / variance_denominator
+                )
+                coordinate_gsnr = jnp.square(mean) / (
+                    sample_variance + epsilon
+                )
+                gsnr_sum += jnp.sum(coordinate_gsnr)
+                log10_gsnr_sum += jnp.sum(
+                    jnp.log10(jnp.maximum(coordinate_gsnr, epsilon))
+                )
+                active_parameter_count += jnp.asarray(
+                    sum_leaf.size, dtype=jnp.float32
+                )
+
+        valid_result = jnp.logical_and(
+            valid_count > 1, active_parameter_count > 0
+        )
+        denominator = jnp.maximum(active_parameter_count, 1.0)
+        mean_gsnr = gsnr_sum / denominator
+        mean_log10_gsnr = log10_gsnr_sum / denominator
+        nan = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        return (
+            jnp.where(valid_result, mean_gsnr, nan),
+            jnp.where(valid_result, mean_log10_gsnr, nan),
+        )
+
+    (
+        policy_parameterwise_gsnr_mean,
+        policy_parameterwise_gsnr_mean_log10,
+    ) = parameterwise_gsnr(
+        raw_policy_sum,
+        raw_policy_squared_sum,
+        policy_gsnr_param_keys,
+    )
+    (
+        value_parameterwise_gsnr_mean,
+        value_parameterwise_gsnr_mean_log10,
+    ) = parameterwise_gsnr(
+        raw_value_sum,
+        raw_value_squared_sum,
+        value_gsnr_param_keys,
+    )
+
     policy_sum_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
     value_sum_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
     policy_value_sum_dot = jnp.asarray(0.0, dtype=jnp.float32)
@@ -502,4 +606,12 @@ def compute_environment_conditioned_cosines(
         "value_snr": value_snr,
         "policy_log_snr": policy_log_snr,
         "value_log_snr": value_log_snr,
+        "policy_parameterwise_gsnr_mean": policy_parameterwise_gsnr_mean,
+        "value_parameterwise_gsnr_mean": value_parameterwise_gsnr_mean,
+        "policy_parameterwise_gsnr_mean_log10": (
+            policy_parameterwise_gsnr_mean_log10
+        ),
+        "value_parameterwise_gsnr_mean_log10": (
+            value_parameterwise_gsnr_mean_log10
+        ),
     }

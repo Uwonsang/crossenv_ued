@@ -58,7 +58,8 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
   포함된다.
 - **`gradient_diagnostics_num_envs_graph.py`** — `cec_stiffness_100m`에서
   `TOTAL_TIMESTEPS=300M`인 IPPO/IDAAC run의 `policy_value`, environment
-  gradient cosine, effective rank, SNR을 가져온다. 알고리즘·`NUM_ENVS`별
+  gradient cosine, effective rank, vector SNR, parameter-wise GSNR을
+  가져온다. 알고리즘·`NUM_ENVS`별
   0M–300M 전체 구간과 마지막 30M-step 구간의 평균 그래프·집계 CSV를
   동시에 저장한다. 300M의 95%에 도달하지 못한 run은 run/history CSV에는
   남기고 두 요약에서는 제외한다. 학습 time-series는 W&B에서 직접 확인한다.

@@ -191,3 +191,4 @@ baselines/CEC/figures/results/*
 baselines/CEC_UED/dataset/*
 baselines/human_proxy/data/origin
 .idea/*
+baselines/CEC/figures/stiffness_results

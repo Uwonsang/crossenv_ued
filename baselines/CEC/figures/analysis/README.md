@@ -56,6 +56,12 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
   subplot으로 생성한다. `--seeds 0 1`을 사용하면 선은 seed 평균, 음영은
   seed 최소–최대 범위를 나타낸다. 출력 파일명에는 선택한 seed가 자동으로
   포함된다.
+- **`gradient_diagnostics_num_envs_graph.py`** — `cec_stiffness_100m`에서
+  `TOTAL_TIMESTEPS=300M`인 IPPO/IDAAC run의 `policy_value`, environment
+  gradient cosine, effective rank, SNR을 가져온다. 알고리즘·`NUM_ENVS`별
+  0M–300M 전체 구간과 마지막 30M-step 구간의 평균 그래프·집계 CSV를
+  동시에 저장한다. 300M의 95%에 도달하지 못한 run은 run/history CSV에는
+  남기고 두 요약에서는 제외한다. 학습 time-series는 W&B에서 직접 확인한다.
 
 ## Current logging compatibility
 
@@ -88,6 +94,7 @@ python baselines/CEC/figures/analysis/eval_xp_model_graph.py \
   --seeds 0 1
 python baselines/CEC/figures/analysis/eval_xp_comparison_graphs.py
 python baselines/CEC/figures/analysis/eval_xp_scaling_graph.py
+python baselines/CEC/figures/analysis/gradient_diagnostics_num_envs_graph.py
 ```
 
 Run `python3 <script>.py --help` for the full flag list.

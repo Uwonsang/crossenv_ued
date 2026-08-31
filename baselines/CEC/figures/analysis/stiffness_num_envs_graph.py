@@ -20,6 +20,7 @@ import wandb
 
 DEFAULT_ENTITY = "overcooked_ai"
 DEFAULT_PROJECT = "cec_stiffness_100m"
+DEFAULT_TARGET_TIMESTEPS = 300_000_000
 DEFAULT_OUTPUT_DIR = Path(__file__).parent.parent / "stiffness_results" / "stiffness_num_envs"
 
 METRICS = {
@@ -43,6 +44,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entity", default=DEFAULT_ENTITY)
     parser.add_argument("--project", default=DEFAULT_PROJECT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--target-timesteps", type=int, default=DEFAULT_TARGET_TIMESTEPS
+    )
+    parser.add_argument(
+        "--min-progress",
+        type=float,
+        default=0.95,
+        help="Minimum target-step fraction required for inclusion.",
+    )
     parser.add_argument(
         "--algorithms",
         nargs="*",
@@ -105,6 +115,28 @@ def fetch_run_means(args: argparse.Namespace):
         if not args.include_running and run.state == "running":
             print(f"Skipping running run: {run.id} ({run.name})")
             continue
+        total_timesteps = run.config.get(
+            "TOTAL_TIMESTEPS", run.config.get("total_timesteps")
+        )
+        try:
+            total_timesteps = int(total_timesteps)
+        except (TypeError, ValueError):
+            continue
+        if total_timesteps != args.target_timesteps:
+            continue
+        summary_env_step = finite_float(run.summary.get("env_step"))
+        if summary_env_step is None:
+            summary_env_step = finite_float(run.summary.get("_step"))
+        progress = (
+            summary_env_step / args.target_timesteps
+            if summary_env_step is not None else 0.0
+        )
+        if progress < args.min_progress:
+            print(
+                f"Skipping incomplete run: {run.id} ({run.name}), "
+                f"progress={100 * progress:.2f}%"
+            )
+            continue
         algorithm = canonical_algorithm(run)
         if args.algorithms and algorithm not in args.algorithms:
             continue
@@ -119,11 +151,16 @@ def fetch_run_means(args: argparse.Namespace):
 
         values = {metric: [] for metric in METRICS}
         history = run.history(
-            keys=keys,
+            keys=["env_step", "_step", *keys],
             samples=args.history_samples,
             pandas=False,
         )
         for history_row in history:
+            env_step = finite_float(
+                history_row.get("env_step", history_row.get("_step"))
+            )
+            if env_step is not None and env_step > args.target_timesteps:
+                continue
             for metric, wandb_key in METRICS.items():
                 value = finite_float(history_row.get(wandb_key))
                 if value is not None:
@@ -138,6 +175,9 @@ def fetch_run_means(args: argparse.Namespace):
                         "run_state": run.state,
                         "algorithm": algorithm,
                         "num_envs": num_envs,
+                        "configured_total_timesteps": total_timesteps,
+                        "max_logged_env_step": int(summary_env_step),
+                        "progress": progress,
                         "metric": metric,
                         "history_mean": float(np.mean(samples)),
                         "history_std": float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0,
@@ -181,7 +221,7 @@ def write_csv(path: Path, rows, fieldnames):
         writer.writerows(rows)
 
 
-def plot(rows, output_path: Path):
+def plot(rows, output_path: Path, target_timesteps: int):
     algorithms = sorted({row["algorithm"] for row in rows})
     num_envs_values = sorted({row["num_envs"] for row in rows})
     lookup = {(r["metric"], r["algorithm"], r["num_envs"]): r for r in rows}
@@ -237,7 +277,12 @@ def plot(rows, output_path: Path):
             ncol=len(labels),
             frameon=True,
         )
-    fig.suptitle("Value-network stiffness vs. number of environments", y=1.14, fontsize=14)
+    fig.suptitle(
+        "Value-network stiffness vs. number of environments "
+        f"(0M–{target_timesteps / 1e6:.0f}M mean)",
+        y=1.14,
+        fontsize=14,
+    )
     fig.subplots_adjust(left=0.065, right=0.99, bottom=0.20, top=0.78, wspace=0.34)
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -245,18 +290,21 @@ def plot(rows, output_path: Path):
 
 def main():
     args = parse_args()
+    if not 0 < args.min_progress <= 1:
+        raise ValueError("--min-progress must be in (0, 1].")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     run_rows = fetch_run_means(args)
     if not run_rows:
         raise RuntimeError("No completed W&B runs with stiffness history were found.")
     aggregate_rows = aggregate(run_rows)
 
-    run_csv = args.output_dir / "stiffness_run_means.csv"
-    aggregate_csv = args.output_dir / "stiffness_num_envs_aggregate.csv"
-    figure_path = args.output_dir / "stiffness_vs_num_envs.png"
+    suffix = f"{args.target_timesteps // 1_000_000}m"
+    run_csv = args.output_dir / f"stiffness_run_means_{suffix}.csv"
+    aggregate_csv = args.output_dir / f"stiffness_num_envs_aggregate_{suffix}.csv"
+    figure_path = args.output_dir / f"stiffness_vs_num_envs_{suffix}.png"
     write_csv(run_csv, run_rows, list(run_rows[0]))
     write_csv(aggregate_csv, aggregate_rows, list(aggregate_rows[0]))
-    plot(aggregate_rows, figure_path)
+    plot(aggregate_rows, figure_path, args.target_timesteps)
 
     print(f"Runs with data: {len({row['run_id'] for row in run_rows})}")
     print(f"Saved: {run_csv}")

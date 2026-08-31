@@ -56,6 +56,7 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued_ICLR_dual_destination"
 "WANDB_MODE" : "online" # disabled, online, offline
+"WANDB_GROUP": null
 "model_name": "CEC_IDAAC"
 "save_frames": False
 "save_frames_interval": 200
@@ -96,5 +97,4 @@
   "num_steps": 100
   "beta": 1.0
   "argmax": False
-
 

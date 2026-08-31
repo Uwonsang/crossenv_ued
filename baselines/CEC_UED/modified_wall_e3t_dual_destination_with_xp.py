@@ -53,6 +53,12 @@ def get_toy_layout_names(config):
     return list(config.get("layout_names", TOY_LAYOUT_NAMES))
 
 
+def get_wall_map_dir_name(config):
+    map_name = get_wall_map_name(config)
+    ckpt_tag = str(config.get("CKPT_TAG", "")).strip()
+    return f"{map_name}_{ckpt_tag}" if ckpt_tag else map_name
+
+
 def make_modified_wall_env(config, map_name=None, evaluation=False):
     allowed = {
         "max_steps",
@@ -97,9 +103,8 @@ def initialize_environment(config):
 
 def load_xp_partner_params(config):
     partner_seed = int(config.get("XP_KWARGS", {}).get("partner_seed", 98))
-    map_name = get_wall_map_name(config)
     root = (
-        f"ckpts/e3t/{config['ENV_NAME']}/modified_wall/{map_name}"
+        f"ckpts/e3t/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
         f"/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/e3t"
     )
     matches = glob.glob(
@@ -995,6 +1000,7 @@ def main(config):
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
+        group=config.get("WANDB_GROUP") or None,
         tags=["E3T", "RNN", "SP", "modified_wall"],
         config=config,
         mode=config["WANDB_MODE"],
@@ -1002,7 +1008,7 @@ def main(config):
     )
 
     filepath = (
-        f"ckpts/e3t/{config['ENV_NAME']}/modified_wall/{map_name}"
+        f"ckpts/e3t/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
         f"/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/e3t/{xpid}"
     )
     config["filepath"] = filepath

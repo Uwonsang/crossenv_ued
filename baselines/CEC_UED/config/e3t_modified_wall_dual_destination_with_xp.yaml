@@ -58,6 +58,7 @@
 "ENTITY": "overcooked_ai"
 "PROJECT": "crossenv_ued_ICLR_dual_destination"
 "WANDB_MODE": "online"
+"WANDB_GROUP": null
 "model_name": "E3T"
 
 "save_frames": false
@@ -81,6 +82,7 @@
   "human_proxy_num_seeds": 5
 
 "map_name": "empty"
+"CKPT_TAG": ""
 "layout_names":
   - "empty"
   - "wall_a"
@@ -92,5 +94,4 @@
   "num_steps": 100
   "beta": 1.0
   "argmax": false
-
 

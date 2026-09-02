@@ -900,18 +900,14 @@ def main(config):
             custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'])
         for ckpt_id in ckpt_id_list:
             for ckpt_seed in seed_list:
-                print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl")
-                if os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"
-                elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"
-                elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"
-                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"):
-                    path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"
-                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"):
-                    path_to_open = f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"
-                else:
+                path_to_open = (
+                    Path(custom_path)
+                    / f"seed{ckpt_seed}"
+                    / "fcp_pool"
+                    / f"seed{ckpt_seed}_{ckpt_id}.pkl"
+                )
+                print(f"Looking for FCP partner: {path_to_open}")
+                if not path_to_open.exists():
                     continue
                 with open(path_to_open, "rb") as f:
                     frozen_ckpt= pickle.load(f)

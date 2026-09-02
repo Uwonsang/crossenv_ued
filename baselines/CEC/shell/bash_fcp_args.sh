@@ -20,10 +20,19 @@ else
     SEEDS=(0 1 2 3 4 5)
 fi
 
+FCP_PATH_ARGS=()
+if [[ -n "${CHECKPOINT_ROOT:-}" ]]; then
+    FCP_PATH_ARGS+=(FCP_filepath="${CHECKPOINT_ROOT}")
+fi
+
 echo "Using GPU ${gpu}, layout ${layout}, seeds: ${SEEDS[*]}"
+if [[ -n "${CHECKPOINT_ROOT:-}" ]]; then
+    echo "Using FCP checkpoint pool: ${CHECKPOINT_ROOT}"
+fi
 for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES="${gpu}" python baselines/CEC/fcp_general.py \
       ENV_KWARGS.layout="${layout}" \
       SEED="${seed}" \
+      "${FCP_PATH_ARGS[@]}" \
       WANDB_MODE=online
 done

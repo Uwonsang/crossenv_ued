@@ -7,6 +7,10 @@
 # subfolder before <folder>. CEC, CEC_IDDAC, E3T, and FCP use the seed prefix
 # in their checkpoint filename as the destination folder name. IPPO ikFalse
 # runs use fcp_pool/seed*_final.pkl and likewise copy under the corresponding seed.
+# CEC_IDDAC_Finetune and CEC_Finetune runs bundle multiple seeds' checkpoints
+# in one lr-* folder, so each seed{N}_ckpt*.pkl (plus its seed{N}_mid_ckpts
+# folder, if present) is split out into its own
+# /app/nas/models/ICRL/<MODEL>/<layout>/<seed>.
 set -euo pipefail
 
 NAS_ROOT="/app/nas/models/ICRL"
@@ -36,11 +40,24 @@ model_for_path() {
   case "$src" in
     */ckpts/idaac/*)
       if [ "$ik" = "True" ]; then echo "CEC_IDDAC"; fi ;;
+    */ckpts/iddac_finetune/*) echo "CEC_IDDAC_Finetune" ;;
+    */ckpts/ippo_finetune/*)  echo "CEC_Finetune" ;;
     */ckpts/ippo/*)
       if [ "$ik" = "False" ]; then echo "IPPO"; else echo "CEC"; fi ;;
     */ckpts/e3t/*)   echo "E3T" ;;
     */ckpts/fcp/*)   echo "FCP" ;;
     *) echo "" ;;
+  esac
+}
+
+# Finetune runs bundle every seed's checkpoint (and mid_ckpts) together in one
+# lr-* folder instead of one seed per folder, so they need the per-seed split
+# handled separately from the single-checkpoint-per-folder models below.
+model_is_finetune() {
+  local model="$1"
+  case "$model" in
+    CEC_IDDAC_Finetune|CEC_Finetune) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -116,7 +133,47 @@ for src in "${ARGS[@]}"; do
   ik="$(ik_for_path "$src")"
   model="$(model_for_path "$src" "$ik")"
   if [ -z "$model" ]; then
-    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,ippo,e3t,fcp}/...): $src" >&2
+    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,iddac_finetune,ippo,ippo_finetune,e3t,fcp}/...): $src" >&2
+    continue
+  fi
+
+  if model_is_finetune "$model"; then
+    layout="$(layout_for_path "$src")"
+    if [ -z "$layout" ]; then
+      echo "[SKIP] couldn't determine layout (expected one of: ${LAYOUTS[*]}): $src" >&2
+      continue
+    fi
+    dest_dir="$NAS_ROOT/$model/$layout"
+
+    pattern="$(ckpt_pattern_for_model "$model")"
+    mapfile -t ckpt_files < <(find "$src" -maxdepth 1 -type f -name "$pattern" | sort)
+    if [ "${#ckpt_files[@]}" -eq 0 ]; then
+      echo "[SKIP] no checkpoint matching '$pattern' found in: $src" >&2
+      continue
+    fi
+
+    for ckpt_file in "${ckpt_files[@]}"; do
+      fname="$(basename "$ckpt_file")"
+      if [[ ! "$fname" =~ ^(seed[0-9]+)_ckpt ]]; then
+        echo "[SKIP] couldn't parse seed from checkpoint filename: $fname" >&2
+        continue
+      fi
+      seed_name="${BASH_REMATCH[1]}"
+      dest="$dest_dir/$seed_name"
+
+      if [ -e "$dest" ] && [ "$FORCE" -ne 1 ]; then
+        echo "[SKIP] destination already exists (use -f to overwrite): $dest" >&2
+        continue
+      fi
+
+      mkdir -p "$dest"
+      echo "[COPY] $src ($fname)"
+      echo "    -> $dest"
+      cp -a --no-preserve=ownership "$ckpt_file" "$dest/"
+      if [ -d "$src/${seed_name}_mid_ckpts" ]; then
+        cp -a --no-preserve=ownership "$src/${seed_name}_mid_ckpts" "$dest/"
+      fi
+    done
     continue
   fi
 

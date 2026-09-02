@@ -745,7 +745,10 @@ def make_train(config, update_step=0):
                 if current_return > best_return[0]:
                     best_return[0] = current_return
                     os.makedirs(config['filepath'], exist_ok=True)
-                    ckpt_path = f"{config['filepath']}/fcp_seed{config['SEED']}_best.pkl"
+                    ckpt_path = (
+                        f"{config['filepath']}/"
+                        f"fcp_fixed_seed{config['SEED']}_best.pkl"
+                    )
                     with open(ckpt_path, "wb") as f:
                         pickle.dump({
                             'params': metric["params"],
@@ -788,6 +791,7 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    config["model_name"] = "FCP_FIXED"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_improved_finetuneIK"
@@ -808,20 +812,23 @@ def main(config):
 
     if config["ENV_NAME"] == "ToyCoop":
         run_name = (
-            f"FCP_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
+            f"FCP_FIXED_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
             f"_seed{config['SEED']}"
         )
     else:
-        run_name = f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
+        run_name = (
+            f"FCP_FIXED_{config['ENV_KWARGS']['layout']}_"
+            f"{config['SEED']}"
+        )
     wandb.init(
         entity=config["ENTITY"],
         project=config["PROJECT"],
-        tags=["IPPO", "RNN", "FCP"],
+        tags=["IPPO", "RNN", "FCP", "FCP_FIXED"],
         config=config,
         mode=config["WANDB_MODE"],
         name=run_name
     )
-    filepath = f"ckpts/fcp/{config['ENV_NAME']}"
+    filepath = f"ckpts/fcp_fixed/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
     filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
@@ -846,14 +853,14 @@ def main(config):
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
-        if os.path.exists(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
+        if os.path.exists(f"{filepath}/fcp_fixed_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             print(f"filepath: {filepath}")
             exit(0)
 
     if config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        with open(f"{filepath}/fcp_fixed_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             final_update_step = previous_ckpt['final_update_step']
@@ -923,11 +930,16 @@ def main(config):
         
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    final_checkpoint = (
+        f"{filepath}/seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}_fcp_fixed"
+        f"{finetune_appendage}_updates{num_updates}.pkl"
+    )
+    with open(final_checkpoint, "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {final_checkpoint}")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

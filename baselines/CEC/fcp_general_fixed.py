@@ -885,7 +885,7 @@ def main(config):
             ckpt_id_list = [0, 1, 3]
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
-        seed_list = range(6)
+        seed_list = [0, 1, 2, 3, 5, 6]
         CKPT_ROOT = Path(__file__).resolve().parents[2] / config['FCP_filepath']
         if config["ENV_NAME"] == "ToyCoop":
             custom_path = str(CKPT_ROOT)

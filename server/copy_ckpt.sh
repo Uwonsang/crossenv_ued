@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Copy trained-checkpoint lr-* folders from /app/ckpts/... into the shared
-# NAS layout under /app/nas/models/ICRL/<MODEL>/<N>/<lr-folder> for CEC and
+# NAS layout under /app/nas/models/ICRL/<MODEL>/<N>/<seed> for CEC and
 # CEC_IDDAC (where <N> is picked from the "updates" count baked into the
-# final checkpoint filename), or /app/nas/models/ICRL/<MODEL>/<lr-folder>
+# final checkpoint filename), or /app/nas/models/ICRL/<MODEL>/<folder>
 # for IPPO/E3T/FCP (no <N>). ikFalse runs additionally get a <layout>
-# subfolder before <lr-folder>.
+# subfolder before <folder>. CEC, CEC_IDDAC, E3T, and FCP use the seed prefix
+# in their checkpoint filename as the destination folder name. IPPO ikFalse
+# runs use fcp_pool/seed*_final.pkl and likewise copy under the corresponding seed.
 set -euo pipefail
 
 NAS_ROOT="/app/nas/models/ICRL"
@@ -101,6 +103,11 @@ fi
 for src in "${ARGS[@]}"; do
   src="${src%/}"
 
+  # This run was already relocated separately, so omit it from scan output.
+  if [[ "$src" == */ckpts/ippo/overcooked/counter_circuit_9/ikFalse/reset_all/lr-20260825-132120 ]]; then
+    continue
+  fi
+
   if [ ! -d "$src" ]; then
     echo "[SKIP] not a directory: $src" >&2
     continue
@@ -113,24 +120,53 @@ for src in "${ARGS[@]}"; do
     continue
   fi
 
-  pattern="$(ckpt_pattern_for_model "$model")"
-  mapfile -t ckpt_files < <(find "$src" -maxdepth 1 -type f -name "$pattern")
-  if [ "${#ckpt_files[@]}" -eq 0 ]; then
-    echo "[SKIP] no checkpoint matching '$pattern' found in: $src" >&2
-    continue
-  fi
-  if [ "${#ckpt_files[@]}" -gt 1 ]; then
-    echo "[SKIP] multiple checkpoint files found, please resolve manually:" >&2
-    printf '    %s\n' "${ckpt_files[@]}" >&2
-    continue
-  fi
+  updates=""
+  seed_name=""
+  mapfile -t fcp_final_files < <(find "$src/fcp_pool" -maxdepth 1 -type f \
+    -name 'seed*_final.pkl' 2>/dev/null | sort)
+  if [[ "$src" == */ckpts/ippo/*/ikFalse/* ]] &&
+     [ "${#fcp_final_files[@]}" -gt 0 ]; then
+    if [ "${#fcp_final_files[@]}" -gt 1 ]; then
+      echo "[SKIP] multiple final seed checkpoints found, can't choose destination name:" >&2
+      printf '    %s\n' "${fcp_final_files[@]}" >&2
+      continue
+    fi
+    # This IPPO run stores its final checkpoint in fcp_pool instead of using
+    # the usual top-level *ckpt*updates* filename.
+    seed_file="$(basename "${fcp_final_files[0]}")"
+    seed_name="${seed_file%_final.pkl}"
+    checkpoint_desc="fcp_pool/$seed_file"
+  else
+    pattern="$(ckpt_pattern_for_model "$model")"
+    mapfile -t ckpt_files < <(find "$src" -maxdepth 1 -type f -name "$pattern")
+    if [ "${#ckpt_files[@]}" -eq 0 ]; then
+      echo "[SKIP] no checkpoint matching '$pattern' found in: $src" >&2
+      continue
+    fi
+    if [ "${#ckpt_files[@]}" -gt 1 ]; then
+      echo "[SKIP] multiple checkpoint files found, please resolve manually:" >&2
+      printf '    %s\n' "${ckpt_files[@]}" >&2
+      continue
+    fi
 
-  fname="$(basename "${ckpt_files[0]}")"
-  if [[ ! "$fname" =~ updates([0-9]+) ]]; then
-    echo "[SKIP] couldn't parse updates count from filename: $fname" >&2
-    continue
+    fname="$(basename "${ckpt_files[0]}")"
+    if [[ ! "$fname" =~ updates([0-9]+) ]]; then
+      echo "[SKIP] couldn't parse updates count from filename: $fname" >&2
+      continue
+    fi
+    updates="${BASH_REMATCH[1]}"
+    checkpoint_desc="$fname"
+
+    case "$model" in
+      CEC|CEC_IDDAC|E3T|FCP)
+        if [[ ! "$fname" =~ ^(seed[0-9]+)_ckpt ]]; then
+          echo "[SKIP] couldn't parse seed from checkpoint filename: $fname" >&2
+          continue
+        fi
+        seed_name="${BASH_REMATCH[1]}"
+        ;;
+    esac
   fi
-  updates="${BASH_REMATCH[1]}"
 
   n=""
   dest_dir="$NAS_ROOT/$model"
@@ -143,7 +179,10 @@ for src in "${ARGS[@]}"; do
     dest_dir="$dest_dir/$n"
   fi
 
-  lr_name="$(basename "$src")"
+  dest_name="$(basename "$src")"
+  if [ -n "$seed_name" ]; then
+    dest_name="$seed_name"
+  fi
 
   if [ "$ik" = "False" ]; then
     layout="$(layout_for_path "$src")"
@@ -154,7 +193,7 @@ for src in "${ARGS[@]}"; do
     dest_dir="$dest_dir/$layout"
   fi
 
-  dest="$dest_dir/$lr_name"
+  dest="$dest_dir/$dest_name"
 
   if [ -e "$dest" ] && [ "$FORCE" -ne 1 ]; then
     echo "[SKIP] destination already exists (use -f to overwrite): $dest" >&2
@@ -165,8 +204,15 @@ for src in "${ARGS[@]}"; do
   echo "[COPY] $src"
   if [ -n "$n" ]; then
     echo "    -> $dest  (updates=$updates -> $n)"
-  else
+  elif [ -n "$updates" ]; then
     echo "    -> $dest  (updates=$updates)"
+  else
+    echo "    -> $dest  (checkpoint=$checkpoint_desc)"
   fi
-  cp -a --no-preserve=ownership "$src" "$dest_dir/"
+  if [ -n "$seed_name" ]; then
+    mkdir -p "$dest"
+    cp -a --no-preserve=ownership "$src/." "$dest/"
+  else
+    cp -a --no-preserve=ownership "$src" "$dest_dir/"
+  fi
 done

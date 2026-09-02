@@ -34,6 +34,7 @@ for seed in "${SEEDS[@]}"; do
     CUDA_VISIBLE_DEVICES="${gpu}" python baselines/CEC/fcp_general_fixed.py \
       ENV_KWARGS.layout="${layout}" \
       SEED="${seed}" \
+      NUM_ENVS=32 \
       "${FCP_PATH_ARGS[@]}" \
       PROJECT=crossenv_baseline_v2 \
       WANDB_MODE=online

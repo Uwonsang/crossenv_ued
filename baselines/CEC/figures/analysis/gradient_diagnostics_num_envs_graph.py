@@ -5,7 +5,8 @@ cosine, effective rank, and SNR), saves the sampled history as CSV, and
 summarizes the final window against NUM_ENVS. A run must reach
 ``--min-summary-progress`` before it contributes to the final-window summary,
 so an incomplete run is retained in the run metadata without being treated as
-a 300M-step result.
+a 300M-step result. By default, duplicate runs with the same algorithm,
+NUM_ENVS, and seed are resolved by keeping the most recently created run.
 """
 from __future__ import annotations
 
@@ -103,11 +104,6 @@ def parse_args() -> argparse.Namespace:
         "--target-timesteps", type=int, default=DEFAULT_TARGET_TIMESTEPS
     )
     parser.add_argument(
-        "--aggregation",
-        default="unique_static_grid",
-        help="Required DIAGNOSTIC_AGGREGATION value in the W&B run config.",
-    )
-    parser.add_argument(
         "--tail-window-steps",
         type=int,
         default=30_000_000,
@@ -122,12 +118,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--states",
         nargs="*",
-        default=("finished", "crashed", "running"),
+        default=("finished",),
         help="W&B run states included while fetching histories.",
     )
     parser.add_argument("--num-envs", nargs="*", type=int, default=None)
     parser.add_argument(
         "--algorithms", nargs="*", default=("CEC", "CEC_IDAAC")
+    )
+    parser.add_argument(
+        "--all-matching-runs",
+        action="store_true",
+        help=(
+            "Include every matching W&B run instead of only the most recent "
+            "run for each algorithm/NUM_ENVS/seed combination."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
@@ -175,13 +179,10 @@ def fetch_history(args: argparse.Namespace):
     runs = list(api.runs(f"{args.entity}/{args.project}"))
     history_rows = []
     run_rows = []
+    matching_runs = []
+    runs_without_diagnostics = 0
 
     for run in runs:
-        if (
-            args.aggregation
-            and run.config.get("DIAGNOSTIC_AGGREGATION") != args.aggregation
-        ):
-            continue
         total_timesteps = run.config.get(
             "TOTAL_TIMESTEPS", run.config.get("total_timesteps")
         )
@@ -204,6 +205,33 @@ def fetch_history(args: argparse.Namespace):
             continue
         if args.num_envs and num_envs not in args.num_envs:
             continue
+
+        if not any(metric in run.summary for metric in ALL_METRICS):
+            runs_without_diagnostics += 1
+            continue
+
+        matching_runs.append((run, algorithm, num_envs, seed))
+
+    if runs_without_diagnostics:
+        print(
+            "Skipped "
+            f"{runs_without_diagnostics} matching run(s) that have not logged "
+            "a target diagnostic metric yet."
+        )
+
+    if not args.all_matching_runs:
+        latest_runs = {}
+        for run_info in matching_runs:
+            run, algorithm, num_envs, seed = run_info
+            group = (algorithm, num_envs, seed)
+            recency = (str(getattr(run, "created_at", "") or ""), run.id)
+            previous = latest_runs.get(group)
+            if previous is None or recency > previous[0]:
+                latest_runs[group] = (recency, run_info)
+        matching_runs = [entry[1] for entry in latest_runs.values()]
+
+    matching_runs.sort(key=lambda item: (item[1], item[2], item[3]))
+    for run, algorithm, num_envs, seed in matching_runs:
 
         print(
             f"Fetching {run.id}: {algorithm}, NUM_ENVS={num_envs}, "
@@ -250,6 +278,7 @@ def fetch_history(args: argparse.Namespace):
                 "run_id": run.id,
                 "run_name": run.name,
                 "run_state": run.state,
+                "created_at": str(getattr(run, "created_at", "") or ""),
                 "algorithm": algorithm,
                 "num_envs": num_envs,
                 "seed": seed,
@@ -413,7 +442,11 @@ def main():
 
     history_rows, run_rows = fetch_history(args)
     if not history_rows:
-        raise RuntimeError("No matching W&B gradient-diagnostic history found.")
+        raise RuntimeError(
+            "No matching W&B gradient-diagnostic history found. Check "
+            "--target-timesteps, --states, --algorithms, and --num-envs; "
+            "if needed, retry with --all-matching-runs."
+        )
     final_window_start = args.target_timesteps - args.tail_window_steps
     final_run_rows, final_aggregate_rows = build_window_summary(
         args, history_rows, run_rows, final_window_start

@@ -323,13 +323,6 @@ class ActorCriticRNN(nn.Module):
             name="critic_trunk",
         )(critic_hidden, obs, dones)
 
-        if (
-            not self.is_initializing()
-            and self.is_mutable_collection("feature_rank")
-        ):
-            self.sow("feature_rank", "policy", actor_embedding)
-            self.sow("feature_rank", "value", critic_embedding)
-
         if collect_intermediates:
             self.sow(
                 "intermediates", "actor_trunk_penultimate", actor_embedding
@@ -377,6 +370,11 @@ class ActorCriticRNN(nn.Module):
 
         if collect_intermediates:
             self.sow("intermediates", "actor_penultimate", actor_mean)
+        if (
+            not self.is_initializing()
+            and self.is_mutable_collection("feature_rank")
+        ):
+            self.sow("feature_rank", "policy_penultimate", actor_mean)
 
         actor_logits = nn.Dense(
             self.action_dim,
@@ -466,6 +464,11 @@ class ActorCriticRNN(nn.Module):
 
         if collect_intermediates:
             self.sow("intermediates", "critic_penultimate", critic)
+        if (
+            not self.is_initializing()
+            and self.is_mutable_collection("feature_rank")
+        ):
+            self.sow("feature_rank", "value_penultimate", critic)
 
         critic = nn.Dense(
             1,
@@ -516,8 +519,8 @@ IDAAC_ENVIRONMENT_GRADIENT_METRIC_NAMES = (
     "value_parameterwise_gsnr_mean_log10",
 ) + ENVIRONMENT_GRADIENT_NORM_METRIC_NAMES
 IDAAC_FEATURE_RANK_NAMES = (
-    ("policy", "policy"),
-    ("value", "value"),
+    ("policy", "policy_penultimate"),
+    ("value", "value_penultimate"),
 )
 
 
@@ -1407,7 +1410,8 @@ def make_train(
 
             def callback(metric):
                 step = int(metric["update_steps"])
-                env_step = int(step * env_steps_per_update)
+                # Metrics are produced after this zero-based update finishes.
+                env_step = int((step + 1) * env_steps_per_update)
                 is_standard_log_step = (
                     step % LOG_INTERVAL == 0
                     or step == int(config["NUM_UPDATES"]) - 1

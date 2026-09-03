@@ -59,7 +59,11 @@ VALUE_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
 )
-IPPO_FEATURE_RANK_NAMES = (("shared", "shared"),)
+IPPO_FEATURE_RANK_NAMES = (
+    ("shared", "shared"),
+    ("policy", "policy_penultimate"),
+    ("value", "value_penultimate"),
+)
 SHARED_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
 )
@@ -310,6 +314,11 @@ class ActorCriticRNN(nn.Module):
 
         if not self.is_initializing():
             self.sow("intermediates", "actor_penultimate", actor_mean)
+        if (
+            not self.is_initializing()
+            and self.is_mutable_collection("feature_rank")
+        ):
+            self.sow("feature_rank", "policy_penultimate", actor_mean)
 
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
@@ -344,6 +353,11 @@ class ActorCriticRNN(nn.Module):
 
         if not self.is_initializing():
             self.sow("intermediates", "critic_penultimate", critic)
+        if (
+            not self.is_initializing()
+            and self.is_mutable_collection("feature_rank")
+        ):
+            self.sow("feature_rank", "value_penultimate", critic)
             
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
@@ -1148,7 +1162,8 @@ def make_train(
 
             def callback(metric):
                 step = int(metric["update_steps"])
-                env_step = int(step * env_steps_per_update)
+                # Metrics are produced after this zero-based update finishes.
+                env_step = int((step + 1) * env_steps_per_update)
                 is_standard_log_step = (
                     step % LOG_INTERVAL == 0
                     or step == int(config["NUM_UPDATES"]) - 1

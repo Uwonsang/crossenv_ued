@@ -1,8 +1,9 @@
 """Plot mean value-network stiffness against the number of environments.
 
-Each W&B run is first averaged over all of its logged measurements.  Runs with
-the same algorithm and NUM_ENVS (for example, different seeds) are then given
-equal weight when computing the plotted point.
+Each W&B run is first averaged over all of its logged measurements. By default,
+duplicate finished runs with the same algorithm, NUM_ENVS, and seed are
+resolved by keeping the most recently created run. Different seeds are then
+given equal weight when computing the plotted point.
 """
 from __future__ import annotations
 
@@ -50,11 +51,6 @@ def parse_args() -> argparse.Namespace:
         "--target-timesteps", type=int, default=DEFAULT_TARGET_TIMESTEPS
     )
     parser.add_argument(
-        "--aggregation",
-        default="unique_static_grid",
-        help="Required DIAGNOSTIC_AGGREGATION value in the W&B run config.",
-    )
-    parser.add_argument(
         "--min-progress",
         type=float,
         default=0.95,
@@ -74,9 +70,12 @@ def parse_args() -> argparse.Namespace:
         help="Only include these NUM_ENVS values.",
     )
     parser.add_argument(
-        "--include-running",
+        "--all-matching-runs",
         action="store_true",
-        help="Include runs whose W&B state is running (disabled by default).",
+        help=(
+            "Include every matching finished W&B run instead of only the "
+            "most recent run for each algorithm/NUM_ENVS/seed combination."
+        ),
     )
     parser.add_argument(
         "--history-samples",
@@ -117,15 +116,10 @@ def fetch_run_means(args: argparse.Namespace):
     runs = list(api.runs(f"{args.entity}/{args.project}"))
     rows = []
     keys = list(METRICS.values())
+    matching_runs = []
 
     for run in runs:
-        if (
-            args.aggregation
-            and run.config.get("DIAGNOSTIC_AGGREGATION") != args.aggregation
-        ):
-            continue
-        if not args.include_running and run.state == "running":
-            print(f"Skipping running run: {run.id} ({run.name})")
+        if run.state != "finished":
             continue
         total_timesteps = run.config.get(
             "TOTAL_TIMESTEPS", run.config.get("total_timesteps")
@@ -161,6 +155,48 @@ def fetch_run_means(args: argparse.Namespace):
         if args.num_envs and num_envs not in args.num_envs:
             continue
 
+        seed = run.config.get("SEED", run.config.get("seed"))
+        try:
+            seed = int(seed)
+        except (TypeError, ValueError):
+            print(f"Skipping run without integer SEED: {run.id} ({run.name})")
+            continue
+        if not any(wandb_key in run.summary for wandb_key in keys):
+            print(f"No stiffness metric in summary: {run.id} ({run.name})")
+            continue
+
+        matching_runs.append(
+            (run, algorithm, num_envs, seed, progress, total_timesteps)
+        )
+
+    if not args.all_matching_runs:
+        latest_runs = {}
+        for run_info in matching_runs:
+            run, algorithm, num_envs, seed, _, _ = run_info
+            group = (algorithm, num_envs, seed)
+            recency = (str(getattr(run, "created_at", "") or ""), run.id)
+            previous = latest_runs.get(group)
+            if previous is None or recency > previous[0]:
+                latest_runs[group] = (recency, run_info)
+        matching_runs = [entry[1] for entry in latest_runs.values()]
+
+    matching_runs.sort(key=lambda item: (item[1], item[2], item[3]))
+    for (
+        run,
+        algorithm,
+        num_envs,
+        seed,
+        progress,
+        total_timesteps,
+    ) in matching_runs:
+        print(
+            f"Fetching {run.id}: {algorithm}, NUM_ENVS={num_envs}, "
+            f"seed={seed}, created_at={getattr(run, 'created_at', '')}"
+        )
+        summary_env_step = finite_float(run.summary.get("env_step"))
+        if summary_env_step is None:
+            summary_env_step = finite_float(run.summary.get("_step"))
+
         values = {metric: [] for metric in METRICS}
         history = run.history(
             keys=["env_step", "_step", *keys],
@@ -185,8 +221,12 @@ def fetch_run_means(args: argparse.Namespace):
                         "run_id": run.id,
                         "run_name": run.name,
                         "run_state": run.state,
+                        "created_at": str(
+                            getattr(run, "created_at", "") or ""
+                        ),
                         "algorithm": algorithm,
                         "num_envs": num_envs,
+                        "seed": seed,
                         "configured_total_timesteps": total_timesteps,
                         "max_logged_env_step": int(summary_env_step),
                         "progress": progress,

@@ -473,9 +473,6 @@ def main():
         args.output_dir / "gradient_diagnostics_full_window_aggregate.csv",
         full_aggregate_rows,
     )
-    plot_summary(
-        args, final_aggregate_rows, final_window_start, "final_window"
-    )
     plot_summary(args, full_aggregate_rows, 0, "full_window")
 
     print(f"Runs fetched: {len(run_rows)}")

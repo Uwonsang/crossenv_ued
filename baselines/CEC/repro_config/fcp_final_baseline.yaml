@@ -70,5 +70,6 @@
 "PROJECT": "crossenv_baseline_v2"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "FCP"
+"RESUME_XPID": ""  # set to lr-YYYYMMDD-HHMMSS to resume a mid-run checkpoint
 # FCP_Paths
 "FCP_filepath": "/app/nas/models/aaai/IPPO/"

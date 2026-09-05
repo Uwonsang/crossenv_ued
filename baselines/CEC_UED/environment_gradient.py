@@ -100,7 +100,7 @@ def compute_static_grid_conditioned_gradients(
     sample_mask: jnp.ndarray,
     static_signatures: jnp.ndarray,
     max_static_grids: int,
-    shared_param_keys: Sequence[str],
+    diagnostic_param_keys: Sequence[str],
     clip_eps: float,
     entropy_coef: float,
     chunk_size: int,
@@ -121,24 +121,26 @@ def compute_static_grid_conditioned_gradients(
     num_slots = int(max_static_grids)
     if int(sketch_size) <= 0:
         raise ValueError("sketch_size must be positive.")
-    shared_params, merge_params = _partition_params(params, shared_param_keys)
+    diagnostic_params, merge_params = _partition_params(
+        params, diagnostic_param_keys
+    )
     policy_gsnr_param_keys = tuple(
-        shared_param_keys
+        diagnostic_param_keys
         if policy_gsnr_param_keys is None else policy_gsnr_param_keys
     )
     value_gsnr_param_keys = tuple(
-        shared_param_keys
+        diagnostic_param_keys
         if value_gsnr_param_keys is None else value_gsnr_param_keys
     )
-    selected_key_set = set(shared_param_keys)
+    selected_key_set = set(diagnostic_param_keys)
     if not set(policy_gsnr_param_keys).issubset(selected_key_set):
-        raise ValueError("policy GSNR keys must be in shared_param_keys.")
+        raise ValueError("policy GSNR keys must be in diagnostic_param_keys.")
     if not set(value_gsnr_param_keys).issubset(selected_key_set):
-        raise ValueError("value GSNR keys must be in shared_param_keys.")
+        raise ValueError("value GSNR keys must be in diagnostic_param_keys.")
 
-    def losses_for_slot(candidate_shared_params, hstate, trajectory, adv, target, mask):
+    def losses_for_slot(candidate_params, hstate, trajectory, adv, target, mask):
         _, pi, value = network.apply(
-            merge_params(candidate_shared_params),
+            merge_params(candidate_params),
             hstate,
             (trajectory.obs, trajectory.done, trajectory.agent_positions),
         )
@@ -174,7 +176,7 @@ def compute_static_grid_conditioned_gradients(
             max_groups=max_static_grids,
         )
     )
-    zero_tree = jax.tree.map(jnp.zeros_like, shared_params)
+    zero_tree = jax.tree.map(jnp.zeros_like, diagnostic_params)
     nan_vector = jnp.full((num_slots,), jnp.nan, dtype=jnp.float32)
     initial_state = (
         zero_tree, zero_tree, jnp.asarray(0.0, jnp.float32),
@@ -305,7 +307,7 @@ def compute_static_grid_conditioned_gradients(
         )
         mask = jnp.logical_and(sample_mask, signature_match)
         policy_gradient_value = policy_gradient(
-            shared_params,
+            diagnostic_params,
             initial_hstates,
             trajectories,
             normalized_advantages,
@@ -313,7 +315,7 @@ def compute_static_grid_conditioned_gradients(
             mask,
         )
         value_gradient_value = value_gradient(
-            shared_params,
+            diagnostic_params,
             initial_hstates,
             trajectories,
             normalized_advantages,

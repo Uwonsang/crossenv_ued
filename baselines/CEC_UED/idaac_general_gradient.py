@@ -52,21 +52,25 @@ from representation_metrics import (
 
 
 # Actor and critic use independent encoder/RNN trunks with identical topology.
-ACTOR_TRUNK_KEYS = (
+POLICY_NETWORK_KEYS = (
     "actor_trunk",
     "actor_hidden_0", "actor_hidden_1", "actor_hidden_2",
-    "actor_hidden_3", "actor_output", "advantage_output",
+    "actor_hidden_3", "actor_output",
 )
-VALUE_TRUNK_KEYS = (
+VALUE_NETWORK_KEYS = (
     "critic_trunk",
     "critic_hidden_0", "critic_hidden_1", "critic_hidden_2",
     "critic_hidden_3", "critic_output",
+)
+DIAGNOSTIC_NETWORK_KEYS = tuple(
+    dict.fromkeys(POLICY_NETWORK_KEYS + VALUE_NETWORK_KEYS)
 )
 
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config["DIAGNOSTIC_AGGREGATION"] = "unique_static_grid"
+    config["DIAGNOSTIC_GRADIENT_SCOPE"] = "full_network"
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
@@ -548,7 +552,7 @@ def compute_idaac_policy_value_norms(
     targets,
     config,
 ):
-    """Measure policy and value norms on IDAAC's disjoint trunks."""
+    """Measure policy and value norms over IDAAC's full disjoint networks."""
 
     def loss_components(candidate_params):
         _, pi, value = network.apply(
@@ -592,20 +596,18 @@ def compute_idaac_policy_value_norms(
     )
 
     policy_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-    for leaf in jax.tree_util.tree_leaves(
-        policy_grads["params"]["actor_trunk"]
-    ):
-        policy_squared_norm += jnp.sum(
-            jnp.square(leaf.astype(jnp.float32))
-        )
+    for key in POLICY_NETWORK_KEYS:
+        for leaf in jax.tree_util.tree_leaves(policy_grads["params"][key]):
+            policy_squared_norm += jnp.sum(
+                jnp.square(leaf.astype(jnp.float32))
+            )
 
     value_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-    for leaf in jax.tree_util.tree_leaves(
-        value_grads["params"]["critic_trunk"]
-    ):
-        value_squared_norm += jnp.sum(
-            jnp.square(leaf.astype(jnp.float32))
-        )
+    for key in VALUE_NETWORK_KEYS:
+        for leaf in jax.tree_util.tree_leaves(value_grads["params"][key]):
+            value_squared_norm += jnp.sum(
+                jnp.square(leaf.astype(jnp.float32))
+            )
 
     policy_norm = jnp.sqrt(policy_squared_norm)
     weighted_value_norm = jnp.abs(
@@ -1038,7 +1040,7 @@ def make_train(
                         sample_layout_ids=selected_layout_ids_by_state.reshape(-1),
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         max_static_grids=stiffness_sample_size,
-                        value_param_keys=VALUE_TRUNK_KEYS,
+                        value_param_keys=VALUE_NETWORK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
 
@@ -1085,9 +1087,9 @@ def make_train(
                         sample_mask=selected_static_sample_mask_by_state,
                         static_signatures=selected_static_signatures_by_state,
                         max_static_grids=stiffness_sample_size,
-                        shared_param_keys=("actor_trunk", "critic_trunk"),
-                        policy_gsnr_param_keys=("actor_trunk",),
-                        value_gsnr_param_keys=("critic_trunk",),
+                        diagnostic_param_keys=DIAGNOSTIC_NETWORK_KEYS,
+                        policy_gsnr_param_keys=POLICY_NETWORK_KEYS,
+                        value_gsnr_param_keys=VALUE_NETWORK_KEYS,
                         value_loss_coefficient=config["VF_COEF"],
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],

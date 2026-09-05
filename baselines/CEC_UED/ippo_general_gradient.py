@@ -51,11 +51,11 @@ from representation_metrics import (
 
 # Parameter groups used consistently by gradient diagnostics and norm metrics.
 # Each group contains the shared encoder/RNN, its branch, and its output head.
-ACTOR_TRUNK_KEYS = (
+POLICY_NETWORK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_2", "Dense_3", "Dense_4", "Dense_5", "Dense_6",
 )
-VALUE_TRUNK_KEYS = (
+VALUE_NETWORK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
 )
@@ -67,11 +67,15 @@ IPPO_FEATURE_RANK_NAMES = (
 SHARED_TRUNK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
 )
+DIAGNOSTIC_NETWORK_KEYS = tuple(
+    dict.fromkeys(POLICY_NETWORK_KEYS + VALUE_NETWORK_KEYS)
+)
 
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
     config["DIAGNOSTIC_AGGREGATION"] = "unique_static_grid"
+    config["DIAGNOSTIC_GRADIENT_SCOPE"] = "full_network"
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
 
@@ -448,7 +452,7 @@ def compute_policy_value_interference(
     config,
     epsilon=1e-12,
 ):
-    """Compare policy and value gradients on the shared PPO trunk.
+    """Measure full-network norms and shared-trunk gradient interference.
 
     ``shared_conflict_rate`` is a 0/1 observation for this measurement;
     averaging it over measurement times (and seeds) gives the conflict rate.
@@ -495,8 +499,8 @@ def compute_policy_value_interference(
         lambda candidate: loss_components(candidate)[1]
     )(params)
 
-    policy_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
-    value_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
+    shared_policy_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
+    shared_value_squared_norm = jnp.asarray(0.0, dtype=jnp.float32)
     dot_product = jnp.asarray(0.0, dtype=jnp.float32)
     for key in SHARED_TRUNK_KEYS:
         policy_leaves = jax.tree_util.tree_leaves(
@@ -508,19 +512,34 @@ def compute_policy_value_interference(
         for policy_leaf, value_leaf in zip(policy_leaves, value_leaves):
             policy_leaf = policy_leaf.astype(jnp.float32)
             value_leaf = value_leaf.astype(jnp.float32)
-            policy_squared_norm += jnp.sum(jnp.square(policy_leaf))
-            value_squared_norm += jnp.sum(jnp.square(value_leaf))
+            shared_policy_squared_norm += jnp.sum(jnp.square(policy_leaf))
+            shared_value_squared_norm += jnp.sum(jnp.square(value_leaf))
             dot_product += jnp.sum(policy_leaf * value_leaf)
 
+    policy_squared_norm = sum(
+        jnp.sum(jnp.square(leaf.astype(jnp.float32)))
+        for key in POLICY_NETWORK_KEYS
+        for leaf in jax.tree_util.tree_leaves(policy_grads["params"][key])
+    )
+    value_squared_norm = sum(
+        jnp.sum(jnp.square(leaf.astype(jnp.float32)))
+        for key in VALUE_NETWORK_KEYS
+        for leaf in jax.tree_util.tree_leaves(raw_value_grads["params"][key])
+    )
     policy_norm = jnp.sqrt(policy_squared_norm)
     raw_value_norm = jnp.sqrt(value_squared_norm)
     weighted_value_norm = jnp.abs(
         jnp.asarray(config["VF_COEF"], dtype=jnp.float32)
     ) * raw_value_norm
-    valid = jnp.logical_and(policy_norm > epsilon, raw_value_norm > epsilon)
+    shared_policy_norm = jnp.sqrt(shared_policy_squared_norm)
+    shared_value_norm = jnp.sqrt(shared_value_squared_norm)
+    valid = jnp.logical_and(
+        shared_policy_norm > epsilon, shared_value_norm > epsilon
+    )
     shared_cosine = jnp.where(
         valid,
-        dot_product / jnp.maximum(policy_norm * raw_value_norm, epsilon),
+        dot_product
+        / jnp.maximum(shared_policy_norm * shared_value_norm, epsilon),
         jnp.asarray(jnp.nan, dtype=jnp.float32),
     )
     shared_conflict = jnp.where(
@@ -929,7 +948,7 @@ def make_train(
                         sample_layout_ids=selected_layout_ids_by_state.reshape(-1),
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         max_static_grids=stiffness_sample_size,
-                        value_param_keys=VALUE_TRUNK_KEYS,
+                        value_param_keys=VALUE_NETWORK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
 
@@ -976,9 +995,9 @@ def make_train(
                         sample_mask=selected_static_sample_mask_by_state,
                         static_signatures=selected_static_signatures_by_state,
                         max_static_grids=stiffness_sample_size,
-                        shared_param_keys=SHARED_TRUNK_KEYS,
-                        policy_gsnr_param_keys=SHARED_TRUNK_KEYS,
-                        value_gsnr_param_keys=SHARED_TRUNK_KEYS,
+                        diagnostic_param_keys=DIAGNOSTIC_NETWORK_KEYS,
+                        policy_gsnr_param_keys=POLICY_NETWORK_KEYS,
+                        value_gsnr_param_keys=VALUE_NETWORK_KEYS,
                         value_loss_coefficient=config["VF_COEF"],
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],

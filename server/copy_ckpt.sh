@@ -123,10 +123,6 @@ fi
 for src in "${ARGS[@]}"; do
   src="${src%/}"
 
-  # This run was already relocated separately, so omit it from scan output.
-  if [[ "$src" == */ckpts/ippo/overcooked/counter_circuit_9/ikFalse/reset_all/lr-20260825-132120 ]]; then
-    continue
-  fi
   if [ ! -d "$src" ]; then
     echo "[SKIP] not a directory: $src" >&2
     continue

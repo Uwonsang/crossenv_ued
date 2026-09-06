@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Copy trained-checkpoint lr-* folders from /app/ckpts/... into the shared
 # NAS layout under /app/nas/models/ICRL/<MODEL>/<N>/<seed> for CEC and
-# CEC_IDDAC (where <N> is picked from the "updates" count baked into the
+# CEC_IDAAC (where <N> is picked from the "updates" count baked into the
 # final checkpoint filename), or /app/nas/models/ICRL/<MODEL>/<folder>
-# for IPPO/E3T/FCP (no <N>). ikFalse runs additionally get a <layout>
-# subfolder before <folder>. CEC, CEC_IDDAC, E3T, and FCP use the seed prefix
-# in their checkpoint filename as the destination folder name. IPPO ikFalse
+# for IPPO/E3T/FCP/FCP_Fixed (no <N>). ikFalse runs additionally get a <layout>
+# subfolder before <folder>. CEC, CEC_IDAAC, E3T, FCP, and FCP_Fixed use the
+# seed prefix in their checkpoint filename as the destination folder name. IPPO ikFalse
 # runs use fcp_pool/seed*_final.pkl and likewise copy under the corresponding seed.
-# CEC_IDDAC_Finetune and CEC_Finetune runs bundle multiple seeds' checkpoints
+# CEC_IDAAC_Finetune and CEC_Finetune runs bundle multiple seeds' checkpoints
 # in one lr-* folder, so each seed{N}_ckpt*.pkl (plus its seed{N}_mid_ckpts
 # folder, if present) is split out into its own
 # /app/nas/models/ICRL/<MODEL>/<layout>/<seed>.
@@ -16,6 +16,7 @@ set -euo pipefail
 NAS_ROOT="/app/nas/models/ICRL"
 CKPTS_ROOT="/app/ckpts"
 FORCE=0
+COPIED=()
 
 declare -A UPDATES_TO_N=(
   [45776]=256
@@ -39,12 +40,13 @@ model_for_path() {
   local src="$1" ik="$2"
   case "$src" in
     */ckpts/idaac/*)
-      if [ "$ik" = "True" ]; then echo "CEC_IDDAC"; fi ;;
-    */ckpts/iddac_finetune/*) echo "CEC_IDDAC_Finetune" ;;
+      if [ "$ik" = "True" ]; then echo "CEC_IDAAC"; fi ;;
+    */ckpts/idaac_finetune/*) echo "CEC_IDAAC_Finetune" ;;
     */ckpts/ippo_finetune/*)  echo "CEC_Finetune" ;;
     */ckpts/ippo/*)
       if [ "$ik" = "False" ]; then echo "IPPO"; else echo "CEC"; fi ;;
     */ckpts/e3t/*)   echo "E3T" ;;
+    */ckpts/fcp_fixed/*) echo "FCP_Fixed" ;;
     */ckpts/fcp/*)   echo "FCP" ;;
     *) echo "" ;;
   esac
@@ -56,17 +58,17 @@ model_for_path() {
 model_is_finetune() {
   local model="$1"
   case "$model" in
-    CEC_IDDAC_Finetune|CEC_Finetune) return 0 ;;
+    CEC_IDAAC_Finetune|CEC_Finetune) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 # Only the population-trained models are split by the "updates" -> N size;
-# the single-layout baselines (IPPO/E3T/FCP) don't have a population size.
+# the single-layout baselines (IPPO/E3T/FCP/FCP_Fixed) don't have a population size.
 model_needs_n() {
   local model="$1"
   case "$model" in
-    CEC|CEC_IDDAC) return 0 ;;
+    CEC|CEC_IDAAC) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -78,6 +80,7 @@ ckpt_pattern_for_model() {
   case "$model" in
     E3T) echo '*ckpt*e3t*updates*' ;;
     FCP) echo '*ckpt*fcp_improved*updates*' ;;
+    FCP_Fixed) echo '*ckpt*fcp_fixed_improved*updates*' ;;
     *)   echo '*ckpt*updates*' ;;
   esac
 }
@@ -124,7 +127,6 @@ for src in "${ARGS[@]}"; do
   if [[ "$src" == */ckpts/ippo/overcooked/counter_circuit_9/ikFalse/reset_all/lr-20260825-132120 ]]; then
     continue
   fi
-
   if [ ! -d "$src" ]; then
     echo "[SKIP] not a directory: $src" >&2
     continue
@@ -133,7 +135,7 @@ for src in "${ARGS[@]}"; do
   ik="$(ik_for_path "$src")"
   model="$(model_for_path "$src" "$ik")"
   if [ -z "$model" ]; then
-    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,iddac_finetune,ippo,ippo_finetune,e3t,fcp}/...): $src" >&2
+    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,idaac_finetune,ippo,ippo_finetune,e3t,fcp,fcp_fixed}/...): $src" >&2
     continue
   fi
 
@@ -173,6 +175,7 @@ for src in "${ARGS[@]}"; do
       if [ -d "$src/${seed_name}_mid_ckpts" ]; then
         cp -a --no-preserve=ownership "$src/${seed_name}_mid_ckpts" "$dest/"
       fi
+      COPIED+=("$ckpt_file -> $dest/$fname")
     done
     continue
   fi
@@ -215,7 +218,7 @@ for src in "${ARGS[@]}"; do
     checkpoint_desc="$fname"
 
     case "$model" in
-      CEC|CEC_IDDAC|E3T|FCP)
+      CEC|CEC_IDAAC|E3T|FCP|FCP_Fixed)
         if [[ ! "$fname" =~ ^(seed[0-9]+)_ckpt ]]; then
           echo "[SKIP] couldn't parse seed from checkpoint filename: $fname" >&2
           continue
@@ -272,4 +275,13 @@ for src in "${ARGS[@]}"; do
   else
     cp -a --no-preserve=ownership "$src" "$dest_dir/"
   fi
+  COPIED+=("$src -> $dest")
 done
+
+if [ "${#COPIED[@]}" -gt 0 ]; then
+  echo ""
+  echo "==== Copy summary (${#COPIED[@]} copied) ===="
+  printf '  %s\n' "${COPIED[@]}"
+else
+  echo "==== Copy summary: nothing copied ===="
+fi

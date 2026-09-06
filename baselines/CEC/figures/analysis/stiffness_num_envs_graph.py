@@ -38,8 +38,12 @@ PANEL_TITLES = {
     "same_layout_per_static_grid": "Same-layout (per static grid)",
     "different_layout_per_static_grid": "Different-layout (per static grid)",
 }
-COLORS = {"CEC": "#4c9a3a", "CEC_IDAAC": "#377eb8"}
-MARKERS = {"CEC": "o", "CEC_IDAAC": "o"}
+COLORS = {
+    "CEC": "#4c9a3a",
+    "CEC_DECOUPLED": "#e68632",
+    "CEC_IDAAC": "#377eb8",
+}
+MARKERS = {name: "o" for name in COLORS}
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,7 +64,10 @@ def parse_args() -> argparse.Namespace:
         "--algorithms",
         nargs="*",
         default=None,
-        help="Only plot these canonical labels (CEC and/or CEC_IDAAC).",
+        help=(
+            "Only plot these canonical labels (CEC, CEC_DECOUPLED, "
+            "and/or CEC_IDAAC)."
+        ),
     )
     parser.add_argument(
         "--num-envs",
@@ -94,6 +101,8 @@ def canonical_algorithm(run) -> str:
         run.name,
     ]
     text = " ".join(str(value) for value in candidates if value).upper()
+    if "DECOUPLED" in text or "DECOUPLE" in text:
+        return "CEC_DECOUPLED"
     if "IDAAC" in text or "IDDAC" in text:
         return "CEC_IDAAC"
     if "CEC" in text or "IPPO" in text:

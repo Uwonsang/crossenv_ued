@@ -3,8 +3,8 @@
 set -euo pipefail
 
 if (( $# < 3 || $# > 4 )); then
-    echo "Usage: bash $0 <gpu> <ippo|idaac|both> \"seed ...\" [\"num_envs ...\"]" >&2
-    echo "Example: bash $0 0 both \"0 1\" \"32 64 128 256\"" >&2
+    echo "Usage: bash $0 <gpu> <ippo|decoupled|idaac|both|all> \"seed ...\" [\"num_envs ...\"]" >&2
+    echo "Example: bash $0 0 all \"0 1\" \"32 64 128 256\"" >&2
     exit 1
 fi
 
@@ -26,14 +26,26 @@ case "$ALGORITHM" in
     idaac)
         TRAIN_SCRIPTS=("baselines/CEC_UED/idaac_general_gradient.py")
         ;;
+    decouple|decoupled)
+        TRAIN_SCRIPTS=(
+            "baselines/CEC_UED/ippo_general_gradient_decouple.py"
+        )
+        ;;
     both)
         TRAIN_SCRIPTS=(
             "baselines/CEC_UED/ippo_general_gradient.py"
             "baselines/CEC_UED/idaac_general_gradient.py"
         )
         ;;
+    all)
+        TRAIN_SCRIPTS=(
+            "baselines/CEC_UED/ippo_general_gradient.py"
+            "baselines/CEC_UED/ippo_general_gradient_decouple.py"
+            "baselines/CEC_UED/idaac_general_gradient.py"
+        )
+        ;;
     *)
-        echo "Algorithm must be one of: ippo, idaac, both." >&2
+        echo "Algorithm must be one of: ippo, decoupled, idaac, both, all." >&2
         exit 1
         ;;
 esac

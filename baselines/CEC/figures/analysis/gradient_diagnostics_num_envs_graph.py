@@ -93,7 +93,11 @@ METRIC_GROUPS = {
 ALL_METRICS = tuple(
     metric for metrics in METRIC_GROUPS.values() for metric in metrics
 )
-ALGORITHM_COLORS = {"CEC": "#4c9a3a", "CEC_IDAAC": "#377eb8"}
+ALGORITHM_COLORS = {
+    "CEC": "#4c9a3a",
+    "CEC_DECOUPLED": "#e68632",
+    "CEC_IDAAC": "#377eb8",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -123,7 +127,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-envs", nargs="*", type=int, default=None)
     parser.add_argument(
-        "--algorithms", nargs="*", default=("CEC", "CEC_IDAAC")
+        "--algorithms",
+        nargs="*",
+        default=("CEC", "CEC_DECOUPLED", "CEC_IDAAC"),
     )
     parser.add_argument(
         "--all-matching-runs",
@@ -151,6 +157,8 @@ def canonical_algorithm(run) -> str:
         run.name,
     )
     text = " ".join(str(value) for value in candidates if value).upper()
+    if "DECOUPLED" in text or "DECOUPLE" in text:
+        return "CEC_DECOUPLED"
     if "IDAAC" in text or "IDDAC" in text:
         return "CEC_IDAAC"
     if "CEC" in text or "IPPO" in text:

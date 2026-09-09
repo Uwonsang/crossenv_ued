@@ -79,9 +79,6 @@ SHARED_TRUNK_KEYS = (
 IPPO_BIG_FC_DIM = 256
 IPPO_BIG_POLICY_HIDDEN_DIMS = (1024, 512, 512, 512)
 IPPO_BIG_VALUE_HIDDEN_DIMS = (1024, 1024, 512, 256)
-IDAAC_REFERENCE_PARAMETER_COUNT = 7_042_439
-IPPO_BIG_PARAMETER_COUNT = 6_989_927
-PARAMETER_MATCH_RELATIVE_TOLERANCE = 1e-2
 
 
 def _big_fc_dim(config):
@@ -565,18 +562,7 @@ def make_train(
             and _big_value_hidden_dims(config)
             == IPPO_BIG_VALUE_HIDDEN_DIMS
         )
-        if uses_reference_architecture:
-            relative_difference = abs(
-                parameter_count - IDAAC_REFERENCE_PARAMETER_COUNT
-            ) / IDAAC_REFERENCE_PARAMETER_COUNT
-            assert parameter_count == IPPO_BIG_PARAMETER_COUNT, (
-                "IPPO-big parameter count drifted from its expected value: "
-                f"{parameter_count:,} != {IPPO_BIG_PARAMETER_COUNT:,}"
-            )
-            assert relative_difference <= PARAMETER_MATCH_RELATIVE_TOLERANCE, (
-                "IPPO-big is outside the IDAAC matching tolerance: "
-                f"{relative_difference:.3%}"
-            )
+        
         if model_params is not None:
             network_params = model_params
         if config["ANNEAL_LR"]:

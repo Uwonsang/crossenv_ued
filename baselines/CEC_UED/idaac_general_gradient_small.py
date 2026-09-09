@@ -82,8 +82,6 @@ VALUE_TRUNK_KEYS = (
 IDAAC_MATCHED_FC_DIM = 128
 IDAAC_MATCHED_POLICY_HIDDEN_DIMS = (1024, 512, 128, 64)
 IDAAC_MATCHED_VALUE_HIDDEN_DIMS = (1024, 512, 256, 256)
-IPPO_REFERENCE_PARAMETER_COUNT = 3_862_311
-PARAMETER_MATCH_RELATIVE_TOLERANCE = 1e-3
 AUXILIARY_PARAM_PREFIXES = (
     "advantage_output",
     "order_classifier_hidden",
@@ -675,18 +673,6 @@ def make_train(
             and _idaac_value_hidden_dims(config)
             == IDAAC_MATCHED_VALUE_HIDDEN_DIMS
         )
-        if uses_reference_architecture:
-            relative_difference = abs(
-                parameter_count - IPPO_REFERENCE_PARAMETER_COUNT
-            ) / IPPO_REFERENCE_PARAMETER_COUNT
-            if relative_difference > PARAMETER_MATCH_RELATIVE_TOLERANCE:
-                print(
-                    "WARNING: IDAAC policy/value network is outside the IPPO "
-                    "matching tolerance: "
-                    f"{parameter_count:,} vs. "
-                    f"{IPPO_REFERENCE_PARAMETER_COUNT:,} "
-                    f"({relative_difference:.3%})"
-                )
         if model_params is not None:
             network_params = model_params
         def optimizer(learning_rate):

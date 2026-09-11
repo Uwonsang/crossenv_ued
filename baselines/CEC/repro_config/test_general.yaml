@@ -52,12 +52,16 @@
 "FCP": False
 "FCP_KWARGS":
   "train_oracle": True
-"MODEL_PATH": "/app/nas/models/aaai"
-"SAVE_PATH": "/app/baselines/CEC/results/test_general"
+"MODEL_PATH": "/mnt/nas/wonsang/crossenv_ued/models/ICRL"
+"MODEL_NUM_ENVS": 256  # CEC and CEC_IDAAC checkpoint subdirectory
+"SAVE_PATH": "artifacts/test_general_icrl"
+"OUTPUT_DIR": null  # optional exact output directory
+"HUMAN_PROXY_CKPT_DIR": "baselines/human_proxy/checkpoints"
+"HUMAN_PROXY_NUM_SEEDS": 5  # matches training-time evaluation (BC seeds 0-4)
 "NUM_MODELS": 6
 "XP_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled" # disabled, online, offline
-"model_name": "IPPO" # CEC, E3T, FCP, IPPO
+"model_name": "IPPO" # CEC, CEC_Finetune, CEC_IDAAC, CEC_IDAAC_Finetune, E3T, IPPO

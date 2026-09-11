@@ -1,12 +1,26 @@
 #!/usr/bin/env bash
 
-# Usage: bash_test_general.sh [GPU] [MODEL|MODEL,...|all] [MODEL_NUM_ENVS] [OUTPUT_DIR]
-# Example: bash_test_general.sh 0 CEC_IDAAC 128,256 /mnt/nas/wonsang/xp_results
+# Usage: bash_test_general.sh [GPU] [MODEL|MODEL,...|all] [MODEL_NUM_ENVS] [MODEL_PATH] [OUTPUT_DIR]
+# Example: bash_test_general.sh 0 CEC_IDAAC 128,256 /app/nas/models/ICRL
 
 gpu="${1:-0}"
 model_arg="${2:-all}"
 model_num_envs_arg="${3:-256}"
-output_dir="${4:-}"
+model_path="${4:-}"
+
+if [[ -z "${model_path}" ]]; then
+  if [[ -d /app/nas/models/ICRL ]]; then
+    model_path=/app/nas/models/ICRL
+  elif [[ -d /mnt/nas/wonsang/crossenv_ued/models/ICRL ]]; then
+    model_path=/mnt/nas/wonsang/crossenv_ued/models/ICRL
+  else
+    echo "Could not find the ICRL model directory." >&2
+    echo "Pass MODEL_PATH as the fourth argument." >&2
+    exit 2
+  fi
+fi
+
+output_dir="${5:-${model_path%/}/xp_results}"
 
 all_models=(
   CEC
@@ -74,6 +88,7 @@ for layout in "${layouts[@]}"; do
       command=(python baselines/CEC/test_general.py
         "model_name=${model}"
         "ENV_KWARGS.layout=${layout}"
+        "++MODEL_PATH=${model_path}"
         "++MODEL_NUM_ENVS=${model_num_envs}"
         NUM_MODELS=6
         XP_ONLY=False

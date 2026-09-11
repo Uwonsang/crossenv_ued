@@ -146,6 +146,124 @@ class ActorCriticRNN(nn.Module):
 
         return hidden, pi, jnp.squeeze(critic, axis=-1)
 
+
+class IDAACActorTrunk(nn.Module):
+    config: Dict
+
+    @nn.compact
+    def __call__(self, hidden, obs, dones):
+        time_size, actor_size, _ = obs.shape
+
+        if self.config["CONV_NET"]:
+            if self.config["ENV_NAME"] == "overcooked":
+                embedding = obs.reshape(-1, 9, 9, 26)
+            else:
+                embedding = obs.reshape(-1, 5, 5, 4)
+            embedding = nn.Conv(
+                features=64,
+                kernel_size=(2, 2),
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name="conv_0",
+            )(embedding)
+            embedding = nn.relu(embedding)
+            embedding = nn.Conv(
+                features=32,
+                kernel_size=(2, 2),
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+                name="conv_1",
+            )(embedding)
+            embedding = nn.relu(embedding)
+            embedding = embedding.reshape((time_size, actor_size, -1))
+        else:
+            embedding = obs
+
+        embedding = nn.Dense(
+            self.config["FC_DIM_SIZE"] * 2,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_0",
+        )(embedding)
+        embedding = nn.relu(embedding)
+        embedding = nn.Dense(
+            self.config["FC_DIM_SIZE"] * 2,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_1",
+        )(embedding)
+        embedding = nn.relu(embedding)
+
+        if self.config["LSTM"]:
+            hidden, embedding = ScannedRNN(name="recurrent")(
+                hidden, (embedding, dones)
+            )
+        else:
+            embedding = nn.Dense(
+                self.config["GRU_HIDDEN_DIM"],
+                kernel_init=orthogonal(2),
+                bias_init=constant(0.0),
+                name="recurrent_dense",
+            )(embedding)
+            embedding = nn.relu(embedding)
+        embedding = embedding.reshape((time_size, actor_size, -1))
+        return hidden, embedding
+
+
+class IDAACActorRNN(nn.Module):
+    """Policy-only module matching CEC-IDAAC checkpoint parameter names."""
+
+    action_dim: Sequence[int]
+    config: Dict
+
+    @nn.compact
+    def __call__(self, hidden, x):
+        obs, dones, _agent_positions = x
+        hidden, embedding = IDAACActorTrunk(
+            config=self.config,
+            name="actor_trunk",
+        )(hidden, obs, dones)
+
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"],
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_0",
+        )(embedding)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"] * 3 // 4,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_1",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"] // 2,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_2",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        if self.config["ENV_NAME"] == "overcooked":
+            actor_mean = nn.Dense(
+                self.config["GRU_HIDDEN_DIM"] // 4,
+                kernel_init=orthogonal(2),
+                bias_init=constant(0.0),
+                name="actor_hidden_3",
+            )(actor_mean)
+            actor_mean = nn.relu(actor_mean)
+
+        logits = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor_output",
+        )(actor_mean)
+        pi = distrax.Categorical(logits=logits)
+        return hidden, pi, jnp.zeros(logits.shape[:-1])
+
+
 class ActorCriticE3T(nn.Module):
     action_dim: Sequence[int]
     config: Dict

@@ -29,7 +29,12 @@ import pandas as pd
 from tqdm import tqdm
 from jax_tqdm import scan_tqdm
 # import tsnex
-from actor_networks import ScannedRNN, ActorCriticE3T, ActorCriticRNN
+from actor_networks import (
+    ScannedRNN,
+    ActorCriticE3T,
+    ActorCriticRNN,
+    IDAACActorRNN,
+)
 
 
 def initialize_environment(config):
@@ -182,6 +187,9 @@ def main(config):
     }
     rnn_model_names = {
         "CEC",
+        "CEC_Finetune",
+        "CEC_IDAAC",
+        "CEC_IDAAC_Finetune",
         "CEC_PREV",
         "CEC_64",
         "FCP",
@@ -198,7 +206,16 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"]) + f"/{config['ENV_NAME']}"
+    scalable_model_names = {"CEC", "CEC_IDAAC"}
+    finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
+    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune"}
+    if config.get("OUTPUT_DIR"):
+        save_path_final = config["OUTPUT_DIR"]
+    else:
+        save_path_final = config['SAVE_PATH'] + "_" + str(config["NUM_MODELS"])
+        if model_name in scalable_model_names:
+            save_path_final += f"_envs{config['MODEL_NUM_ENVS']}"
+        save_path_final += f"/{config['ENV_NAME']}"
     config['SAVE_PATH_FINAL'] = save_path_final
     os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
     param_list = []
@@ -208,7 +225,17 @@ def main(config):
     def find_model_path(seed):
         model_root = f"{config['MODEL_PATH']}/{model_name}"
 
-        if model_name == "CEC_PREV":
+        if model_name in scalable_model_names:
+            patterns = [
+                f"{model_root}/{config['MODEL_NUM_ENVS']}/seed{seed}/"
+                f"seed{seed}_ckpt*.pkl"
+            ]
+        elif model_name in finetune_model_names:
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/seed{seed}/"
+                f"seed{seed}_ckpt*_finetune_updates*.pkl"
+            ]
+        elif model_name == "CEC_PREV":
             patterns = [
                 f"{model_root}/seed{seed}/"
                 f"seed{seed}_ckpt0_improved_updates58593.pkl"
@@ -276,11 +303,14 @@ def main(config):
         return None
 
     for seed in iter_range:
+        if config["ENV_NAME"] == "ToyCoop":
+            filepath = find_toy_model_path(seed)
+        else:
+            filepath = find_model_path(seed)
+        if filepath is None:
+            print(f"Missing checkpoint: model={model_name}, seed={seed}")
+            continue
         try:
-            if config["ENV_NAME"] == "ToyCoop":
-                filepath = find_toy_model_path(seed)
-            else:
-                filepath = find_model_path(seed)
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
@@ -293,12 +323,18 @@ def main(config):
                 param_list.append(model_params)
                 seed_list.append(seed)
                 del previous_ckpt
-        except:
+                print(f"Loaded seed {seed}: {filepath}")
+        except (OSError, KeyError, pickle.UnpicklingError) as exc:
+            print(f"Failed to load {filepath}: {exc}")
             continue
     
     if len(param_list) == 0:
-        print(f"No models found")
-        exit(0)
+        raise RuntimeError(f"No checkpoints found for model={model_name}")
+    if config.get("XP_ONLY", False) and len(param_list) < 2:
+        raise RuntimeError(
+            f"XP requires at least two seeds; found {len(param_list)} for "
+            f"model={model_name}"
+        )
     seed_list = jnp.array(seed_list)
 
     param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)      # stack params
@@ -306,6 +342,8 @@ def main(config):
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
     seed_pairs = seed_pairs.reshape((2, -1)).T
+    if config.get("XP_ONLY", False):
+        seed_pairs = seed_pairs[seed_pairs[:, 0] != seed_pairs[:, 1]]
     
     ##################
     # Initialize environment and network
@@ -313,7 +351,12 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    if model_name in rnn_model_names:
+    if model_name in idaac_model_names:
+        network = IDAACActorRNN(
+            env.action_space("agent_0").n,
+            config=config,
+        )
+    elif model_name in rnn_model_names:
         network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
     elif model_name == "E3T":
         network = ActorCriticE3T(env.action_space("agent_0").n, config=config)

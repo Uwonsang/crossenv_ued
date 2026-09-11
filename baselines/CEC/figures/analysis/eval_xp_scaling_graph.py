@@ -13,7 +13,7 @@ from eval_xp_model_graph import fetch_model_histories
 
 ENTITY = "overcooked_ai"
 PROJECT = "crossenv_ICLR"
-MODEL_NAMES = ["CEC", "CEC_IDAAC_POP"]
+MODEL_NAMES = ["CEC", "CEC_IDAAC"]
 NUM_ENVS_VALUES = [32, 64, 128, 256]
 SEED = 1
 OUTPUT_DIR = (

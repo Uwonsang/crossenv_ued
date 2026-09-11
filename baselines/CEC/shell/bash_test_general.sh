@@ -74,12 +74,12 @@ for layout in "${layouts[@]}"; do
       command=(python baselines/CEC/test_general.py
         "model_name=${model}"
         "ENV_KWARGS.layout=${layout}"
-        "MODEL_NUM_ENVS=${model_num_envs}"
+        "++MODEL_NUM_ENVS=${model_num_envs}"
         NUM_MODELS=6
         XP_ONLY=False
       )
       if [[ -n "${model_output_dir}" ]]; then
-        command+=("OUTPUT_DIR=${model_output_dir}")
+        command+=("++OUTPUT_DIR=${model_output_dir}")
       fi
       CUDA_VISIBLE_DEVICES="${gpu}" "${command[@]}"
     done

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
-# Usage: bash_test_general.sh [GPU] [MODEL|MODEL,...|all] [MODEL_NUM_ENVS] [OUTPUT_DIR]
-# Example: bash_test_general.sh 0 CEC_IDAAC 128,256 /mnt/nas/wonsang/xp_results
+# Usage: bash_test_general_human_proxy.sh [GPU] [MODEL|MODEL,...|all] [MODEL_NUM_ENVS] [OUTPUT_DIR]
+# Example: bash_test_general_human_proxy.sh 0 CEC_IDAAC 128,256 /mnt/nas/wonsang/human_proxy_results
 
 gpu="${1:-0}"
 model_arg="${2:-all}"
@@ -67,16 +67,18 @@ for layout in "${layouts[@]}"; do
           model_output_dir="${model_output_dir}/envs${model_num_envs}"
         fi
       fi
-      echo "XP evaluation: layout=${layout}, model=${model}, seeds=0-5, model_num_envs=${model_num_envs}"
+
+      echo "Human-proxy evaluation: layout=${layout}, model=${model}, model_num_envs=${model_num_envs}, model seeds=0-5, BC seeds=0-4"
       if [[ -n "${model_output_dir}" ]]; then
         echo "Output directory: ${model_output_dir}"
       fi
-      command=(python baselines/CEC/test_general.py
+
+      command=(python baselines/CEC/test_general_human_proxy.py
         "model_name=${model}"
         "ENV_KWARGS.layout=${layout}"
         "MODEL_NUM_ENVS=${model_num_envs}"
         NUM_MODELS=6
-        XP_ONLY=False
+        HUMAN_PROXY_NUM_SEEDS=5
       )
       if [[ -n "${model_output_dir}" ]]; then
         command+=("OUTPUT_DIR=${model_output_dir}")

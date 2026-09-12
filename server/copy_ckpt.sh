@@ -41,7 +41,7 @@ model_for_path() {
   case "$src" in
     */ckpts/idaac/*)
       if [ "$ik" = "True" ]; then echo "CEC_IDAAC"; fi ;;
-    */ckpts/idaac_finetune/*) echo "CEC_IDAAC_Finetune" ;;
+    */ckpts/iddac_finetune/*) echo "CEC_IDAAC_Finetune" ;;
     */ckpts/ippo_finetune/*)  echo "CEC_Finetune" ;;
     */ckpts/ippo/*)
       if [ "$ik" = "False" ]; then echo "IPPO"; else echo "CEC"; fi ;;
@@ -131,7 +131,7 @@ for src in "${ARGS[@]}"; do
   ik="$(ik_for_path "$src")"
   model="$(model_for_path "$src" "$ik")"
   if [ -z "$model" ]; then
-    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,idaac_finetune,ippo,ippo_finetune,e3t,fcp,fcp_fixed}/...): $src" >&2
+    echo "[SKIP] can't infer model from path (expected .../ckpts/{idaac,iddac_finetune,ippo,ippo_finetune,e3t,fcp,fcp_fixed}/...): $src" >&2
     continue
   fi
 

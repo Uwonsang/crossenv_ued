@@ -65,4 +65,4 @@
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled" # disabled, online, offline
-"model_name": "IPPO" # CEC, CEC_Finetune, CEC_IDAAC, CEC_IDAAC_Finetune, E3T, IPPO
+"model_name": "IPPO" # CEC, CEC_Finetune, CEC_IDAAC, CEC_IDAAC_Finetune, E3T, FCP, FCP_Fixed, IPPO

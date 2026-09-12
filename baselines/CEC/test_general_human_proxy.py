@@ -243,6 +243,7 @@ def main(config):
         "CEC_PREV",
         "CEC_64",
         "FCP",
+        "FCP_Fixed",
         "IPPO",
         *popart_model_names,
     }
@@ -299,6 +300,11 @@ def main(config):
             patterns = [
                 f"{model_root}/{config['ENV_KWARGS']['layout']}/"
                 f"seed{seed}/fcp_seed{seed}_best.pkl",
+            ]
+        elif model_name == "FCP_Fixed":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/fcp_fixed_seed{seed}_best.pkl",
             ]
         elif model_name == "E3T":
             patterns = [

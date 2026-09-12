@@ -28,6 +28,8 @@ all_models=(
   CEC_IDAAC
   CEC_IDAAC_Finetune
   E3T
+  FCP
+  FCP_Fixed
   IPPO
 )
 

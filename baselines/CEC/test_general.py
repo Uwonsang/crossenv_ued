@@ -220,7 +220,12 @@ def main(config):
     os.makedirs(config['SAVE_PATH_FINAL'], exist_ok=True)
     param_list = []
     seed_list = []
-    iter_range = range(config['NUM_MODELS'])
+    configured_seeds = config.get("MODEL_SEEDS")
+    iter_range = (
+        [int(seed) for seed in configured_seeds]
+        if configured_seeds is not None
+        else range(config['NUM_MODELS'])
+    )
 
     def find_model_path(seed):
         model_root = f"{config['MODEL_PATH']}/{model_name}"

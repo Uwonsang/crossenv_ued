@@ -74,6 +74,13 @@ for layout in "${layouts[@]}"; do
       selected_envs=("${model_num_envs_values[0]}")
     fi
     for model_num_envs in "${selected_envs[@]}"; do
+      if [[ "${model}" == "IPPO" ]]; then
+        model_seeds="[0,1,2,3,5,6]"
+        model_seed_label="0,1,2,3,5,6"
+      else
+        model_seeds="[0,1,2,3,4,5]"
+        model_seed_label="0,1,2,3,4,5"
+      fi
       model_output_dir=""
       if [[ -n "${output_dir}" ]]; then
         model_output_dir="${output_dir%/}/${model}"
@@ -81,7 +88,7 @@ for layout in "${layouts[@]}"; do
           model_output_dir="${model_output_dir}/envs${model_num_envs}"
         fi
       fi
-      echo "XP evaluation: layout=${layout}, model=${model}, seeds=0-5, model_num_envs=${model_num_envs}"
+      echo "XP evaluation: layout=${layout}, model=${model}, seeds=${model_seed_label}, model_num_envs=${model_num_envs}"
       if [[ -n "${model_output_dir}" ]]; then
         echo "Output directory: ${model_output_dir}"
       fi
@@ -90,6 +97,7 @@ for layout in "${layouts[@]}"; do
         "ENV_KWARGS.layout=${layout}"
         "++MODEL_PATH=${model_path}"
         "++MODEL_NUM_ENVS=${model_num_envs}"
+        "++MODEL_SEEDS=${model_seeds}"
         NUM_MODELS=6
         XP_ONLY=False
       )

@@ -59,6 +59,7 @@
 "HUMAN_PROXY_CKPT_DIR": "baselines/human_proxy/checkpoints"
 "HUMAN_PROXY_NUM_SEEDS": 5  # matches training-time evaluation (BC seeds 0-4)
 "NUM_MODELS": 6
+"MODEL_SEEDS": null  # optional explicit checkpoint seed list
 "XP_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          

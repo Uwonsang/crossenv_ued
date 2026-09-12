@@ -19,35 +19,47 @@ DEFAULT_HUMAN_PROXY_RESULTS_DIR = Path(
 
 ALG_ORDER = [
     "CEC_envs32",
+    "CEC_IDAAC_envs32",
     "CEC_envs64",
+    "CEC_IDAAC_envs64",
     "CEC_envs128",
+    "CEC_IDAAC_envs128",
     "CEC_envs256",
-    "CEC_Finetune",
+    "CEC_IDAAC_envs256",
 ]
 
 # graph key: (directory relative to xp_results, checkpoint filename prefix)
 ALG_SOURCES = {
     "CEC_envs32": ("CEC/envs32", "CEC"),
+    "CEC_IDAAC_envs32": ("CEC_IDAAC/envs32", "CEC_IDAAC"),
     "CEC_envs64": ("CEC/envs64", "CEC"),
+    "CEC_IDAAC_envs64": ("CEC_IDAAC/envs64", "CEC_IDAAC"),
     "CEC_envs128": ("CEC/envs128", "CEC"),
+    "CEC_IDAAC_envs128": ("CEC_IDAAC/envs128", "CEC_IDAAC"),
     "CEC_envs256": ("CEC/envs256", "CEC"),
-    "CEC_Finetune": ("CEC_Finetune", "CEC_Finetune"),
+    "CEC_IDAAC_envs256": ("CEC_IDAAC/envs256", "CEC_IDAAC"),
 }
 
 ALG_LABELS = {
     "CEC_envs32": "CEC-32",
+    "CEC_IDAAC_envs32": "CEC-IDAAC-32",
     "CEC_envs64": "CEC-64",
+    "CEC_IDAAC_envs64": "CEC-IDAAC-64",
     "CEC_envs128": "CEC-128",
+    "CEC_IDAAC_envs128": "CEC-IDAAC-128",
     "CEC_envs256": "CEC-256",
-    "CEC_Finetune": "CEC-FT",
+    "CEC_IDAAC_envs256": "CEC-IDAAC-256",
 }
 
 ALG_COLORS = [
-    "#c6dbef",  # CEC-32
-    "#9ecae1",  # CEC-64
-    "#4292c6",  # CEC-128
-    "#08519c",  # CEC-256
-    "#66a61e",  # CEC-FT
+    "#2a8c4a",  # CEC-32
+    "#377eb8",  # CEC-IDAAC-32
+    "#2a8c4a",  # CEC-64
+    "#377eb8",  # CEC-IDAAC-64
+    "#2a8c4a",  # CEC-128
+    "#377eb8",  # CEC-IDAAC-128
+    "#2a8c4a",  # CEC-256
+    "#377eb8",  # CEC-IDAAC-256
 ]
 
 MAP_ORDER = [
@@ -380,7 +392,7 @@ def main(config):
         xp_results_path,
         xp_out_path,
         "xp",
-        "CEC scaling cross-play",
+        "CEC vs CEC-IDAAC scaling cross-play",
     )
     human_proxy_grid = load_human_proxy_grid(human_proxy_results_path)
     save_graph_set(
@@ -388,7 +400,7 @@ def main(config):
         human_proxy_results_path,
         human_proxy_out_path,
         "human_proxy",
-        "CEC scaling human-proxy",
+        "CEC vs CEC-IDAAC scaling human-proxy",
     )
 
 

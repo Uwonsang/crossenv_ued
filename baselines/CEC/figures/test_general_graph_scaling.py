@@ -18,47 +18,36 @@ DEFAULT_HUMAN_PROXY_RESULTS_DIR = Path(
 )
 
 ALG_ORDER = [
-    "IPPO",
-    "E3T",
-    "FCP",
+    "CEC_envs32",
     "CEC_envs64",
+    "CEC_envs128",
+    "CEC_envs256",
     "CEC_Finetune",
-    "CEC_IDAAC_envs256",
-    "CEC_IDAAC_Finetune",
 ]
 
 # graph key: (directory relative to xp_results, checkpoint filename prefix)
 ALG_SOURCES = {
+    "CEC_envs32": ("CEC/envs32", "CEC"),
     "CEC_envs64": ("CEC/envs64", "CEC"),
-    "CEC_IDAAC_envs256": ("CEC_IDAAC/envs256", "CEC_IDAAC"),
+    "CEC_envs128": ("CEC/envs128", "CEC"),
+    "CEC_envs256": ("CEC/envs256", "CEC"),
     "CEC_Finetune": ("CEC_Finetune", "CEC_Finetune"),
-    "CEC_IDAAC_Finetune": (
-        "CEC_IDAAC_Finetune",
-        "CEC_IDAAC_Finetune",
-    ),
-    "E3T": ("E3T", "E3T"),
-    "FCP": ("FCP", "FCP"),
-    "IPPO": ("IPPO", "IPPO"),
 }
 
 ALG_LABELS = {
-    "IPPO": "IPPO",
-    "E3T": "E3T",
-    "FCP": "FCP",
-    "CEC_envs64": "CEC",
+    "CEC_envs32": "CEC-32",
+    "CEC_envs64": "CEC-64",
+    "CEC_envs128": "CEC-128",
+    "CEC_envs256": "CEC-256",
     "CEC_Finetune": "CEC-FT",
-    "CEC_IDAAC_envs256": "CEC-IDAAC",
-    "CEC_IDAAC_Finetune": "CEC-IDAAC-FT",
 }
 
 ALG_COLORS = [
-    "#d62728",  # IPPO
-    "#7b126b",  # E3T
-    "#e3a21a",  # FCP
-    "#117733",  # CEC
+    "#c6dbef",  # CEC-32
+    "#9ecae1",  # CEC-64
+    "#4292c6",  # CEC-128
+    "#08519c",  # CEC-256
     "#66a61e",  # CEC-FT
-    "#2166ac",  # CEC-IDAAC
-    "#67a9cf",  # CEC-IDAAC-FT
 ]
 
 MAP_ORDER = [
@@ -374,13 +363,15 @@ def main(config):
     )
     xp_out_path = Path(
         config.get("GRAPH_OUTPUT_DIR")
-        or project_root / "artifacts" / "test_general_graph_ICRL_xp"
+        or project_root
+        / "artifacts"
+        / "test_general_graph_scaling_ICRL_xp"
     )
     human_proxy_out_path = Path(
         config.get("HUMAN_PROXY_GRAPH_OUTPUT_DIR")
         or project_root
         / "artifacts"
-        / "test_general_graph_ICRL_human_proxy"
+        / "test_general_graph_scaling_ICRL_human_proxy"
     )
 
     xp_grid = load_grid(config, xp_results_path)
@@ -389,7 +380,7 @@ def main(config):
         xp_results_path,
         xp_out_path,
         "xp",
-        "Cross-play",
+        "CEC scaling cross-play",
     )
     human_proxy_grid = load_human_proxy_grid(human_proxy_results_path)
     save_graph_set(
@@ -397,7 +388,7 @@ def main(config):
         human_proxy_results_path,
         human_proxy_out_path,
         "human_proxy",
-        "Human-proxy",
+        "CEC scaling human-proxy",
     )
 
 

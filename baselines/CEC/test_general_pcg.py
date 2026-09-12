@@ -35,6 +35,12 @@ import pandas as pd
 from tqdm import tqdm
 from baselines.CEC_UED.minimax.plr_utils import pad_wall_idx
 from flax.core import unfreeze
+from actor_networks import (
+    ScannedRNN as EvalScannedRNN,
+    ActorCriticE3T as EvalActorCriticE3T,
+    ActorCriticRNN as EvalActorCriticRNN,
+    IDAACActorRNN as EvalIDAACActorRNN,
+)
 # import tsnex
 
 def initialize_environment(config):
@@ -275,9 +281,23 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, res
             last_done[np.newaxis, :],
             agent_positions[np.newaxis, :]
         )
-        hstate_1, pi_1, value_1 = network.apply(train_state_params_1, hstate_1, ac_in)
+        if config["model_name"] == "E3T":
+            hstate_1, pi_1, value_1, _ = network.apply(
+                train_state_params_1, hstate_1, ac_in
+            )
+        else:
+            hstate_1, pi_1, value_1 = network.apply(
+                train_state_params_1, hstate_1, ac_in
+            )
         pi_1 = distrax.Categorical(logits=pi_1.logits * config["TEST_KWARGS"]["beta"])
-        hstate_2, pi_2, value_2 = network.apply(train_state_params_2, hstate_2, ac_in)
+        if config["model_name"] == "E3T":
+            hstate_2, pi_2, value_2, _ = network.apply(
+                train_state_params_2, hstate_2, ac_in
+            )
+        else:
+            hstate_2, pi_2, value_2 = network.apply(
+                train_state_params_2, hstate_2, ac_in
+            )
         pi_2 = distrax.Categorical(logits=pi_2.logits * config["TEST_KWARGS"]["beta"])
 
         action_1 = pi_1.sample(seed=_rng)[0]
@@ -318,8 +338,12 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, res
             )
         else:
             obsv, env_state = env.reset(_rng)
-        init_hstate_1 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
-        init_hstate_2 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
+        init_hstate_1 = EvalScannedRNN.initialize_carry(
+            env.num_agents, config["GRU_HIDDEN_DIM"]
+        )
+        init_hstate_2 = EvalScannedRNN.initialize_carry(
+            env.num_agents, config["GRU_HIDDEN_DIM"]
+        )
         done_batch = jnp.zeros(env.num_agents, dtype=bool)
         
         init_carry = (train_state_params_1, train_state_params_2, env_state, obsv, done_batch, init_hstate_1, init_hstate_2, rng)
@@ -335,6 +359,17 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, res
 @hydra.main(version_base=None, config_path="repro_config", config_name="test_general_pcg")
 def main(config):
     config = OmegaConf.to_container(config)
+    model_name = config["model_name"]
+    scalable_model_names = {"CEC", "CEC_IDAAC"}
+    finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
+    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune"}
+    rnn_model_names = {
+        "CEC",
+        "CEC_Finetune",
+        "FCP",
+        "FCP_Fixed",
+        "IPPO",
+    }
 
     ##################
     # Load all models for current ckpt id
@@ -345,23 +380,58 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    os.makedirs(config['SAVE_PATH'], exist_ok=True)
+    if config.get("OUTPUT_DIR"):
+        save_path_final = config["OUTPUT_DIR"]
+    else:
+        save_path_final = config["SAVE_PATH"]
+        if model_name in scalable_model_names:
+            save_path_final += f"_envs{config['MODEL_NUM_ENVS']}"
+    config["SAVE_PATH_FINAL"] = save_path_final
+    os.makedirs(save_path_final, exist_ok=True)
 
     param_list = []
     seed_list = []
-    iter_range = range(6)
+    configured_seeds = config.get("MODEL_SEEDS")
+    iter_range = (
+        [int(seed) for seed in configured_seeds]
+        if configured_seeds is not None
+        else range(config["NUM_MODELS"])
+    )
+
     def find_model_path(seed):
-        if config["model_name"] == "CEC":
-            patterns = [f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved.pkl"]
-        elif config["model_name"] == "FCP":
+        model_root = f"{config['MODEL_PATH']}/{model_name}"
+        if model_name in scalable_model_names:
             patterns = [
-                f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_improved_fcp_updates22888.pkl",
+                f"{model_root}/{config['MODEL_NUM_ENVS']}/seed{seed}/"
+                f"seed{seed}_ckpt*.pkl"
             ]
-        elif config["model_name"] == "E3T":
-            patterns = [f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt0_e3t_updates22888.pkl"]
-        elif config["model_name"] == "IPPO":
+        elif model_name in finetune_model_names:
             patterns = [
-                f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_ckpt19_update22887.pkl"]
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/seed{seed}/"
+                f"seed{seed}_ckpt*_finetune_updates*.pkl"
+            ]
+        elif model_name == "FCP":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/fcp_seed{seed}_best.pkl",
+            ]
+        elif model_name == "FCP_Fixed":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/fcp_fixed_seed{seed}_best.pkl",
+            ]
+        elif model_name == "E3T":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/seed{seed}_best_e3t.pkl"
+            ]
+        elif model_name == "IPPO":
+            patterns = [
+                f"{model_root}/{config['ENV_KWARGS']['layout']}/"
+                f"seed{seed}/seed{seed}_best.pkl"
+            ]
+        else:
+            raise ValueError(f"Unknown model_name: {model_name}")
         for pat in patterns:
             matches = sorted(glob_module.glob(pat))
             if matches:
@@ -369,19 +439,28 @@ def main(config):
         return None
 
     for seed in iter_range:
+        filepath = find_model_path(seed)
+        if filepath is None:
+            print(f"Missing checkpoint: model={model_name}, seed={seed}")
+            continue
         try:
-            filepath = find_model_path(seed)
             with open(filepath, "rb") as f:
                 previous_ckpt = pickle.load(f)
                 model_params = previous_ckpt['params']
                 param_list.append(model_params)
                 seed_list.append(seed)
                 del previous_ckpt
-        except:
+                print(f"Loaded seed {seed}: {filepath}")
+        except (OSError, KeyError, pickle.UnpicklingError) as exc:
+            print(f"Failed to load {filepath}: {exc}")
             continue
     if len(param_list) == 0:
-        print(f"No models found")
-        exit(0)
+        raise RuntimeError(f"No checkpoints found for model={model_name}")
+    if config.get("XP_ONLY", False) and len(param_list) < 2:
+        raise RuntimeError(
+            f"XP requires at least two seeds; found {len(param_list)} for "
+            f"model={model_name}"
+        )
     seed_list = jnp.array(seed_list)
 
     param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)      # stack params
@@ -389,6 +468,8 @@ def main(config):
     # i want to get all pairs of seeds as a single array of (# pairs, 2)
     seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(seed_list)), jnp.arange(len(seed_list))))
     seed_pairs = seed_pairs.reshape((2, -1)).T
+    if config.get("XP_ONLY", False):
+        seed_pairs = seed_pairs[seed_pairs[:, 0] != seed_pairs[:, 1]]
 
     ##################
     # Initialize environment and network
@@ -396,7 +477,20 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
+    if model_name in idaac_model_names:
+        network = EvalIDAACActorRNN(
+            env.action_space("agent_0").n, config=config
+        )
+    elif model_name == "E3T":
+        network = EvalActorCriticE3T(
+            env.action_space("agent_0").n, config=config
+        )
+    elif model_name in rnn_model_names:
+        network = EvalActorCriticRNN(
+            env.action_space("agent_0").n, config=config
+        )
+    else:
+        raise ValueError(f"No evaluation network for model_name={model_name}")
 
     stacked_layouts = jax.device_get(config["eval_held_out_layouts"])
     eval_held_out_layouts = unfreeze(stacked_layouts)
@@ -437,7 +531,14 @@ def main(config):
                     df_dict['held_out_layout_idx'].append(int(hi))
             df_parts.append(pd.DataFrame(df_dict))
         df = pd.concat(df_parts, ignore_index=True)
-        savefile = f"{config['SAVE_PATH']}/{config['model_name']}_{layout_name}_XP_results.csv"
+        if model_name in scalable_model_names:
+            result_name = (
+                f"{model_name}_envs{config['MODEL_NUM_ENVS']}"
+                "_PCG_XP_results.csv"
+            )
+        else:
+            result_name = f"{model_name}_{layout_name}_PCG_XP_results.csv"
+        savefile = f"{config['SAVE_PATH_FINAL']}/{result_name}"
         df.to_csv(savefile, index=False)
         print(f"Saved data to {savefile}")
     else:

@@ -37,6 +37,8 @@ from environment_gradient import (
     environment_gradient_log_key,
 )
 from paper_stiffness import (
+    SAMPLEWISE_GSNR_METRIC_NAMES,
+    STIFFNESS_METRIC_NAMES,
     advance_rollout_rng,
     compute_paper_stiffness,
     count_unique_static_signatures,
@@ -1288,7 +1290,14 @@ def make_train(
                 stiffness_log = {
                     f"stiffness/paper_{k}": float(v)
                     for k, v in metric["stiffness"].items()
-                    if np.isfinite(float(v))
+                    if k in STIFFNESS_METRIC_NAMES
+                    and np.isfinite(float(v))
+                }
+                samplewise_gsnr_log = {
+                    f"sample_gradient_gsnr/{k}": float(v)
+                    for k, v in metric["stiffness"].items()
+                    if k in SAMPLEWISE_GSNR_METRIC_NAMES
+                    and np.isfinite(float(v))
                 }
                 diversity_log = {}
                 if np.isfinite(float(metric["static_unique_count"])):
@@ -1312,6 +1321,7 @@ def make_train(
                 }
                 if (
                     stiffness_log
+                    or samplewise_gsnr_log
                     or diversity_log
                     or policy_value_log
                     or feature_rank_log
@@ -1322,6 +1332,7 @@ def make_train(
                             "update_step": step,
                             "env_step": env_step,
                             **stiffness_log,
+                            **samplewise_gsnr_log,
                             **diversity_log,
                             **policy_value_log,
                             **feature_rank_log,
@@ -1349,6 +1360,7 @@ def make_train(
                         log_dict[k] = s / cnt if cnt > 0 else float("nan")
 
                     log_dict.update(stiffness_log)
+                    log_dict.update(samplewise_gsnr_log)
                     log_dict.update(diversity_log)
                     log_dict.update(policy_value_log)
                     log_dict.update(feature_rank_log)

@@ -52,6 +52,10 @@ METRIC_GROUPS = {
         "env_gradient_gsnr/policy_parameterwise_gsnr_mean_log10",
         "env_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
     ),
+    "sample_gradient_gsnr": (
+        "sample_gradient_gsnr/value_parameterwise_gsnr_mean",
+        "sample_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
+    ),
     "env_gradient_norm": tuple(
         f"env_gradient_norm/{gradient_name}_{statistic}"
         for gradient_name in (

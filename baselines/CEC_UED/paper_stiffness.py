@@ -20,6 +20,11 @@ STIFFNESS_METRIC_NAMES = (
     "value_different_layout_per_static_grid",
 )
 
+SAMPLEWISE_GSNR_METRIC_NAMES = (
+    "value_parameterwise_gsnr_mean",
+    "value_parameterwise_gsnr_mean_log10",
+)
+
 
 def encode_static_grid_signature(
     wall_map: jnp.ndarray,
@@ -141,7 +146,7 @@ def empty_paper_stiffness_metrics(dtype=jnp.float32):
 
     return {
         name: jnp.asarray(jnp.nan, dtype=dtype)
-        for name in STIFFNESS_METRIC_NAMES
+        for name in STIFFNESS_METRIC_NAMES + SAMPLEWISE_GSNR_METRIC_NAMES
     }
 
 
@@ -281,8 +286,13 @@ def compute_paper_stiffness(
         chunk(sample_mask),
     )
     normalized_gradient_sum = jax.tree.map(jnp.zeros_like, value_params)
+    raw_gradient_sum = jax.tree.map(jnp.zeros_like, value_params)
+    raw_gradient_squared_sum = jax.tree.map(jnp.zeros_like, value_params)
     initial_state = (
         normalized_gradient_sum,
+        jnp.asarray(0.0, dtype=jnp.float32),
+        raw_gradient_sum,
+        raw_gradient_squared_sum,
         jnp.asarray(0.0, dtype=jnp.float32),
         jnp.zeros(
             (int(max_static_grids), int(sketch_size)), dtype=jnp.float32
@@ -297,6 +307,9 @@ def compute_paper_stiffness(
         (
             normalized_sum,
             valid_count,
+            gradient_sum,
+            gradient_squared_sum,
+            samplewise_count,
             raw_gradient_sketch_by_static_grid,
             sample_count_by_static_grid,
             layout_count_by_static_grid,
@@ -345,6 +358,42 @@ def compute_paper_stiffness(
         normalized_sum = jax.tree.map(
             add_normalized,
             normalized_sum,
+            gradients,
+        )
+        # A zero gradient is still a valid observation for GSNR. Only samples
+        # outside the selected minibatch or with non-finite gradients are
+        # excluded; stiffness separately requires a non-zero norm for cosine.
+        samplewise_valid = jnp.logical_and(
+            jnp.isfinite(gradient_norms),
+            batch_sample_mask.astype(jnp.bool_),
+        )
+
+        def accumulate_samplewise(total, gradient_leaf):
+            broadcast_shape = (chunk_size,) + (1,) * (
+                gradient_leaf.ndim - 1
+            )
+            weights = samplewise_valid.astype(jnp.float32).reshape(
+                broadcast_shape
+            )
+            return total + jnp.sum(gradient_leaf * weights, axis=0)
+
+        def accumulate_samplewise_squared(total, gradient_leaf):
+            broadcast_shape = (chunk_size,) + (1,) * (
+                gradient_leaf.ndim - 1
+            )
+            weights = samplewise_valid.astype(jnp.float32).reshape(
+                broadcast_shape
+            )
+            return total + jnp.sum(
+                jnp.square(gradient_leaf) * weights, axis=0
+            )
+
+        gradient_sum = jax.tree.map(
+            accumulate_samplewise, gradient_sum, gradients
+        )
+        gradient_squared_sum = jax.tree.map(
+            accumulate_samplewise_squared,
+            gradient_squared_sum,
             gradients,
         )
         raw_gradient_sketches = jnp.zeros(
@@ -413,6 +462,10 @@ def compute_paper_stiffness(
         return (
             normalized_sum,
             valid_count + jnp.sum(valid.astype(jnp.float32)),
+            gradient_sum,
+            gradient_squared_sum,
+            samplewise_count
+            + jnp.sum(samplewise_valid.astype(jnp.float32)),
             raw_gradient_sketch_by_static_grid,
             sample_count_by_static_grid,
             layout_count_by_static_grid,
@@ -421,6 +474,9 @@ def compute_paper_stiffness(
     (
         normalized_gradient_sum,
         valid_sample_count,
+        raw_gradient_sum,
+        raw_gradient_squared_sum,
+        samplewise_count,
         raw_gradient_sketch_by_static_grid,
         sample_count_by_static_grid,
         layout_count_by_static_grid,
@@ -442,6 +498,49 @@ def compute_paper_stiffness(
         )
 
     off_diagonal = safe_mean(off_diagonal_sum, off_diagonal_count)
+
+    # Liu et al. (ICLR 2020) define a parameter's GSNR as its squared
+    # sample-wise mean gradient divided by its sample-wise gradient variance.
+    # Accumulating first and second moments keeps memory linear in the number
+    # of value-network parameters instead of materializing samples x params.
+    gsnr_count = jnp.maximum(samplewise_count, 1.0)
+    variance_denominator = jnp.maximum(samplewise_count - 1.0, 1.0)
+    gsnr_total = jnp.asarray(0.0, dtype=jnp.float32)
+    gsnr_log_total = jnp.asarray(0.0, dtype=jnp.float32)
+    parameter_count = jnp.asarray(0.0, dtype=jnp.float32)
+    for gradient_sum_leaf, gradient_squared_sum_leaf in zip(
+        jax.tree_util.tree_leaves(raw_gradient_sum),
+        jax.tree_util.tree_leaves(raw_gradient_squared_sum),
+    ):
+        mean_gradient = gradient_sum_leaf / gsnr_count
+        gradient_variance = jnp.maximum(
+            gradient_squared_sum_leaf
+            - gsnr_count * jnp.square(mean_gradient),
+            0.0,
+        ) / variance_denominator
+        coordinate_gsnr = jnp.square(mean_gradient) / (
+            gradient_variance + epsilon
+        )
+        gsnr_total += jnp.sum(coordinate_gsnr)
+        gsnr_log_total += jnp.sum(
+            jnp.log10(jnp.maximum(coordinate_gsnr, epsilon))
+        )
+        parameter_count += jnp.asarray(
+            gradient_sum_leaf.size, dtype=jnp.float32
+        )
+    valid_gsnr = jnp.logical_and(
+        samplewise_count > 1.0, parameter_count > 0.0
+    )
+    samplewise_gsnr_mean = jnp.where(
+        valid_gsnr,
+        gsnr_total / jnp.maximum(parameter_count, 1.0),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
+    samplewise_gsnr_mean_log10 = jnp.where(
+        valid_gsnr,
+        gsnr_log_total / jnp.maximum(parameter_count, 1.0),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
 
     static_grid_layout_ids = jnp.argmax(
         layout_count_by_static_grid, axis=1
@@ -506,5 +605,9 @@ def compute_paper_stiffness(
         "value_different_layout_per_static_grid": safe_mean(
             static_grid_different_layout_sum,
             static_grid_different_layout_count,
+        ),
+        "value_parameterwise_gsnr_mean": samplewise_gsnr_mean,
+        "value_parameterwise_gsnr_mean_log10": (
+            samplewise_gsnr_mean_log10
         ),
     }

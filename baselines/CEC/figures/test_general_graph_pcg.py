@@ -13,9 +13,21 @@ import pandas as pd
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+plt.rcParams.update(
+    {
+        "font.size": 14,
+        "axes.titlesize": 16,
+        "axes.labelsize": 15,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
+        "figure.titlesize": 18,
+        "legend.fontsize": 13,
+    }
+)
+
 
 DEFAULT_RESULTS_DIR = Path(
-    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/pcg_xp_results"
+    "/app/nas/models/ICRL/pcg_xp_results"
 )
 DEFAULT_OUTPUT_DIR = (
     Path(__file__).resolve().parents[3]
@@ -28,9 +40,8 @@ ALGORITHM_ORDER = [
     "E3T",
     "FCP",
     "CEC_envs64",
-    "CEC_Finetune",
+    "CEC_IDAAC_envs32",
     "CEC_IDAAC_envs256",
-    "CEC_IDAAC_Finetune",
 ]
 
 # graph key: (relative directory, filename prefix, layout-generalist model)
@@ -39,16 +50,15 @@ ALGORITHM_SOURCES = {
     "E3T": ("E3T", "E3T", False),
     "FCP": ("FCP", "FCP", False),
     "CEC_envs64": ("CEC/envs64", "CEC_envs64", True),
-    "CEC_Finetune": ("CEC_Finetune", "CEC_Finetune", False),
+    "CEC_IDAAC_envs32": (
+        "CEC_IDAAC/envs32",
+        "CEC_IDAAC_envs32",
+        True,
+    ),
     "CEC_IDAAC_envs256": (
         "CEC_IDAAC/envs256",
         "CEC_IDAAC_envs256",
         True,
-    ),
-    "CEC_IDAAC_Finetune": (
-        "CEC_IDAAC_Finetune",
-        "CEC_IDAAC_Finetune",
-        False,
     ),
 }
 
@@ -56,10 +66,9 @@ ALGORITHM_LABELS = {
     "IPPO": "IPPO",
     "E3T": "E3T",
     "FCP": "FCP",
-    "CEC_envs64": "CEC",
-    "CEC_Finetune": "CEC-FT",
-    "CEC_IDAAC_envs256": "CEC-IDAAC",
-    "CEC_IDAAC_Finetune": "CEC-IDAAC-FT",
+    "CEC_envs64": "CEC (64)",
+    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
+    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
 }
 
 ALGORITHM_COLORS = {
@@ -67,9 +76,8 @@ ALGORITHM_COLORS = {
     "E3T": "#7b126b",
     "FCP": "#e3a21a",
     "CEC_envs64": "#117733",
-    "CEC_Finetune": "#66a61e",
-    "CEC_IDAAC_envs256": "#2166ac",
-    "CEC_IDAAC_Finetune": "#67a9cf",
+    "CEC_IDAAC_envs32": "#56B4E9",
+    "CEC_IDAAC_envs256": "#0072B2",
 }
 
 CHECKPOINT_LAYOUT_ORDER = [
@@ -217,19 +225,9 @@ def make_checkpoint_summary(pair_units: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def make_generated_layout_summary(data: pd.DataFrame) -> pd.DataFrame:
-    return (
-        data.groupby(["algorithm", "held_out_layout_idx"], as_index=False)[
-            "reward"
-        ]
-        .mean()
-        .rename(columns={"reward": "mean_reward"})
-    )
-
-
 def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
     indexed = summary.set_index("algorithm").reindex(ALGORITHM_ORDER)
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(12.5, 6.0))
     x = np.arange(len(ALGORITHM_ORDER))
     ax.bar(
         x,
@@ -252,14 +250,14 @@ def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
 def plot_per_checkpoint_layout(
     summary: pd.DataFrame, output_path: Path
 ) -> None:
-    fig, axes = plt.subplots(2, 3, figsize=(16, 8.8), squeeze=False)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10), squeeze=False)
     axes_flat = axes.ravel()
     x = np.arange(len(ALGORITHM_ORDER))
     for index, checkpoint_layout in enumerate(CHECKPOINT_LAYOUT_ORDER):
@@ -289,34 +287,11 @@ def plot_per_checkpoint_layout(
     axes_flat[-1].set_visible(False)
     fig.suptitle(
         "PCG cross-play by specialist checkpoint layout",
-        fontsize=13,
+        fontsize=18,
         y=1.01,
     )
     fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_generated_layout_heatmap(
-    summary: pd.DataFrame, output_path: Path
-) -> None:
-    pivot = summary.pivot(
-        index="algorithm", columns="held_out_layout_idx", values="mean_reward"
-    ).reindex(ALGORITHM_ORDER)
-    fig, ax = plt.subplots(figsize=(16, 4.8))
-    image = ax.imshow(pivot.to_numpy(), aspect="auto", cmap="viridis")
-    ax.set_yticks(np.arange(len(ALGORITHM_ORDER)))
-    ax.set_yticklabels([ALGORITHM_LABELS[a] for a in ALGORITHM_ORDER])
-    layout_indices = pivot.columns.to_numpy(dtype=int)
-    tick_positions = np.arange(0, len(layout_indices), 10)
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(layout_indices[tick_positions])
-    ax.set_xlabel("held-out PCG layout index")
-    ax.set_title("Mean cross-play reward on each generated layout")
-    colorbar = fig.colorbar(image, ax=ax)
-    colorbar.set_label("mean reward")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=180, bbox_inches="tight")
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -350,28 +325,27 @@ def main() -> None:
     pair_units = summarize_pair_units(data)
     overall = make_overall_summary(pair_units)
     by_checkpoint = make_checkpoint_summary(pair_units)
-    by_generated_layout = make_generated_layout_summary(data)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    overall.to_csv(args.output_dir / "pcg_overall_table.csv", index=False)
-    by_checkpoint.to_csv(
-        args.output_dir / "pcg_per_checkpoint_layout_table.csv", index=False
+    prefix = (
+        "test_general_pcg_xp_with_sp"
+        if args.include_sp
+        else "test_general_pcg_xp"
     )
-    by_generated_layout.to_csv(
-        args.output_dir / "pcg_generated_layout_table.csv", index=False
-    )
-    plot_overall(overall, args.output_dir / "pcg_overall.png")
-    plot_per_checkpoint_layout(
-        by_checkpoint, args.output_dir / "pcg_per_checkpoint_layout.png"
-    )
-    plot_generated_layout_heatmap(
-        by_generated_layout, args.output_dir / "pcg_layout_heatmap.png"
-    )
+    output_paths = [
+        args.output_dir / f"{prefix}_overall_table.csv",
+        args.output_dir / f"{prefix}_per_checkpoint_layout_table.csv",
+        args.output_dir / f"{prefix}_overall.pdf",
+        args.output_dir / f"{prefix}_per_checkpoint_layout.pdf",
+    ]
+    overall.to_csv(output_paths[0], index=False)
+    by_checkpoint.to_csv(output_paths[1], index=False)
+    plot_overall(overall, output_paths[2])
+    plot_per_checkpoint_layout(by_checkpoint, output_paths[3])
 
     print(f"Loaded {len(data):,} XP rows from {args.results_dir}")
-    for path in sorted(args.output_dir.iterdir()):
-        if path.is_file():
-            print(f"Saved: {path}")
+    for path in output_paths:
+        print(f"Saved: {path}")
 
 
 if __name__ == "__main__":

@@ -10,11 +10,23 @@ import os
 import hydra
 from omegaconf import OmegaConf
 
+plt.rcParams.update(
+    {
+        "font.size": 14,
+        "axes.titlesize": 16,
+        "axes.labelsize": 15,
+        "xtick.labelsize": 13,
+        "ytick.labelsize": 13,
+        "figure.titlesize": 18,
+        "legend.fontsize": 13,
+    }
+)
+
 DEFAULT_XP_RESULTS_DIR = Path(
-    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/xp_results"
+    "/app/nas/models/ICRL/xp_results"
 )
 DEFAULT_HUMAN_PROXY_RESULTS_DIR = Path(
-    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/human_proxy_results"
+    "/app/nas/models/ICRL/human_proxy_results"
 )
 
 ALG_ORDER = [
@@ -22,20 +34,15 @@ ALG_ORDER = [
     "E3T",
     "FCP",
     "CEC_envs64",
-    "CEC_Finetune",
+    "CEC_IDAAC_envs32",
     "CEC_IDAAC_envs256",
-    "CEC_IDAAC_Finetune",
 ]
 
 # graph key: (directory relative to xp_results, checkpoint filename prefix)
 ALG_SOURCES = {
     "CEC_envs64": ("CEC/envs64", "CEC"),
+    "CEC_IDAAC_envs32": ("CEC_IDAAC/envs32", "CEC_IDAAC"),
     "CEC_IDAAC_envs256": ("CEC_IDAAC/envs256", "CEC_IDAAC"),
-    "CEC_Finetune": ("CEC_Finetune", "CEC_Finetune"),
-    "CEC_IDAAC_Finetune": (
-        "CEC_IDAAC_Finetune",
-        "CEC_IDAAC_Finetune",
-    ),
     "E3T": ("E3T", "E3T"),
     "FCP": ("FCP", "FCP"),
     "IPPO": ("IPPO", "IPPO"),
@@ -45,20 +52,18 @@ ALG_LABELS = {
     "IPPO": "IPPO",
     "E3T": "E3T",
     "FCP": "FCP",
-    "CEC_envs64": "CEC",
-    "CEC_Finetune": "CEC-FT",
-    "CEC_IDAAC_envs256": "CEC-IDAAC",
-    "CEC_IDAAC_Finetune": "CEC-IDAAC-FT",
+    "CEC_envs64": "CEC (64)",
+    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
+    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
 }
 
 ALG_COLORS = [
     "#d62728",  # IPPO
     "#7b126b",  # E3T
     "#e3a21a",  # FCP
-    "#117733",  # CEC
-    "#66a61e",  # CEC-FT
-    "#2166ac",  # CEC-IDAAC
-    "#67a9cf",  # CEC-IDAAC-FT
+    "#117733",  # CEC (64)
+    "#56B4E9",  # CEC-IDAAC (32): Okabe-Ito sky blue
+    "#0072B2",  # CEC-IDAAC (256): Okabe-Ito blue
 ]
 
 MAP_ORDER = [
@@ -200,7 +205,7 @@ def plot_per_map(
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(5.2 * ncols, 4.2 * nrows),
+        figsize=(6.0 * ncols, 4.8 * nrows),
         squeeze=False,
     )
     axes_flat = axes.ravel()
@@ -249,10 +254,10 @@ def plot_per_map(
         axes_flat[j].set_visible(False)
 
     fig.suptitle(
-        f"{evaluation_label} performance per layout", fontsize=13, y=1.02
+        f"{evaluation_label} performance per layout", fontsize=18, y=1.02
     )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -272,7 +277,7 @@ def plot_overall(
     errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(12.5, 6.0))
     x = np.arange(len(ALG_ORDER))
     colors = [_alg_color_map()[a] for a in ALG_ORDER]
     ax.bar(
@@ -299,7 +304,7 @@ def plot_overall(
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -326,13 +331,13 @@ def save_graph_set(
         )
 
     os.makedirs(out_path, exist_ok=True)
-    per_map_png = out_path / f"{file_prefix}_per_map.png"
-    overall_png = out_path / f"{file_prefix}_overall.png"
+    per_map_pdf = out_path / f"{file_prefix}_per_map.pdf"
+    overall_pdf = out_path / f"{file_prefix}_overall.pdf"
     per_map_csv = out_path / f"{file_prefix}_per_map_table.csv"
     overall_csv = out_path / f"{file_prefix}_overall_table.csv"
 
-    plot_per_map(grid, per_map_png, evaluation_label)
-    plot_overall(grid, overall_png, evaluation_label)
+    plot_per_map(grid, per_map_pdf, evaluation_label)
+    plot_overall(grid, overall_pdf, evaluation_label)
 
     pivot = grid.pivot_table(
         index="map", columns="algorithm", values="mean_reward", aggfunc="first"
@@ -355,8 +360,8 @@ def save_graph_set(
     )
     overall_df.to_csv(overall_csv, index=False, encoding="utf-8")
 
-    print(f"Saved: {per_map_png}")
-    print(f"Saved: {overall_png}")
+    print(f"Saved: {per_map_pdf}")
+    print(f"Saved: {overall_pdf}")
     print(f"Saved: {per_map_csv}")
     print(f"Saved: {overall_csv}")
 
@@ -372,9 +377,15 @@ def main(config):
         config.get("HUMAN_PROXY_RESULTS_DIR")
         or DEFAULT_HUMAN_PROXY_RESULTS_DIR
     )
+    xp_only = bool(config["XP_ONLY"])
+    default_xp_output_name = (
+        "test_general_graph_ICRL_xp"
+        if xp_only
+        else "test_general_graph_ICRL_xp_with_sp"
+    )
     xp_out_path = Path(
         config.get("GRAPH_OUTPUT_DIR")
-        or project_root / "artifacts" / "test_general_graph_ICRL_xp"
+        or project_root / "artifacts" / default_xp_output_name
     )
     human_proxy_out_path = Path(
         config.get("HUMAN_PROXY_GRAPH_OUTPUT_DIR")
@@ -388,15 +399,15 @@ def main(config):
         xp_grid,
         xp_results_path,
         xp_out_path,
-        "xp",
-        "Cross-play",
+        "test_general_xp" if xp_only else "test_general_xp_with_sp",
+        "Cross-play" if xp_only else "Cross-play + self-play",
     )
     human_proxy_grid = load_human_proxy_grid(human_proxy_results_path)
     save_graph_set(
         human_proxy_grid,
         human_proxy_results_path,
         human_proxy_out_path,
-        "human_proxy",
+        "test_general_human_proxy",
         "Human-proxy",
     )
 

@@ -10,11 +10,23 @@ import os
 import hydra
 from omegaconf import OmegaConf
 
+plt.rcParams.update(
+    {
+        "font.size": 14,
+        "axes.titlesize": 16,
+        "axes.labelsize": 15,
+        "xtick.labelsize": 12,
+        "ytick.labelsize": 13,
+        "figure.titlesize": 18,
+        "legend.fontsize": 13,
+    }
+)
+
 DEFAULT_XP_RESULTS_DIR = Path(
-    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/xp_results"
+    "/app/nas/models/ICRL/xp_results"
 )
 DEFAULT_HUMAN_PROXY_RESULTS_DIR = Path(
-    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/human_proxy_results"
+    "/app/nas/models/ICRL/human_proxy_results"
 )
 
 ALG_ORDER = [
@@ -52,14 +64,14 @@ ALG_LABELS = {
 }
 
 ALG_COLORS = [
-    "#2a8c4a",  # CEC-32
-    "#377eb8",  # CEC-IDAAC-32
-    "#2a8c4a",  # CEC-64
-    "#377eb8",  # CEC-IDAAC-64
-    "#2a8c4a",  # CEC-128
-    "#377eb8",  # CEC-IDAAC-128
-    "#2a8c4a",  # CEC-256
-    "#377eb8",  # CEC-IDAAC-256
+    "#8FD19E",  # CEC-32
+    "#56B4E9",  # CEC-IDAAC-32
+    "#5ABF75",  # CEC-64
+    "#3D9BD3",  # CEC-IDAAC-64
+    "#2F9956",  # CEC-128
+    "#1F86C2",  # CEC-IDAAC-128
+    "#117733",  # CEC-256
+    "#0072B2",  # CEC-IDAAC-256
 ]
 
 MAP_ORDER = [
@@ -201,7 +213,7 @@ def plot_per_map(
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(5.2 * ncols, 4.2 * nrows),
+        figsize=(6.4 * ncols, 5.0 * nrows),
         squeeze=False,
     )
     axes_flat = axes.ravel()
@@ -250,10 +262,10 @@ def plot_per_map(
         axes_flat[j].set_visible(False)
 
     fig.suptitle(
-        f"{evaluation_label} performance per layout", fontsize=13, y=1.02
+        f"{evaluation_label} performance per layout", fontsize=18, y=1.02
     )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -273,7 +285,7 @@ def plot_overall(
     errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
-    fig, ax = plt.subplots(figsize=(11, 5))
+    fig, ax = plt.subplots(figsize=(14.0, 6.5))
     x = np.arange(len(ALG_ORDER))
     colors = [_alg_color_map()[a] for a in ALG_ORDER]
     ax.bar(
@@ -300,7 +312,7 @@ def plot_overall(
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=160, bbox_inches="tight")
+    fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -327,13 +339,13 @@ def save_graph_set(
         )
 
     os.makedirs(out_path, exist_ok=True)
-    per_map_png = out_path / f"{file_prefix}_per_map.png"
-    overall_png = out_path / f"{file_prefix}_overall.png"
+    per_map_pdf = out_path / f"{file_prefix}_per_map.pdf"
+    overall_pdf = out_path / f"{file_prefix}_overall.pdf"
     per_map_csv = out_path / f"{file_prefix}_per_map_table.csv"
     overall_csv = out_path / f"{file_prefix}_overall_table.csv"
 
-    plot_per_map(grid, per_map_png, evaluation_label)
-    plot_overall(grid, overall_png, evaluation_label)
+    plot_per_map(grid, per_map_pdf, evaluation_label)
+    plot_overall(grid, overall_pdf, evaluation_label)
 
     pivot = grid.pivot_table(
         index="map", columns="algorithm", values="mean_reward", aggfunc="first"
@@ -356,8 +368,8 @@ def save_graph_set(
     )
     overall_df.to_csv(overall_csv, index=False, encoding="utf-8")
 
-    print(f"Saved: {per_map_png}")
-    print(f"Saved: {overall_png}")
+    print(f"Saved: {per_map_pdf}")
+    print(f"Saved: {overall_pdf}")
     print(f"Saved: {per_map_csv}")
     print(f"Saved: {overall_csv}")
 
@@ -386,20 +398,29 @@ def main(config):
         / "test_general_graph_scaling_ICRL_human_proxy"
     )
 
+    xp_only = bool(config["XP_ONLY"])
     xp_grid = load_grid(config, xp_results_path)
     save_graph_set(
         xp_grid,
         xp_results_path,
         xp_out_path,
-        "xp",
-        "CEC vs CEC-IDAAC scaling cross-play",
+        (
+            "test_general_scaling_xp"
+            if xp_only
+            else "test_general_scaling_xp_with_sp"
+        ),
+        (
+            "CEC vs CEC-IDAAC scaling cross-play"
+            if xp_only
+            else "CEC vs CEC-IDAAC scaling cross-play + self-play"
+        ),
     )
     human_proxy_grid = load_human_proxy_grid(human_proxy_results_path)
     save_graph_set(
         human_proxy_grid,
         human_proxy_results_path,
         human_proxy_out_path,
-        "human_proxy",
+        "test_general_scaling_human_proxy",
         "CEC vs CEC-IDAAC scaling human-proxy",
     )
 

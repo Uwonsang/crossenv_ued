@@ -35,6 +35,16 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
 - **`target_popart_graph.py`** — PopArt-normalized value target (`target_popart/...`), per layout.
 - **`train_returns_graph.py`** — training return (`train_returns/...`), per layout.
 - **`eval_graph.py`** — eval return (`eval/...`), per layout.
+- **`value_loss_generalization_graph.py`** — W&B의 `value_loss`와 held-out
+  `eval/...` return 사이의 상관관계를 그린다. 동일 `NUM_ENVS`의 seed를 먼저
+  평균하고, 각 점을 `NUM_ENVS` 설정 하나로 표시한다. 레이아웃별 Pearson
+  correlation과 선형 회귀선을 포함하며 run-level/집계 CSV도 함께 저장한다.
+  기본 출력 경로는 `artifacts/value_loss_generalization/`이다.
+- **`generalization_gap_graph.py`** — 마지막 공통 학습 구간에서 레이아웃별
+  `train_returns/* - eval/*` generalization gap을 계산한다. 양수는 생성된
+  training layout의 return이 고정 evaluation layout보다 높다는 뜻이다.
+  CEC/CEC-IDAAC의 환경 수별 seed 평균과 SEM을 비교하고 원자료/집계 CSV를
+  `artifacts/generalization_gap/`에 저장한다.
 - **`eval_xp_model_graph.py`** — `config.model_name`별 BC cross-play return
   (`eval_xp/mean`) 평균 곡선. 여러 run은 모델별로 묶는다. 기본 프로젝트는
   `crossenv_ICLR`이다. 환경 수가 다른 run도
@@ -82,6 +92,12 @@ python baselines/CEC/figures/analysis/target_raw_graph.py --run-id 5rwobcx9
 python baselines/CEC/figures/analysis/target_popart_graph.py --run-id 5rwobcx9
 python baselines/CEC/figures/analysis/train_returns_graph.py --run-id 5rwobcx9 --smooth-window 20
 python baselines/CEC/figures/analysis/eval_graph.py --run-id 5rwobcx9
+python baselines/CEC/figures/analysis/value_loss_generalization_graph.py \
+  --project crossenv_ICLR \
+  --target-env-steps 3000000000 \
+  --model-names CEC CEC_IDAAC \
+  --num-envs 32 64 128 256
+python baselines/CEC/figures/analysis/generalization_gap_graph.py
 python baselines/CEC/figures/analysis/eval_xp_model_graph.py \
   --model-names CEC_IDAAC CEC_POP CEC_IDAAC_POP CEC \
   --num-envs 256 \

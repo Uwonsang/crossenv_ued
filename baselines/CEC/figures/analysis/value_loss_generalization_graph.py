@@ -18,6 +18,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+from matplotlib.patches import ConnectionPatch, Rectangle
 import numpy as np
 import wandb
 
@@ -121,6 +122,7 @@ def parse_args() -> argparse.Namespace:
             "aggregate", "individual", "both", "combined",
             "combined-individual", "mean-comparison",
             "mean-comparison-individual", "mean-comparison-separate",
+            "mean-overview-zoom", "mean-center-zoom",
         ),
         default="aggregate",
         help=(
@@ -995,6 +997,181 @@ def plot_mean_separate(model, rows, output_path: Path):
     plt.close(fig)
 
 
+def plot_mean_overview_zoom(
+    rows, models, output_path: Path, center_overview: bool = False,
+):
+    """Show a shared-scale mean overview followed by one zoom per model."""
+    model_styles = {
+        "CEC": {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+        "CEC_IDAAC": {"color": "#e68632", "marker": "s", "linestyle": "--"},
+    }
+    figure = plt.figure(figsize=(16.5, 5.8) if center_overview else (14.0, 4.8))
+    width_ratios = (1.0, 1.15, 1.0) if center_overview else (1.15, 1.0, 1.0)
+    grid = figure.add_gridspec(1, 3, width_ratios=width_ratios)
+    axes = [figure.add_subplot(grid[0, index]) for index in range(3)]
+    correlations = {}
+
+    def draw_model(ax, model, annotate_envs=True, force_solid=False):
+        points = sorted(
+            (
+                row for row in rows
+                if row["model"] == model and row["eval_layout"] == "mean"
+            ),
+            key=lambda row: row["num_envs"],
+        )
+        if not points:
+            return None
+        style = model_styles.get(
+            model, {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+        )
+        x = np.asarray([row["value_loss_mean"] for row in points], dtype=float)
+        y = np.asarray([row["eval_score_mean"] for row in points], dtype=float)
+        correlations[model] = correlation(x, y)
+        if len(x) >= 2 and not np.allclose(x, x[0]):
+            slope, intercept = np.polyfit(x, y, 1)
+            line_x = np.linspace(float(x.min()), float(x.max()), 100)
+            ax.plot(
+                line_x, slope * line_x + intercept,
+                color=style["color"],
+                linestyle="-" if force_solid else style["linestyle"],
+                linewidth=2.4, zorder=1,
+            )
+        x_mid = (float(x.min()) + float(x.max())) / 2.0
+        y_mid = (float(y.min()) + float(y.max())) / 2.0
+        for point, px, py in zip(points, x, y):
+            env_color = COLORS.get(point["num_envs"], "#1f4e99")
+            ax.scatter(
+                [px], [py], s=56, color=env_color, marker=style["marker"],
+                edgecolors="white", linewidths=0.7, zorder=3,
+            )
+            if not annotate_envs:
+                continue
+            dx = -6 if px > x_mid else 6
+            dy = -6 if py > y_mid else 6
+            ax.annotate(
+                str(point["num_envs"]), (px, py),
+                xytext=(dx, dy), textcoords="offset points",
+                ha="right" if dx < 0 else "left",
+                va="top" if dy < 0 else "bottom",
+                fontsize=12.0 if center_overview else 8.5,
+                color=env_color, zorder=4,
+                bbox={"facecolor": "white", "edgecolor": "none",
+                      "pad": 0.12, "alpha": 0.84},
+            )
+        return x, y
+
+    # The overview uses the union of both models' limits.
+    overview_ax = axes[1] if center_overview else axes[0]
+    zoom_axes = (axes[0], axes[2]) if center_overview else axes[1:]
+    zoom_models = list(reversed(models)) if center_overview else models
+    overview_data = {}
+    for model in models:
+        overview_data[model] = draw_model(overview_ax, model)
+    overview_ax.set_title(
+        "CEC vs. CEC-IDAAC",
+        fontsize=18 if center_overview else 12.5,
+        pad=10 if center_overview else None,
+    )
+
+    # Each following panel autoscales independently to expose its trend.
+    for ax, model in zip(zoom_axes, zoom_models):
+        draw_model(
+            ax, model,
+            force_solid=center_overview and model == "CEC_IDAAC",
+        )
+        r_value = correlations.get(model, float("nan"))
+        rendered = f"{r_value:.2f}" if math.isfinite(r_value) else "n/a"
+        label = MODEL_LABELS.get(model, model.replace("_", "-"))
+        ax.set_title(
+            f"{label} ($r$ = {rendered})",
+            fontsize=18 if center_overview else 12.5,
+            pad=10 if center_overview else None,
+        )
+
+    for ax in axes:
+        ax.set_xlabel("Value loss", fontsize=16 if center_overview else None)
+        ax.set_ylabel(
+            "Mean evaluation return",
+            fontsize=16 if center_overview else None,
+        )
+        ax.tick_params(
+            axis="both",
+            labelsize=14 if center_overview else None,
+        )
+        ax.grid(alpha=0.25)
+        # Keep the outer points, their labels, and the overview zoom boxes
+        # comfortably inside the plotting area.
+        ax.margins(x=0.18, y=0.12)
+
+    handles = []
+    for model in models:
+        style = model_styles[model]
+        handles.append(Line2D(
+            [0], [0], color=style["color"], linestyle=style["linestyle"],
+            marker=style["marker"], markerfacecolor="white", markersize=6,
+            linewidth=2.2, label=MODEL_LABELS.get(model, model),
+        ))
+    if not center_overview:
+        figure.legend(
+            handles=handles, loc="upper center", ncol=len(handles),
+            bbox_to_anchor=(0.5, 0.925), frameon=True,
+        )
+    figure.subplots_adjust(
+        left=0.06, right=0.99, bottom=0.14,
+        top=0.91 if center_overview else 0.86, wspace=0.27,
+    )
+    if center_overview:
+        # Mark both data regions in the shared overview and connect them to
+        # their independently scaled detail panels.
+        overview_y = np.concatenate([
+            data[1] for data in overview_data.values() if data is not None
+        ])
+        y_span = float(overview_y.max() - overview_y.min())
+        y_padding = max(y_span * 0.15, 8.0)
+        overview_ax.set_ylim(
+            float(overview_y.min()) - y_padding,
+            float(overview_y.max()) + y_padding,
+        )
+        overview_ax.autoscale(False)
+        for model_index, (model, zoom_ax) in enumerate(zip(zoom_models, zoom_axes)):
+            data = overview_data.get(model)
+            if data is None:
+                continue
+            x, y = data
+            # Keep the overview selection close to the selected data.  A
+            # smaller horizontal pad prevents the box from looking overly
+            # wide relative to its vertical extent.
+            x_pad = max(float(np.ptp(x)) * 0.045, 0.035)
+            y_pad = max(float(np.ptp(y)) * 0.065, 2.5)
+            x0, x1 = float(x.min()) - x_pad, float(x.max()) + x_pad
+            y0, y1 = float(y.min()) - y_pad, float(y.max()) + y_pad
+            style = model_styles[model]
+            overview_ax.add_patch(Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                fill=False, edgecolor=style["color"], linewidth=1.5,
+                linestyle=(0, (4, 3)), zorder=2,
+            ))
+            for spine in zoom_ax.spines.values():
+                spine.set_color(style["color"])
+                spine.set_linewidth(1.4)
+            if model_index == 0:
+                overview_points = ((x0, y0), (x0, y1))
+                zoom_points = ((1.0, 0.0), (1.0, 1.0))
+            else:
+                overview_points = ((x1, y0), (x1, y1))
+                zoom_points = ((0.0, 0.0), (0.0, 1.0))
+            for overview_point, zoom_point in zip(overview_points, zoom_points):
+                figure.add_artist(ConnectionPatch(
+                    xyA=overview_point, coordsA=overview_ax.transData,
+                    xyB=zoom_point, coordsB=zoom_ax.transAxes,
+                    color=style["color"], linewidth=0.9,
+                    linestyle=(0, (3, 3)), alpha=0.65, zorder=0,
+                    clip_on=False,
+                ))
+    figure.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.04)
+    plt.close(figure)
+
+
 def write_csv(path: Path, rows):
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -1141,6 +1318,7 @@ def main():
     if args.plot_mode in (
         "combined", "combined-individual", "mean-comparison",
         "mean-comparison-individual", "mean-comparison-separate",
+        "mean-overview-zoom", "mean-center-zoom",
     ):
         available_models = [
             model for model in args.model_names
@@ -1184,6 +1362,22 @@ def main():
             plot_mean_comparison(
                 run_rows, available_models, combined_path, args.aggregation,
                 shared_scale=False, individual_runs=True,
+            )
+        elif args.plot_mode == "mean-overview-zoom":
+            combined_path = args.output_dir / (
+                f"value_loss_vs_eval_mean_{combined_tag}_overview_zoom_{suffix}.pdf"
+            )
+            plot_mean_overview_zoom(
+                aggregate_rows, available_models, combined_path,
+            )
+        elif args.plot_mode == "mean-center-zoom":
+            combined_path = args.output_dir / (
+                f"value_loss_vs_eval_mean_{combined_tag}_center_overview_zoom_"
+                f"{suffix}.pdf"
+            )
+            plot_mean_overview_zoom(
+                aggregate_rows, available_models, combined_path,
+                center_overview=True,
             )
         else:
             for model in available_models:

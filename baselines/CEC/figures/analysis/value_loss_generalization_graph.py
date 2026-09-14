@@ -116,11 +116,18 @@ def parse_args() -> argparse.Namespace:
         help="Show across-seed standard deviations on both axes.",
     )
     parser.add_argument(
-        "--plot-mode", choices=("aggregate", "individual", "both"),
+        "--plot-mode",
+        choices=(
+            "aggregate", "individual", "both", "combined",
+            "combined-individual", "mean-comparison",
+            "mean-comparison-individual", "mean-comparison-separate",
+        ),
         default="aggregate",
         help=(
             "Plot the original seed-averaged points, all individual seed runs, "
-            "or both. Individual plots use a separate filename."
+            "both, both seed-averaged models overlaid in one figure, or both "
+            "models overlaid using every individual run, or a two-panel mean "
+            "comparison. Additional plots use separate filenames."
         ),
     )
     parser.add_argument(
@@ -573,6 +580,421 @@ def plot_model_individual_runs(
     plt.close(fig)
 
 
+def plot_models_combined(rows, models, output_path: Path, aggregation: str):
+    """Overlay seed-averaged CEC and CEC-IDAAC points in matched panels."""
+    panels = ["mean", *LAYOUTS]
+    fig, axes = plt.subplots(2, 3, figsize=(12.6, 7.6))
+    axes = axes.ravel()
+    model_styles = {
+        "CEC": {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+        "CEC_IDAAC": {"color": "#e68632", "marker": "s", "linestyle": "--"},
+    }
+    correlation_summary = {model: {} for model in models}
+
+    for ax, layout in zip(axes, panels):
+        panel_rows = [row for row in rows if row["eval_layout"] == layout]
+        if not panel_rows:
+            ax.set_visible(False)
+            continue
+
+        for model_index, model in enumerate(models):
+            points = sorted(
+                (row for row in panel_rows if row["model"] == model),
+                key=lambda row: row["num_envs"],
+            )
+            if not points:
+                continue
+            style = model_styles.get(
+                model,
+                {"color": f"C{model_index}", "marker": "o", "linestyle": "-"},
+            )
+            x = np.asarray([row["value_loss_mean"] for row in points], dtype=float)
+            y = np.asarray([row["eval_score_mean"] for row in points], dtype=float)
+            r_value = correlation(x, y)
+            correlation_summary[model][layout] = r_value
+
+            if len(x) >= 2 and not np.allclose(x, x[0]):
+                slope, intercept = np.polyfit(x, y, 1)
+                line_x = np.linspace(float(x.min()), float(x.max()), 100)
+                ax.plot(
+                    line_x, slope * line_x + intercept,
+                    color=style["color"], linestyle=style["linestyle"],
+                    linewidth=2.0, alpha=0.9, zorder=1,
+                )
+            ax.scatter(
+                x, y, s=43, color=style["color"], marker=style["marker"],
+                edgecolors="white", linewidths=0.6, zorder=3,
+            )
+
+            x_mid = (float(x.min()) + float(x.max())) / 2.0
+            y_mid = (float(y.min()) + float(y.max())) / 2.0
+            for point, px, py in zip(points, x, y):
+                label_dx = -5 if px > x_mid else 5
+                # Opposite default vertical directions help separate methods;
+                # top-edge points are always labelled downward.
+                label_dy = 5 if model_index == 0 else -5
+                if py >= y_mid and math.isclose(py, float(y.max())):
+                    label_dy = -5
+                ax.annotate(
+                    str(point["num_envs"]), (px, py),
+                    xytext=(label_dx, label_dy), textcoords="offset points",
+                    ha="right" if label_dx < 0 else "left",
+                    va="top" if label_dy < 0 else "bottom",
+                    fontsize=7.5, color=style["color"], zorder=4,
+                    bbox={"facecolor": "white", "edgecolor": "none",
+                          "pad": 0.12, "alpha": 0.82},
+                )
+
+        ax.set_title(LAYOUT_LABELS[layout], fontsize=11)
+        ax.grid(alpha=0.25)
+        ax.margins(x=0.07, y=0.10)
+
+    for index, ax in enumerate(axes):
+        if not ax.get_visible():
+            continue
+        if index // 3 == 1:
+            ax.set_xlabel(
+                "Value loss (last logged value)"
+                if aggregation == "last"
+                else "Value loss (final-window mean)"
+            )
+        if index % 3 == 0:
+            ax.set_ylabel("Evaluation return")
+
+    handles = []
+    for model_index, model in enumerate(models):
+        style = model_styles.get(
+            model,
+            {"color": f"C{model_index}", "marker": "o", "linestyle": "-"},
+        )
+        handles.append(Line2D(
+            [0], [0], color=style["color"], linestyle=style["linestyle"],
+            marker=style["marker"], markersize=6, linewidth=2,
+            label=MODEL_LABELS.get(model, model.replace("_", "-")),
+        ))
+    fig.legend(
+        handles=handles, loc="upper center", ncol=len(handles),
+        bbox_to_anchor=(0.5, 0.945), frameon=True,
+    )
+    fig.text(
+        0.5, 0.982, "Value Loss and Generalization: CEC vs CEC-IDAAC",
+        ha="center", va="top", fontsize=15,
+    )
+    fig.subplots_adjust(
+        left=0.068, right=0.988, bottom=0.17, top=0.855,
+        wspace=0.27, hspace=0.42,
+    )
+    # Place each correlation summary directly below its layout panel instead
+    # of using a single footer or covering the plotted data.
+    for index, (ax, layout) in enumerate(zip(axes, panels)):
+        if not ax.get_visible():
+            continue
+        values = []
+        for model in models:
+            value = correlation_summary[model].get(layout, float("nan"))
+            rendered = f"{value:.2f}" if math.isfinite(value) else "n/a"
+            short_name = "CEC-IDAAC" if model == "CEC_IDAAC" else MODEL_LABELS.get(model, model)
+            values.append(f"{short_name} {rendered}")
+        bounds = ax.get_position()
+        text_y = bounds.y0 - (0.055 if index < 3 else 0.105)
+        fig.text(
+            (bounds.x0 + bounds.x1) / 2.0, text_y,
+            "Pearson r: " + " | ".join(values),
+            ha="center", va="center", fontsize=8.2,
+        )
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
+def plot_models_combined_individual(
+    rows, models, output_path: Path, aggregation: str,
+):
+    """Overlay all seed runs for multiple models without seed-mean markers."""
+    panels = ["mean", *LAYOUTS]
+    fig, axes = plt.subplots(2, 3, figsize=(12.6, 7.6))
+    axes = axes.ravel()
+    model_styles = {
+        "CEC": {"line_color": "#377eb8", "marker": "o", "linestyle": "-"},
+        "CEC_IDAAC": {
+            "line_color": "#e68632", "marker": "s", "linestyle": "--",
+        },
+    }
+    correlation_summary = {model: {} for model in models}
+
+    for ax, layout in zip(axes, panels):
+        panel_rows = [row for row in rows if row["eval_layout"] == layout]
+        if not panel_rows:
+            ax.set_visible(False)
+            continue
+
+        for model_index, model in enumerate(models):
+            points = [row for row in panel_rows if row["model"] == model]
+            if not points:
+                continue
+            style = model_styles.get(
+                model,
+                {"line_color": f"C{model_index}", "marker": "o", "linestyle": "-"},
+            )
+            all_x = np.asarray(
+                [row["value_loss_mean"] for row in points], dtype=float,
+            )
+            all_y = np.asarray(
+                [row["eval_score_mean"] for row in points], dtype=float,
+            )
+            r_value = correlation(all_x, all_y)
+            correlation_summary[model][layout] = r_value
+            if len(all_x) >= 2 and not np.allclose(all_x, all_x[0]):
+                slope, intercept = np.polyfit(all_x, all_y, 1)
+                line_x = np.linspace(float(all_x.min()), float(all_x.max()), 100)
+                ax.plot(
+                    line_x, slope * line_x + intercept,
+                    color=style["line_color"], linestyle=style["linestyle"],
+                    linewidth=2.0, zorder=1,
+                )
+
+            for num_envs in sorted({row["num_envs"] for row in points}):
+                group = [row for row in points if row["num_envs"] == num_envs]
+                x = [row["value_loss_mean"] for row in group]
+                y = [row["eval_score_mean"] for row in group]
+                ax.scatter(
+                    x, y, s=31, marker=style["marker"],
+                    color=COLORS.get(num_envs, "#1f4e99"), alpha=0.62,
+                    edgecolors="white", linewidths=0.5, zorder=3,
+                )
+
+        ax.set_title(LAYOUT_LABELS[layout], fontsize=11)
+        ax.grid(alpha=0.25)
+        ax.margins(x=0.06, y=0.08)
+
+    for index, ax in enumerate(axes):
+        if not ax.get_visible():
+            continue
+        if index // 3 == 1:
+            ax.set_xlabel(
+                "Value loss (last logged value)"
+                if aggregation == "last"
+                else "Value loss (final-window mean)"
+            )
+        if index % 3 == 0:
+            ax.set_ylabel("Evaluation return")
+
+    method_handles = []
+    for model_index, model in enumerate(models):
+        style = model_styles.get(
+            model,
+            {"line_color": f"C{model_index}", "marker": "o", "linestyle": "-"},
+        )
+        method_handles.append(Line2D(
+            [0], [0], color=style["line_color"],
+            linestyle=style["linestyle"], marker=style["marker"],
+            markerfacecolor="white", markersize=6, linewidth=2,
+            label=MODEL_LABELS.get(model, model.replace("_", "-")),
+        ))
+    env_handles = [
+        Line2D(
+            [0], [0], marker="o", linestyle="none", markersize=6,
+            markerfacecolor=COLORS.get(num_envs, "#1f4e99"),
+            markeredgecolor="white", label=f"{num_envs} envs",
+        )
+        for num_envs in sorted({row["num_envs"] for row in rows})
+    ]
+    fig.legend(
+        handles=method_handles + env_handles, loc="upper center",
+        ncol=len(method_handles + env_handles), bbox_to_anchor=(0.5, 0.945),
+        frameon=True, fontsize=9,
+    )
+    fig.text(
+        0.5, 0.982,
+        "Value Loss and Generalization: CEC vs CEC-IDAAC (Individual Runs)",
+        ha="center", va="top", fontsize=15,
+    )
+    fig.subplots_adjust(
+        left=0.068, right=0.988, bottom=0.17, top=0.855,
+        wspace=0.27, hspace=0.42,
+    )
+    for index, (ax, layout) in enumerate(zip(axes, panels)):
+        if not ax.get_visible():
+            continue
+        values = []
+        for model in models:
+            value = correlation_summary[model].get(layout, float("nan"))
+            rendered = f"{value:.2f}" if math.isfinite(value) else "n/a"
+            short_name = (
+                "CEC-IDAAC" if model == "CEC_IDAAC"
+                else MODEL_LABELS.get(model, model)
+            )
+            values.append(f"{short_name} {rendered}")
+        bounds = ax.get_position()
+        text_y = bounds.y0 - (0.055 if index < 3 else 0.105)
+        fig.text(
+            (bounds.x0 + bounds.x1) / 2.0, text_y,
+            "Pearson r: " + " | ".join(values),
+            ha="center", va="center", fontsize=8.2,
+        )
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
+def plot_mean_comparison(
+    rows, models, output_path: Path, aggregation: str, shared_scale: bool,
+    individual_runs: bool = False,
+):
+    """Place only the macro-mean panel for each model side by side."""
+    fig, axes = plt.subplots(
+        1, len(models), figsize=(10.8, 4.6),
+        sharex=shared_scale, sharey=shared_scale,
+    )
+    axes = np.atleast_1d(axes)
+    model_styles = {
+        "CEC": {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+        "CEC_IDAAC": {"color": "#e68632", "marker": "s", "linestyle": "--"},
+    }
+    correlations = {}
+
+    for model_index, (ax, model) in enumerate(zip(axes, models)):
+        points = sorted(
+            (
+                row for row in rows
+                if row["model"] == model and row["eval_layout"] == "mean"
+            ),
+            key=lambda row: row["num_envs"],
+        )
+        if not points:
+            ax.set_visible(False)
+            continue
+        style = model_styles.get(
+            model,
+            {"color": f"C{model_index}", "marker": "o", "linestyle": "-"},
+        )
+        x = np.asarray([row["value_loss_mean"] for row in points], dtype=float)
+        y = np.asarray([row["eval_score_mean"] for row in points], dtype=float)
+        correlations[model] = correlation(x, y)
+        if len(x) >= 2 and not np.allclose(x, x[0]):
+            slope, intercept = np.polyfit(x, y, 1)
+            line_x = np.linspace(float(x.min()), float(x.max()), 100)
+            ax.plot(
+                line_x, slope * line_x + intercept,
+                color=style["color"], linestyle=style["linestyle"],
+                linewidth=2.2, zorder=1,
+            )
+        x_mid = (float(x.min()) + float(x.max())) / 2.0
+        y_mid = (float(y.min()) + float(y.max())) / 2.0
+        for point, px, py in zip(points, x, y):
+            env_color = COLORS.get(point["num_envs"], "#1f4e99")
+            ax.scatter(
+                [px], [py], s=55, color=env_color, marker=style["marker"],
+                edgecolors="white", linewidths=0.7,
+                alpha=0.68 if individual_runs else 1.0, zorder=3,
+            )
+            if individual_runs:
+                continue
+            dx = -6 if px > x_mid else 6
+            dy = -6 if py > y_mid else 6
+            ax.annotate(
+                str(point["num_envs"]), (px, py),
+                xytext=(dx, dy), textcoords="offset points",
+                ha="right" if dx < 0 else "left",
+                va="top" if dy < 0 else "bottom",
+                fontsize=9, color=env_color, zorder=4,
+                bbox={"facecolor": "white", "edgecolor": "none",
+                      "pad": 0.15, "alpha": 0.84},
+            )
+        r_value = correlations[model]
+        r_text = f"r = {r_value:.2f}" if math.isfinite(r_value) else "r = n/a"
+        ax.set_title(
+            f"{MODEL_LABELS.get(model, model.replace('_', '-'))}     {r_text}",
+            fontsize=13,
+        )
+        ax.set_xlabel(
+            "Value loss (last logged value)"
+            if aggregation == "last"
+            else "Value loss (final-window mean)"
+        )
+        ax.set_ylabel("Mean evaluation return")
+        ax.grid(alpha=0.25)
+        ax.margins(x=0.10, y=0.12)
+
+    scale_label = "Shared axes" if shared_scale else "Independent axes"
+    run_label = ", Individual Runs" if individual_runs else ""
+    fig.text(
+        0.5, 0.98,
+        f"Mean Value Loss and Generalization: CEC vs CEC-IDAAC "
+        f"({scale_label}{run_label})",
+        ha="center", va="top", fontsize=14,
+    )
+    fig.subplots_adjust(
+        left=0.075, right=0.985, bottom=0.14, top=0.88,
+        wspace=0.16 if shared_scale else 0.24,
+    )
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
+def plot_mean_separate(model, rows, output_path: Path):
+    """Plot one seed-averaged macro-mean panel without a figure/model title."""
+    points = sorted(
+        (
+            row for row in rows
+            if row["model"] == model and row["eval_layout"] == "mean"
+        ),
+        key=lambda row: row["num_envs"],
+    )
+    if not points:
+        raise RuntimeError(f"No macro-mean data available for model={model}.")
+
+    model_styles = {
+        "CEC": {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+        "CEC_IDAAC": {"color": "#e68632", "marker": "s", "linestyle": "--"},
+    }
+    style = model_styles.get(
+        model, {"color": "#377eb8", "marker": "o", "linestyle": "-"},
+    )
+    x = np.asarray([row["value_loss_mean"] for row in points], dtype=float)
+    y = np.asarray([row["eval_score_mean"] for row in points], dtype=float)
+    r_value = correlation(x, y)
+
+    fig, ax = plt.subplots(figsize=(5.4, 4.5))
+    if len(x) >= 2 and not np.allclose(x, x[0]):
+        slope, intercept = np.polyfit(x, y, 1)
+        line_x = np.linspace(float(x.min()), float(x.max()), 100)
+        ax.plot(
+            line_x, slope * line_x + intercept,
+            color=style["color"], linestyle=style["linestyle"],
+            linewidth=2.2, zorder=1,
+        )
+
+    x_mid = (float(x.min()) + float(x.max())) / 2.0
+    y_mid = (float(y.min()) + float(y.max())) / 2.0
+    for point, px, py in zip(points, x, y):
+        env_color = COLORS.get(point["num_envs"], "#1f4e99")
+        ax.scatter(
+            [px], [py], s=58, color=env_color, marker=style["marker"],
+            edgecolors="white", linewidths=0.7, zorder=3,
+        )
+        dx = -6 if px > x_mid else 6
+        dy = -6 if py > y_mid else 6
+        ax.annotate(
+            str(point["num_envs"]), (px, py),
+            xytext=(dx, dy), textcoords="offset points",
+            ha="right" if dx < 0 else "left",
+            va="top" if dy < 0 else "bottom",
+            fontsize=9, color=env_color, zorder=4,
+            bbox={"facecolor": "white", "edgecolor": "none",
+                  "pad": 0.15, "alpha": 0.84},
+        )
+
+    rendered_r = f"{r_value:.2f}" if math.isfinite(r_value) else "n/a"
+    model_label = MODEL_LABELS.get(model, model.replace("_", "-"))
+    ax.set_title(f"{model_label} ($r$ = {rendered_r})", fontsize=13, pad=8)
+    ax.set_xlabel("Value loss")
+    ax.set_ylabel("Mean evaluation return")
+    ax.grid(alpha=0.25)
+    ax.margins(x=0.11, y=0.13)
+    fig.subplots_adjust(left=0.15, right=0.98, bottom=0.14, top=0.98)
+    fig.savefig(output_path, dpi=200, bbox_inches="tight", pad_inches=0.04)
+    plt.close(fig)
+
+
 def write_csv(path: Path, rows):
     with path.open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -715,6 +1137,65 @@ def main():
                 model, run_rows, individual_path, args.aggregation,
             )
             print(f"Saved: {individual_path}")
+
+    if args.plot_mode in (
+        "combined", "combined-individual", "mean-comparison",
+        "mean-comparison-individual", "mean-comparison-separate",
+    ):
+        available_models = [
+            model for model in args.model_names
+            if any(row["model"] == model for row in aggregate_rows)
+        ]
+        if len(available_models) < 2:
+            raise RuntimeError(
+                "The selected plot mode requires at least two models with data."
+            )
+        combined_tag = "_vs_".join(model.lower() for model in available_models)
+        if args.plot_mode == "combined":
+            combined_path = args.output_dir / (
+                f"value_loss_vs_eval_{combined_tag}_{suffix}.pdf"
+            )
+            plot_models_combined(
+                aggregate_rows, available_models, combined_path, args.aggregation,
+            )
+        elif args.plot_mode == "combined-individual":
+            combined_path = args.output_dir / (
+                f"value_loss_vs_eval_{combined_tag}_individual_runs_{suffix}.pdf"
+            )
+            plot_models_combined_individual(
+                run_rows, available_models, combined_path, args.aggregation,
+            )
+        elif args.plot_mode == "mean-comparison":
+            for shared_scale, scale_tag in ((True, "shared_scale"), (False, "independent_scale")):
+                combined_path = args.output_dir / (
+                    f"value_loss_vs_eval_mean_{combined_tag}_{scale_tag}_{suffix}.pdf"
+                )
+                plot_mean_comparison(
+                    aggregate_rows, available_models, combined_path,
+                    args.aggregation, shared_scale,
+                )
+                print(f"Saved: {combined_path}")
+            combined_path = None
+        elif args.plot_mode == "mean-comparison-individual":
+            combined_path = args.output_dir / (
+                f"value_loss_vs_eval_mean_{combined_tag}_individual_runs_"
+                f"independent_scale_{suffix}.pdf"
+            )
+            plot_mean_comparison(
+                run_rows, available_models, combined_path, args.aggregation,
+                shared_scale=False, individual_runs=True,
+            )
+        else:
+            for model in available_models:
+                separate_path = args.output_dir / (
+                    f"value_loss_vs_eval_mean_{model.lower()}_"
+                    f"independent_scale_{suffix}.pdf"
+                )
+                plot_mean_separate(model, aggregate_rows, separate_path)
+                print(f"Saved: {separate_path}")
+            combined_path = None
+        if combined_path is not None:
+            print(f"Saved: {combined_path}")
 
 
 if __name__ == "__main__":

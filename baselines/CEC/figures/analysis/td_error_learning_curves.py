@@ -192,14 +192,23 @@ def plot_num_envs(rows, args, num_envs, output_path):
     ]
     fig.legend(
         handles=handles, loc="upper center", ncol=2,
-        bbox_to_anchor=(0.5, 0.90), frameon=True,
+        bbox_to_anchor=(0.5, 0.91), frameon=True,
     )
-    fig.suptitle(
-        f"{args.model_name.replace('_', '-')}: Train vs Evaluation TD-error Learning Curves\n"
+    model_label = args.model_name.replace("_", "-")
+    fig.text(
+        0.5, 0.982,
+        f"{model_label}: Train vs Evaluation TD-error Learning Curves",
+        ha="center", va="top", fontsize=14,
+    )
+    fig.text(
+        0.5, 0.948,
         f"NUM_ENVS={num_envs}, NUM_MINIBATCHES={args.num_minibatches}",
-        fontsize=14,
+        ha="center", va="top", fontsize=12,
     )
-    fig.tight_layout(rect=(0.02, 0.01, 0.99, 0.81))
+    fig.subplots_adjust(
+        left=0.07, right=0.985, bottom=0.09, top=0.80,
+        wspace=0.22, hspace=0.28,
+    )
     fig.savefig(output_path)
     plt.close(fig)
 

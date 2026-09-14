@@ -1,6 +1,7 @@
 """Cross-algorithm XP result heatmaps — directional (role-labeled) and symmetric versions."""
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -10,18 +11,21 @@ import pandas as pd
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
-RESULTS_DIR = Path(__file__).parent.parent / "results" / "cross_algo"
-SAVE_DIR = Path(__file__).parent / "results" / "cross_algo_graph"
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_RESULTS_DIR = Path(__file__).parent.parent / "results" / "cross_algo"
+DEFAULT_SAVE_DIR = Path(__file__).parent / "results" / "cross_algo_graph"
 
 ALGO_RENAME = {
-    "ik":          "CEC",
-    "sk":          "IPPO",
-    "fcp":         "FCP",
-    "e3t":         "E3T",
-    "ik_pop_art":  "CEC-PopArt",
+    "IPPO": "IPPO",
+    "E3T": "E3T",
+    "FCP": "FCP",
+    "CEC_envs64": "CEC (64)",
+    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
+    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
 }
-ALGO_ORDER = ["IPPO", "E3T", "FCP", "CEC", "CEC-PopArt"]
+ALGO_ORDER = [
+    "IPPO", "E3T", "FCP", "CEC (64)",
+    "CEC-IDAAC (32)", "CEC-IDAAC (256)",
+]
 
 LAYOUT_ORDER = [
     "asymm_advantages_9",
@@ -92,7 +96,10 @@ def plot_heatmap(ax: plt.Axes, data: pd.DataFrame, title: str,
     return im
 
 
-def save_figures(pivots_raw: dict, tag: str, xlabel: str, ylabel: str, suptitle: str):
+def save_figures(
+    pivots_raw: dict, tag: str, xlabel: str, ylabel: str, suptitle: str,
+    save_dir: Path,
+):
     """Generate per-layout + overall figures for a given pivot set."""
     pivots_norm = {layout: normalize_pivot(p) for layout, p in pivots_raw.items()}
 
@@ -112,8 +119,8 @@ def save_figures(pivots_raw: dict, tag: str, xlabel: str, ylabel: str, suptitle:
     cbar.set_label("Normalized Reward", fontsize=10)
     fig.suptitle(f"{suptitle} — per Layout", fontsize=13, y=1.01)
 
-    out = SAVE_DIR / f"cross_algo_per_layout_{tag}.png"
-    fig.savefig(out, dpi=150, bbox_inches="tight")
+    out = save_dir / f"cross_algo_per_layout_{tag}.pdf"
+    fig.savefig(out, bbox_inches="tight")
     print(f"Saved: {out}")
     plt.close(fig)
 
@@ -134,8 +141,8 @@ def save_figures(pivots_raw: dict, tag: str, xlabel: str, ylabel: str, suptitle:
     cbar2.set_label("Normalized Reward", fontsize=10)
     fig2.suptitle(f"{suptitle} — Overall", fontsize=13)
 
-    out2 = SAVE_DIR / f"cross_algo_overall_{tag}.png"
-    fig2.savefig(out2, dpi=150, bbox_inches="tight")
+    out2 = save_dir / f"cross_algo_overall_{tag}.pdf"
+    fig2.savefig(out2, bbox_inches="tight")
     print(f"Saved: {out2}")
     plt.close(fig2)
 
@@ -144,8 +151,13 @@ def save_figures(pivots_raw: dict, tag: str, xlabel: str, ylabel: str, suptitle:
 # Main
 # ──────────────────────────────────────────────
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--results-dir", type=Path, default=DEFAULT_RESULTS_DIR)
+    parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR)
+    args = parser.parse_args()
+    args.save_dir.mkdir(parents=True, exist_ok=True)
     csv_files = {
-        layout: RESULTS_DIR / f"{layout}_cross_algo_eval_onIK.csv"
+        layout: args.results_dir / f"{layout}_cross_algo_results.csv"
         for layout in LAYOUT_ORDER
     }
     missing = [l for l, p in csv_files.items() if not p.exists()]
@@ -168,6 +180,7 @@ def main():
         xlabel="Algorithm 2 (Agent 1)",
         ylabel="Algorithm 1 (Agent 0)",
         suptitle="Cross-Algorithm XP (Directional)",
+        save_dir=args.save_dir,
     )
 
     # Version 2: symmetric — average both role assignments
@@ -178,6 +191,7 @@ def main():
         xlabel="Algorithm",
         ylabel="Algorithm",
         suptitle="Cross-Algorithm XP (Symmetric)",
+        save_dir=args.save_dir,
     )
 
 

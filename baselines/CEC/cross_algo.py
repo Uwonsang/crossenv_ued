@@ -1,369 +1,269 @@
-"""
-Based on PureJaxRL Implementation of PPO.
+"""Evaluate directional cross-play between selected ICRL algorithms.
 
-Note, this file will only work for MPE environments with homogenous agents (e.g. Simple Spread).
-
+Each invocation evaluates one layout. Agent 0 uses ``algo_1`` and agent 1
+uses ``algo_2``; both role directions are retained in the output CSV. For
+same-algorithm cells, XP_ONLY excludes identical checkpoint seeds.
 """
-import os
+from __future__ import annotations
+
+import glob
 import pickle
+import re
+from pathlib import Path
+
+import distrax
+import hydra
 import jax
 import jax.numpy as jnp
 import numpy as np
-import distrax
-import hydra
+import pandas as pd
 from omegaconf import OmegaConf
 
 import jaxmarl
-from jaxmarl.wrappers.baselines import LogWrapper
 from jaxmarl.environments.overcooked import overcooked_layouts
-from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, make_forced_coord_9x9, make_coord_ring_9x9, make_asymm_advantages_9x9, make_cramped_room_9x9
 
-from jax_tqdm import scan_tqdm
-import pandas as pd
-from tqdm import tqdm
-from actor_networks import ScannedRNN, ActorCriticE3T, ActorCriticRNN
+from actor_networks import (
+    ActorCriticE3T,
+    ActorCriticRNN,
+    IDAACActorRNN,
+    ScannedRNN,
+)
+
+
+DEFAULT_MODELS = [
+    "IPPO",
+    "E3T",
+    "FCP",
+    "CEC_envs64",
+    "CEC_IDAAC_envs32",
+    "CEC_IDAAC_envs256",
+]
+
+MODEL_SPECS = {
+    "IPPO": {"family": "IPPO", "network": "rnn", "seeds": [0, 1, 2, 3, 5, 6]},
+    "E3T": {"family": "E3T", "network": "e3t", "seeds": [0, 1, 2, 3, 4, 5]},
+    "FCP": {"family": "FCP", "network": "rnn", "seeds": [0, 1, 2, 3, 4, 5]},
+    "CEC_envs64": {
+        "family": "CEC", "network": "rnn", "num_envs": 64,
+        "seeds": [0, 1, 2, 3, 4, 5],
+    },
+    "CEC_IDAAC_envs32": {
+        "family": "CEC_IDAAC", "network": "idaac", "num_envs": 32,
+        "seeds": [0, 1, 2, 3, 4, 5],
+    },
+    "CEC_IDAAC_envs256": {
+        "family": "CEC_IDAAC", "network": "idaac", "num_envs": 256,
+        "seeds": [0, 1, 2, 3, 4, 5],
+    },
+}
+
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
-    config['layout_name'] = layout_name
+    if layout_name not in overcooked_layouts:
+        raise ValueError(f"Unknown Overcooked layout: {layout_name}")
+    config["layout_name"] = layout_name
     config["ENV_KWARGS"]["layout"] = overcooked_layouts[layout_name]
     env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
-
-    if config["ENV_NAME"] == "overcooked":
-        def reset_env(key):
-            def reset_sub_dict(key, fn):
-                key, subkey = jax.random.split(key)
-                sampled_layout_dict = fn(subkey, ik=True)
-                temp_o, temp_s = env.custom_reset(key, layout=sampled_layout_dict, random_reset=False, shuffle_inv_and_pot=False)
-                key, subkey = jax.random.split(key)
-                return (temp_o, temp_s), key
-                
-            asymm_reset, key = reset_sub_dict(key, make_asymm_advantages_9x9)
-            coord_ring_reset, key = reset_sub_dict(key, make_coord_ring_9x9)
-            counter_circuit_reset, key = reset_sub_dict(key, make_counter_circuit_9x9)
-            forced_coord_reset, key = reset_sub_dict(key, make_forced_coord_9x9)
-            cramped_room_reset, key = reset_sub_dict(key, make_cramped_room_9x9)
-            layout_resets = [asymm_reset, coord_ring_reset, counter_circuit_reset, forced_coord_reset, cramped_room_reset]
-            # stack all layouts
-            stacked_layout_reset = jax.tree.map(lambda *x: jnp.stack(x), *layout_resets)
-            # sample an index from 0 to 4
-            index = jax.random.randint(key, (), minval=0, maxval=5)
-            sampled_reset = jax.tree.map(lambda x: x[index], stacked_layout_reset)
-            return sampled_reset
-        @scan_tqdm(100)
-        def gen_held_out(runner_state, unused):
-            (i,) = runner_state
-            _, ho_state = reset_env(jax.random.key(i))
-            res = (ho_state.goal_pos, ho_state.wall_map, ho_state.pot_pos)
-            carry = (i+1,)
-            return carry, res
-        carry, res = jax.lax.scan(gen_held_out, (0,), jnp.arange(100), 100)
-        ho_goal, ho_wall, ho_pot = [], [], []
-        for layout_name, layout_dict in overcooked_layouts.items():  # add hand crafted ones to heldout set
-            if "9" in layout_name:
-                _, ho_state = env.custom_reset(jax.random.PRNGKey(0), random_reset=False, shuffle_inv_and_pot=False, layout=layout_dict)
-                ho_goal.append(ho_state.goal_pos)
-                ho_wall.append(ho_state.wall_map)
-                ho_pot.append(ho_state.pot_pos)
-        ho_goal = jnp.stack(ho_goal, axis=0)
-        ho_wall = jnp.stack(ho_wall, axis=0)
-        ho_pot = jnp.stack(ho_pot, axis=0)
-        ho_goal = jnp.concatenate([res[0], ho_goal], axis=0)
-        ho_wall = jnp.concatenate([res[1], ho_wall], axis=0)
-        ho_pot = jnp.concatenate([res[2], ho_pot], axis=0)
-        env.held_out_goal, env.held_out_wall, env.held_out_pot = (ho_goal, ho_wall, ho_pot)
-    elif config["ENV_NAME"] == "ToyCoop":
-        # Generate 100 held-out states for ToyCoop
-        @scan_tqdm(100)
-        def gen_held_out_toycoop(runner_state, unused):
-            (i,) = runner_state
-            key = jax.random.key(i)
-            state = env.custom_reset_fn(key, random_reset=True)
-            res = (state.agent_pos, state.goal_pos)
-            carry = (i+1,)
-            return carry, res
-        
-        carry, res = jax.lax.scan(gen_held_out_toycoop, (0,), jnp.arange(100), 100)
-        ho_agent_pos, ho_goal_pos = res
-        
-        # Set the held-out states in the environment
-        env.held_out_agent_pos = ho_agent_pos
-        env.held_out_goal_pos = ho_goal_pos
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
 
-def get_rollouts(model_param_1, model_param_2, config, env, network_1, network_2, seed=0):
-    
-    def _step(carry, unused):
-        train_state_params_1, train_state_params_2, env_state, last_obs, last_done, hstate_1, hstate_2, rng = carry
-        
-        # Select action
-        rng, _rng = jax.random.split(rng)
-        obs_batch = jnp.stack([last_obs[a].flatten() for a in env.agents])
+def checkpoint_patterns(model_name: str, seed: int, model_root: Path, layout: str):
+    spec = MODEL_SPECS[model_name]
+    family = spec["family"]
+    root = model_root / family
+    if family in {"CEC", "CEC_IDAAC"}:
+        num_envs = spec["num_envs"]
+        return [str(root / str(num_envs) / f"seed{seed}" / f"seed{seed}_ckpt*.pkl")]
+    if family == "IPPO":
+        return [str(root / layout / f"seed{seed}" / f"seed{seed}_best.pkl")]
+    if family == "E3T":
+        return [str(root / layout / f"seed{seed}" / f"seed{seed}_best_e3t.pkl")]
+    if family == "FCP":
+        return [str(root / layout / f"seed{seed}" / f"fcp_seed{seed}_best.pkl")]
+    raise ValueError(f"Unsupported model family: {family}")
 
-        agent_positions = jnp.stack([env_state.env_state.agent_pos for a in env.agents])
-        ac_in = (
-            obs_batch[np.newaxis, :],
-            last_done[np.newaxis, :],
-            agent_positions[np.newaxis, :]
+
+def checkpoint_sort_key(path: str):
+    numbers = re.findall(r"(?:updates|ckpt)(\d+)", Path(path).name)
+    return tuple(int(number) for number in numbers) or (0,)
+
+
+def find_checkpoint(model_name: str, seed: int, model_root: Path, layout: str):
+    matches = []
+    for pattern in checkpoint_patterns(model_name, seed, model_root, layout):
+        matches.extend(glob.glob(pattern))
+    return max(matches, key=checkpoint_sort_key) if matches else None
+
+
+def load_model_group(model_name: str, config, layout: str):
+    if model_name not in MODEL_SPECS:
+        raise ValueError(
+            f"Unknown model {model_name}. Available: {', '.join(MODEL_SPECS)}"
         )
-        res = network_1.apply(train_state_params_1, hstate_1, ac_in)
-        hstate_1, pi_1, value_1 = res[0], res[1], res[2]
-        pi_1 = distrax.Categorical(logits=pi_1.logits * config["TEST_KWARGS"]["beta"])
-        res = network_2.apply(train_state_params_2, hstate_2, ac_in)
-        hstate_2, pi_2, value_2 = res[0], res[1], res[2]
-        pi_2 = distrax.Categorical(logits=pi_2.logits * config["TEST_KWARGS"]["beta"])
-
-        action_1 = pi_1.sample(seed=_rng)[0]
-        action_1 = jnp.where(config["TEST_KWARGS"]["argmax"], jnp.argmax(pi_1.probs, 2)[0], action_1)
-        action_1_prob_distrib = pi_1.probs[0, 0, :]
-        action_2 = pi_2.sample(seed=_rng)[0]
-        action_2 = jnp.where(config["TEST_KWARGS"]["argmax"], jnp.argmax(pi_2.probs, 2)[0], action_2)
-        action_2_prob_distrib = pi_2.probs[0, 1, :]
-        action_prob_dict = {env.agents[0]: action_1_prob_distrib, env.agents[1]: action_2_prob_distrib}
-
-        # Convert action to env format
-        env_act = {env.agents[0]: action_1[0], env.agents[1]: action_2[1]}
-
-        # Step environment
-        rng, _rng = jax.random.split(rng)
-        obsv, env_state, reward, done, info = env.step(_rng, env_state, env_act)
-        
-        done_batch = jnp.array([done[a] for a in env.agents])
-        transition = (env_state.env_state, obsv, done_batch, env_act, reward, action_prob_dict)
-        carry = (train_state_params_1, train_state_params_2, env_state, obsv, done_batch, hstate_1, hstate_2, rng)
-        return carry, transition
-    
-    # Initialize environment and RNN state
-    rng = jax.random.PRNGKey(seed)
-
-    def get_rollout(rng, train_state_params_1=model_param_1, train_state_params_2=model_param_2, env=env, config=config):
-        rng, _rng = jax.random.split(rng)
-        obsv, env_state = env.reset(_rng)
-        init_hstate_1 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
-        init_hstate_2 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
-        done_batch = jnp.zeros(env.num_agents, dtype=bool)
-        
-        init_carry = (train_state_params_1, train_state_params_2, env_state, obsv, done_batch, init_hstate_1, init_hstate_2, rng)
-        _, trajectory = jax.lax.scan(_step, init_carry, None, config["NUM_STEPS"])
-        return trajectory, env_state.env_state, obsv
-
-    rollouts_fn = jax.jit(jax.vmap(get_rollout, in_axes=(0,)))
-    rollouts_res = rollouts_fn(jax.random.split(rng, config["TEST_KWARGS"]["num_trajs"]))
-    trajectories, init_env_states, init_obsvs = rollouts_res
-    return (trajectories, init_env_states, init_obsvs)
-
-def load_ik_models(config):
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"{config['MODEL_PATH']}/CEC/seed{seed}/seed{seed}_ckpt0_improved_updates58593.pkl"
-        try:
-            with open(load_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
+    spec = MODEL_SPECS[model_name]
+    model_root = Path(config["MODEL_PATH"])
+    params, seeds, paths = [], [], []
+    for seed in spec["seeds"]:
+        checkpoint = find_checkpoint(model_name, seed, model_root, layout)
+        if checkpoint is None:
+            print(f"Missing checkpoint: model={model_name}, seed={seed}")
             continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
-
-def load_ik_finetune_models(config):
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"ckpts/ippo/{config['ENV_NAME']}/{config['ENV_KWARGS']['layout']}/ikFalse/reset_all/graphTrue"
         try:
-            with open(f"{load_path}/seed{seed}_ckpt1_improved_finetune.pkl", "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
-            continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
+            with open(checkpoint, "rb") as file:
+                params.append(pickle.load(file)["params"])
+            seeds.append(seed)
+            paths.append(checkpoint)
+            print(f"Loaded {model_name} seed {seed}: {checkpoint}")
+        except (OSError, KeyError, pickle.UnpicklingError) as exc:
+            print(f"Failed checkpoint: model={model_name}, seed={seed}: {exc}")
+    if not params:
+        raise RuntimeError(f"No checkpoints found for model={model_name}")
+    param_stack = jax.tree.map(lambda *values: jnp.stack(values), *params)
+    return {
+        "name": model_name,
+        "params": param_stack,
+        "seeds": jnp.asarray(seeds),
+        "paths": paths,
+        "network_type": spec["network"],
+    }
 
-def load_sk_models(config): #ippo
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"{config['MODEL_PATH']}/IPPO/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_final.pkl"
-        try:
-            with open(load_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
-            continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
 
-def load_e3t_models(config):
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"{config['MODEL_PATH']}/E3T/{config['ENV_KWARGS']['layout']}/seed{seed}/seed{seed}_best_e3t.pkl"
-        try:
-            with open(load_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
-            continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
+def make_network(network_type: str, env, config):
+    action_dim = env.action_space(env.agents[0]).n
+    if network_type == "idaac":
+        return IDAACActorRNN(action_dim, config=config)
+    if network_type == "e3t":
+        return ActorCriticE3T(action_dim, config=config)
+    return ActorCriticRNN(action_dim, config=config)
 
-def load_fcp_models(config):
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"{config['MODEL_PATH']}/FCP/{config['ENV_KWARGS']['layout']}/seed{seed}/fcp_seed{seed}_best.pkl"
-        try:
-            with open(load_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
-            continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
 
-def load_ik_models_pop_art(config):
-    param_list = []
-    seed_list = []
-    for seed in range(config['NUM_MODELS']):
-        load_path = f"{config['MODEL_PATH']}/CEC_POP_ART/seed{seed}/seed{seed}_ckpt0_improved_pop_updates29296.pkl"
-        try:
-            with open(load_path, "rb") as f:
-                previous_ckpt = pickle.load(f)
-                model_params = previous_ckpt['params']
-                import flax.core
-                p = flax.core.unfreeze(model_params)
-                if 'critic_output' in p.get('params', {}):
-                    p['params']['Dense_11'] = p['params'].pop('critic_output')
-                model_params = flax.core.freeze(p)
-                param_list.append(model_params)
-                seed_list.append(seed)
-        except:
-            continue
-    param_stack = jax.tree.map(lambda *x: jnp.stack(x), *param_list)
-    return param_stack, jnp.array(seed_list)
+def apply_policy(network, params, hidden, actor_input, beta: float):
+    result = network.apply(params, hidden, actor_input)
+    hidden, policy = result[0], result[1]
+    return hidden, distrax.Categorical(logits=policy.logits * beta)
+
+
+def get_rollout_returns(params_1, params_2, network_1, network_2, config, env):
+    """Return one cumulative reward per trajectory without retaining states."""
+    beta = float(config["TEST_KWARGS"]["beta"])
+    use_argmax = bool(config["TEST_KWARGS"]["argmax"])
+
+    def one_rollout(rng):
+        rng, reset_key = jax.random.split(rng)
+        obs, env_state = env.reset(reset_key)
+        hidden_1 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
+        hidden_2 = ScannedRNN.initialize_carry(env.num_agents, config["GRU_HIDDEN_DIM"])
+        dones = jnp.zeros(env.num_agents, dtype=bool)
+
+        def step(carry, _):
+            state, observations, last_dones, h_1, h_2, step_rng = carry
+            step_rng, action_key_0, action_key_1, env_key = jax.random.split(step_rng, 4)
+            obs_batch = jnp.stack(
+                [observations[agent].flatten() for agent in env.agents]
+            )
+            actor_input = (
+                obs_batch[jnp.newaxis, :],
+                last_dones[jnp.newaxis, :],
+                state.agent_pos[jnp.newaxis, ...],
+            )
+            h_1, policy_1 = apply_policy(network_1, params_1, h_1, actor_input, beta)
+            h_2, policy_2 = apply_policy(network_2, params_2, h_2, actor_input, beta)
+            sampled_0 = policy_1.sample(seed=action_key_0)[0, 0]
+            sampled_1 = policy_2.sample(seed=action_key_1)[0, 1]
+            action_0 = jnp.where(
+                use_argmax, jnp.argmax(policy_1.probs[0, 0]), sampled_0
+            )
+            action_1 = jnp.where(
+                use_argmax, jnp.argmax(policy_2.probs[0, 1]), sampled_1
+            )
+            actions = {env.agents[0]: action_0, env.agents[1]: action_1}
+            next_obs, next_state, reward, done, _ = env.step(env_key, state, actions)
+            next_dones = jnp.asarray([done[agent] for agent in env.agents])
+            next_carry = (
+                next_state, next_obs, next_dones, h_1, h_2, step_rng
+            )
+            return next_carry, reward[env.agents[0]]
+
+        carry = (env_state, obs, dones, hidden_1, hidden_2, rng)
+        _, rewards = jax.lax.scan(step, carry, None, length=config["NUM_STEPS"])
+        return rewards.sum()
+
+    keys = jax.random.split(
+        jax.random.PRNGKey(config["SEED"]),
+        config["TEST_KWARGS"]["num_trajs"],
+    )
+    return jax.vmap(one_rollout)(keys)
+
+
+def evaluate_algorithm_pair(group_1, group_2, network_1, network_2, config, env):
+    indices_1 = jnp.arange(len(group_1["seeds"]))
+    indices_2 = jnp.arange(len(group_2["seeds"]))
+    pairs = jnp.asarray(jnp.meshgrid(indices_1, indices_2)).reshape(2, -1).T
+    if config.get("XP_ONLY", True) and group_1["name"] == group_2["name"]:
+        pairs = pairs[pairs[:, 0] != pairs[:, 1]]
+
+    def evaluate(pair, params_stack_1, params_stack_2):
+        index_1, index_2 = pair
+        params_1 = jax.tree.map(lambda value: value[index_1], params_stack_1)
+        params_2 = jax.tree.map(lambda value: value[index_2], params_stack_2)
+        rewards = get_rollout_returns(
+            params_1, params_2, network_1, network_2, config, env
+        )
+        return group_1["seeds"][index_1], group_2["seeds"][index_2], rewards
+
+    evaluate_all = jax.jit(jax.vmap(evaluate, in_axes=(0, None, None)))
+    return evaluate_all(pairs, group_1["params"], group_2["params"])
 
 
 @hydra.main(version_base=None, config_path="repro_config", config_name="cross_algo")
 def main(config):
-    config = OmegaConf.to_container(config)
-    config["ENV_KWARGS"]["shuffle_inv_and_pot"] = False
-    config["ENV_KWARGS"]["check_held_out"] = False
-    os.makedirs(config['SAVE_PATH'], exist_ok=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    requested_models = [str(model) for model in (config.get("MODEL_NAMES") or DEFAULT_MODELS)]
+    unknown = [model for model in requested_models if model not in MODEL_SPECS]
+    if unknown:
+        raise ValueError(f"Unsupported MODEL_NAMES: {unknown}")
 
-
-    ##################
-    # Load all models for current ckpt id
-    ##################
-    ik_param_stack, ik_seed_list = load_ik_models(config)
-    sk_param_stack, sk_seed_list = load_sk_models(config)
-    fcp_param_stack, fcp_seed_list = load_fcp_models(config)
-    e3t_param_stack, e3t_seed_list = load_e3t_models(config)
-    ik_param_stack_pop_art, ik_seed_list_pop_art = load_ik_models_pop_art(config)
-    # ik_finetune_param_stack, ik_finetune_seed_list = load_ik_finetune_models(config)
-    assert len(ik_seed_list) > 0
-    assert len(sk_seed_list) > 0
-    assert len(fcp_seed_list) > 0
-    assert len(e3t_seed_list) > 0
-    # assert len(ik_finetune_seed_list) > 0
-
-    # gc.collect()
-    # i want to get all pairs of seeds as a single array of (# pairs, 2)
-
-    ##################
-    # Initialize environment and network
-    ##################
+    layout = config["ENV_KWARGS"]["layout"]
+    output_dir = Path(config["SAVE_PATH"])
+    output_dir.mkdir(parents=True, exist_ok=True)
     env = initialize_environment(config)
-    config["obs_dim"] = env.observation_space(env.agents[0]).shape
-    env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    regular_network = ActorCriticRNN(env.action_space("agent_0").n, config=config)
-    e3t_network = ActorCriticE3T(env.action_space("agent_0").n, config=config)
+    groups = {
+        model: load_model_group(model, config, layout) for model in requested_models
+    }
+    networks = {
+        model: make_network(groups[model]["network_type"], env, config)
+        for model in requested_models
+    }
 
-    ik_info = (ik_param_stack, ik_seed_list, regular_network, 'ik')
-    sk_info = (sk_param_stack, sk_seed_list, regular_network, 'sk')
-    fcp_info = (fcp_param_stack, fcp_seed_list, regular_network, 'fcp')
-    e3t_info = (e3t_param_stack, e3t_seed_list, e3t_network, 'e3t')
-    ik_pop_art_info = (ik_param_stack_pop_art, ik_seed_list_pop_art, regular_network, 'ik_pop_art')
-    # ik_finetune_info = (ik_finetune_param_stack, ik_finetune_seed_list, regular_network, 'ik_finetune')
+    records = []
+    for model_1 in requested_models:
+        for model_2 in requested_models:
+            print(f"Evaluating {model_1} (agent 0) vs {model_2} (agent 1)")
+            seeds_1, seeds_2, rewards = evaluate_algorithm_pair(
+                groups[model_1], groups[model_2],
+                networks[model_1], networks[model_2], config, env,
+            )
+            seeds_1 = np.asarray(jax.device_get(seeds_1))
+            seeds_2 = np.asarray(jax.device_get(seeds_2))
+            rewards = np.asarray(jax.device_get(rewards))
+            for pair_index in range(len(seeds_1)):
+                for trajectory_index in range(rewards.shape[1]):
+                    records.append({
+                        "layout": layout,
+                        "algo_1": model_1,
+                        "algo_2": model_2,
+                        "seed_1": int(seeds_1[pair_index]),
+                        "seed_2": int(seeds_2[pair_index]),
+                        "trajectory": trajectory_index,
+                        "reward": float(rewards[pair_index, trajectory_index]),
+                    })
 
-    info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_pop_art_info]
-    # info_list = [ik_info, sk_info, fcp_info, e3t_info, ik_finetune_info]
-
-
-
-    df_dict = {'seed_1': [], 'seed_2': [], 'reward': [], 'algo_1': [], 'algo_2': []}
-
-    for algo_1 in info_list:
-        algo_1_params, algo_1_seed_list, algo_1_network, algo_1_name = algo_1
-        for algo_2 in info_list:
-            algo_2_params, algo_2_seed_list, algo_2_network, algo_2_name = algo_2
-            print(f"Evaluating {algo_1_name} vs {algo_2_name}")
-
-
-            seed_pairs = jnp.array(jnp.meshgrid(jnp.arange(len(algo_1_seed_list)), jnp.arange(len(algo_2_seed_list))))
-            seed_pairs = seed_pairs.reshape((2, -1)).T
-
-
-            ##################
-            # Evaluate pairs
-            ##################
-            def eval_pair(seed_pair, seed_list_1, seed_list_2, param_stack_1, param_stack_2, network_1=algo_1_network, network_2=algo_2_network, config=config, env=env):
-                seed_1, seed_2 = seed_pair[0], seed_pair[1]
-                param_1 = jax.tree.map(lambda x: x[seed_1], param_stack_1)
-                param_2 = jax.tree.map(lambda x: x[seed_2], param_stack_2)
-
-                (trajectories, init_env_states, init_obsvs) = get_rollouts(param_1, param_2, config, env, network_1, network_2)
-                rewards = trajectories[4]['agent_0'].sum(axis=1)  # axis 1 is originally each timestep in a single trajectory, want cumulative reward by end
-                true_seed_1 = seed_list_1[seed_1]
-                true_seed_2 = seed_list_2[seed_2]
-                return (true_seed_1, true_seed_2, rewards, trajectories, init_env_states)
-
-            eval_pair_fn = jax.jit(jax.vmap(eval_pair, in_axes=(0, None, None, None, None)))
-            eval_pair_res = eval_pair_fn(seed_pairs, algo_1_seed_list, algo_2_seed_list, algo_1_params, algo_2_params)
-            true_seed_1, true_seed_2, rewards, trajectories, init_env_states = eval_pair_res
-            for i in tqdm(range(len(true_seed_1))):
-                for j in range(len(rewards[i])):
-                    df_dict['seed_1'].append(true_seed_1[i])
-                    df_dict['seed_2'].append(true_seed_2[i])
-                    df_dict['reward'].append(rewards[i][j])
-                    df_dict['algo_1'].append(algo_1_name)
-                    df_dict['algo_2'].append(algo_2_name)
-    df = pd.DataFrame(df_dict)
-    df.to_csv(f"{config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv", index=False)
-    print(f"Saved data to {config['SAVE_PATH']}/{config['layout_name']}_cross_algo_eval_onIK.csv")
+    output_path = output_dir / f"{layout}_cross_algo_results.csv"
+    pd.DataFrame.from_records(records).to_csv(output_path, index=False)
+    print(f"Saved data to {output_path}")
 
 
 if __name__ == "__main__":
     main()
-
-
-    # FOR FUTURE REFERENCE:
-    '''
-        loop over graph/no graph  (this will be config)
-        loop over ik train vs sk train  (this will be test kwargs)
-        loop over ckpt id  (this will be train kwargs)
-        loop over eval on ik vs eval on sk  (this will be env kwargs)
-    '''
-
-    # For overcooked
-    '''
-    # first eval sk grids on sk model
-    for layout in "cramped_room_padded" "counter_circuit_padded" "forced_coord_padded" "asymm_advantages_padded" "coord_ring_padded"
-        for graph vs no graph
-            for train sk
-                for test ik = False vs True
-                    for ckpt id
-                        run eval
-    '''

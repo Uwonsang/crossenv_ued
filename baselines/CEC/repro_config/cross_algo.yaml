@@ -52,9 +52,16 @@
 "FCP": False
 "FCP_KWARGS":
   "train_oracle": True
-"MODEL_PATH": "/app/nas/models/new_baselines_model"
-"SAVE_PATH": "/app/baselines/CEC/results/cross_algo"
-"NUM_MODELS": 3
+"MODEL_PATH": "/mnt/nas/wonsang/crossenv_ued/models/ICRL"
+"SAVE_PATH": "baselines/CEC/results/cross_algo"
+"MODEL_NAMES":
+  - "IPPO"
+  - "E3T"
+  - "FCP"
+  - "CEC_envs64"
+  - "CEC_IDAAC_envs32"
+  - "CEC_IDAAC_envs256"
+"XP_ONLY": True  # exclude identical seeds only for same-algorithm cells
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"

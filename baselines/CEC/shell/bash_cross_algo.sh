@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: bash_cross_algo.sh [GPU] [MODEL_PATH] [OUTPUT_DIR] [NUM_TRAJS]
+# Usage: bash_cross_algo.sh [GPU] [MODEL_PATH] [NUM_TRAJS]
 # Example: bash baselines/CEC/shell/bash_cross_algo.sh \
-#   0 /app/nas/models/ICRL /app/nas/models/ICRL/cross_algo_results 10
+#   0 /app/nas/models/ICRL 10
 
 gpu="${1:-0}"
 model_path="${2:-}"
-output_dir="${3:-}"
-num_trajs="${4:-10}"
+num_trajs="${3:-10}"
 
 if [[ -z "${model_path}" ]]; then
   if [[ -d /app/nas/models/ICRL ]]; then
@@ -22,9 +21,7 @@ if [[ -z "${model_path}" ]]; then
   fi
 fi
 
-if [[ -z "${output_dir}" ]]; then
-  output_dir="${model_path%/}/cross_algo_results"
-fi
+output_dir="${model_path%/}/xp_results_diff_algo"
 
 layouts=(
   asymm_advantages_9
@@ -41,5 +38,6 @@ for layout in "${layouts[@]}"; do
     "ENV_KWARGS.layout=${layout}" \
     "MODEL_PATH=${model_path}" \
     "SAVE_PATH=${output_dir}" \
-    "TEST_KWARGS.num_trajs=${num_trajs}"
+    "TEST_KWARGS.num_trajs=${num_trajs}" \
+    XP_ONLY=False
 done

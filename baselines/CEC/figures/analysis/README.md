@@ -67,7 +67,62 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
   seed 최소–최대 범위를 나타낸다. 출력 파일명에는 선택한 seed가 자동으로
   포함된다.
 
-## Current logging compatibility
+## EGTA from cross-algorithm CSVs
+
+`egta_analysis.py` reads the CSV schema produced by `baselines/CEC/cross_algo.py`.
+It requires NumPy, pandas, SciPy and Matplotlib; no W&B connection or model
+loading is needed. This analysis assumes a two-player shared-reward game with
+uniform random seat assignment. It averages trajectories within each seed pair,
+then seed pairs within each layout, then layouts equally. The role-averaged
+payoff is `(M + M.T) / 2`. Missing cells (including diagonals), duplicate
+evaluation keys and nonfinite rewards are errors. Inputs must share evaluation
+settings/checkpoint selection; do not mix fixed-task and PCG datasets.
+
+```bash
+python baselines/CEC/figures/analysis/egta_analysis.py \
+  --input /mnt/nas/wonsang/crossenv_ued/models/ICRL/xp_results_diff_algo \
+  --models FCP CEC_envs64 CEC_IDAAC_envs256 \
+  --xp-only --output-dir artifacts/egta/fixed_three
+```
+
+`--input` accepts one or more CSV files/directories. `--layouts` optionally
+selects layouts. `--xp-only` excludes same-model, same-seed pairs; the default
+retains them, matching whatever the evaluator collected. With XP-only, each
+model needs cross-seed evaluations on the diagonal. Model names are raw CSV
+identifiers. Use separate output directories for different model/task groups.
+
+Outputs:
+
+- `payoff.csv`: role-averaged, equal-layout payoff matrix in raw return units.
+- `layout_payoffs.csv`, `seed_pair_summary.csv`: directional and role-averaged
+  layout values, and seed-pair means/counts for auditing aggregation.
+- `simplex.png`: vector field and trajectories, generated only for exactly
+  three models. This represents the selected three-model subgame.
+- `population.png`, `trajectories.csv`: dynamics for any number of models;
+  the first start is uniform (solid lines), others are seeded Dirichlet draws
+  (faint lines). Defaults: 16 starts, horizon 100, 501 time samples, seed 0.
+- `endpoints.csv`: finite-time fractions, raw derivative norm, and symmetric
+  Nash gap `max(A @ x) - x @ A @ x`.
+- `pure_strategy_gaps.csv`: the same gap at each pure strategy. A zero
+  replicator derivative at a vertex alone does not establish equilibrium.
+- `metadata.json`: input paths, settings and assumptions.
+
+Integration uses log population coordinates and one global payoff scale
+`max(ptp(A), 1)`; this changes time units, not the dynamics' paths. No per-row,
+per-column or per-layout score normalization is applied. Results are restricted
+to the selected empirical model set. Endpoints are not certified equilibria,
+and counts of endpoints are not certified attraction basin probabilities.
+Sampling uncertainty/bootstrap confidence intervals are not estimated.
+Asymmetric individual-payoff games and multiplayer payoff tensors are outside
+this script's scope.
+
+References: [Tuyls et al. (2018)](https://arxiv.org/abs/1803.06376),
+[Serrino et al. (2019)](https://arxiv.org/abs/1906.02330),
+[Wellman et al. (2024)](https://arxiv.org/abs/2403.04018).
+
+Verification: `python -m unittest discover -s baselines/CEC/figures/analysis -p test_egta_analysis.py`.
+
+## Current logging compatibility (training curves)
 
 현재 `ippo_general_gradient.py` 계열의 새 run에는 `train_returns_graph.py`,
 `eval_graph.py`, `target_raw_graph.py`가 그대로 동작한다.
@@ -107,3 +162,43 @@ python baselines/CEC/figures/analysis/eval_xp_scaling_graph.py
 ```
 
 Run `python3 <script>.py --help` for the full flag list.
+
+## Sparse baseline comparison panels
+
+The simplex defaults to `--resolution 8` (45 grid positions) rather than 24
+(325 positions). Resolution is unrelated to evaluation episode count.
+Add `--show-trajectories` to overlay integration paths.
+
+```bash
+python baselines/CEC/figures/analysis/egta_panels.py \
+  --payoff artifacts/egta/fixed_all/payoff.csv \
+  --focal CEC_IDAAC_envs256 \
+  --pair FCP IPPO --pair CEC_envs64 FCP --pair E3T IPPO \
+  --title '5 original tasks | DCEC256' \
+  --output-dir artifacts/egta/dcec256_baseline_panels
+```
+
+PNG/PDF panels use a shared speed scale normalized to [0, 1].
+`baseline_checks.csv` records strict dominance margins within each subgame,
+individual invasion gains, and focal pure-strategy Nash gaps. These are
+empirical point estimates, not statistical significance tests. Missing focal
+models are rejected; DCEC256 cannot substitute for DCEC128.
+
+The evaluator accepts `CEC_IDAAC_envs128` explicitly through `MODEL_NAMES`.
+Collect its missing data in a Python environment with the project's JAX
+requirements, using the configured model root (override MODEL_PATH if needed):
+
+```bash
+for layout in asymm_advantages_9 coord_ring_9 counter_circuit_9 cramped_room_9 forced_coord_9; do
+  python baselines/CEC/cross_algo.py \
+    "ENV_KWARGS.layout=$layout" \
+    'MODEL_NAMES=[IPPO,E3T,FCP,CEC_envs64,CEC_IDAAC_envs128]' \
+    SAVE_PATH=artifacts/egta/dcec128_cross_play \
+    TEST_KWARGS.num_trajs=10 XP_ONLY=True
+done
+```
+
+Then run `egta_analysis.py` with that input directory and those five models,
+and pass its payoff CSV to `egta_panels.py --focal CEC_IDAAC_envs128`.
+PCG requires a separate complete cross-algorithm dataset; within-algorithm
+cross-play scores do not provide the missing baseline cells.

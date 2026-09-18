@@ -17,6 +17,14 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
+
 try:
     from .value_loss_generalization_graph import finite_float, select_runs
 except ImportError:
@@ -45,7 +53,7 @@ LAYOUT_LABELS = {
     "counter_circuit_9": "Counter Circuit",
     "forced_coord_9": "Forced Coordination",
 }
-MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "CEC-IDAAC"}
+MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 SPLIT_COLORS = {"train": "#377eb8", "evaluation": "#e68632"}
 SPLIT_MARKERS = {"train": "o", "evaluation": "s"}
 
@@ -295,7 +303,7 @@ def aggregate_seeds(run_rows):
 
 
 def plot_model(rows, model, num_envs_values, aggregation, output_path):
-    fig, axes = plt.subplots(2, 3, figsize=(11.2, 7.0), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.0), sharex=True)
     axes = axes.ravel()
     x_lookup = {num_envs: index for index, num_envs in enumerate(num_envs_values)}
 
@@ -336,13 +344,7 @@ def plot_model(rows, model, num_envs_values, aggregation, output_path):
     ]
     fig.legend(handles=handles, loc="upper center", ncol=2,
                bbox_to_anchor=(0.5, 0.89), frameon=True)
-    statistic = "Last logged values" if aggregation == "last" else "Final-window means"
-    fig.suptitle(
-        f"{MODEL_LABELS.get(model, model)}: Train vs Evaluation TD-error RMSE\n"
-        f"{statistic}; gap = evaluation - train",
-        fontsize=14,
-    )
-    fig.tight_layout(rect=(0.025, 0.01, 0.99, 0.81))
+    fig.tight_layout(rect=(0.025, 0.01, 0.99, 0.86))
     fig.savefig(output_path)
     plt.close(fig)
 

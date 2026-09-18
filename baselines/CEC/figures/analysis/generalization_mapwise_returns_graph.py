@@ -13,6 +13,14 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DATA_DIR = REPOSITORY_ROOT / "artifacts" / "generalization_gap"
@@ -30,7 +38,7 @@ LAYOUT_LABELS = {
     "counter_circuit_9": "Counter Circuit",
     "forced_coord_9": "Forced Coordination",
 }
-MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "CEC-IDAAC"}
+MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#377eb8", "CEC_IDAAC": "#e68632"}
 SPLIT_STYLES = {"train": "-", "evaluation": "--"}
 SPLIT_MARKERS = {"train": "o", "evaluation": "s"}
@@ -141,7 +149,7 @@ def aggregate_layouts(rows):
 
 
 def plot(layout_rows, args, models, output_path):
-    fig = plt.figure(figsize=(11.5, 7.1))
+    fig = plt.figure(figsize=(15.0, 9.0))
     grid = fig.add_gridspec(2, 6)
     axes = [
         fig.add_subplot(grid[0, 0:2]),
@@ -197,17 +205,10 @@ def plot(layout_rows, args, models, output_path):
         handles=legend_handles, loc="upper center", ncol=4,
         bbox_to_anchor=(0.5, 0.90), frameon=True,
     )
-    statistic = "Last logged returns" if args.aggregation == "last" else "Final-window mean returns"
-    model_title = " vs ".join(MODEL_LABELS.get(model, model) for model in models)
-    fig.suptitle(
-        f"{model_title}: Map-wise Train and Evaluation Performance\n"
-        f"{statistic}",
-        fontsize=14,
-    )
     # Figure-level titles and legends make tight_layout reserve excessive
     # vertical space. Place the panel grid explicitly for a compact layout.
     fig.subplots_adjust(
-        left=0.075, right=0.985, bottom=0.095, top=0.80,
+        left=0.075, right=0.985, bottom=0.095, top=0.84,
         wspace=0.42, hspace=0.38,
     )
     fig.savefig(output_path)

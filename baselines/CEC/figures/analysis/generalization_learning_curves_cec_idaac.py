@@ -1,4 +1,4 @@
-"""Reproduce the earlier CEC versus CEC-IDAAC learning-curve comparison.
+"""Reproduce the earlier CEC versus DCEC learning-curve comparison.
 
 This entry point intentionally preserves the comparison version that preceded
 the CEC-only figure. It shares CSV loading and plotting logic with

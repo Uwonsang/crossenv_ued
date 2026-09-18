@@ -22,6 +22,14 @@ from matplotlib.patches import ConnectionPatch, Rectangle
 import numpy as np
 import wandb
 
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
+
 
 DEFAULT_ENTITY = "overcooked_ai"
 DEFAULT_PROJECT = "crossenv_ICLR"
@@ -46,7 +54,7 @@ LAYOUT_LABELS = {
 }
 MODEL_LABELS = {
     "CEC": "CEC",
-    "CEC_IDAAC": "CEC-IDAAC",
+    "CEC_IDAAC": "DCEC",
 }
 COLORS = {
     32: "#1f77b4",
@@ -583,7 +591,7 @@ def plot_model_individual_runs(
 
 
 def plot_models_combined(rows, models, output_path: Path, aggregation: str):
-    """Overlay seed-averaged CEC and CEC-IDAAC points in matched panels."""
+    """Overlay seed-averaged CEC and DCEC points in matched panels."""
     panels = ["mean", *LAYOUTS]
     fig, axes = plt.subplots(2, 3, figsize=(12.6, 7.6))
     axes = axes.ravel()
@@ -679,7 +687,7 @@ def plot_models_combined(rows, models, output_path: Path, aggregation: str):
         bbox_to_anchor=(0.5, 0.945), frameon=True,
     )
     fig.text(
-        0.5, 0.982, "Value Loss and Generalization: CEC vs CEC-IDAAC",
+        0.5, 0.982, "Value Loss and Generalization: CEC vs DCEC",
         ha="center", va="top", fontsize=15,
     )
     fig.subplots_adjust(
@@ -695,7 +703,7 @@ def plot_models_combined(rows, models, output_path: Path, aggregation: str):
         for model in models:
             value = correlation_summary[model].get(layout, float("nan"))
             rendered = f"{value:.2f}" if math.isfinite(value) else "n/a"
-            short_name = "CEC-IDAAC" if model == "CEC_IDAAC" else MODEL_LABELS.get(model, model)
+            short_name = "DCEC" if model == "CEC_IDAAC" else MODEL_LABELS.get(model, model)
             values.append(f"{short_name} {rendered}")
         bounds = ax.get_position()
         text_y = bounds.y0 - (0.055 if index < 3 else 0.105)
@@ -807,7 +815,7 @@ def plot_models_combined_individual(
     )
     fig.text(
         0.5, 0.982,
-        "Value Loss and Generalization: CEC vs CEC-IDAAC (Individual Runs)",
+        "Value Loss and Generalization: CEC vs DCEC (Individual Runs)",
         ha="center", va="top", fontsize=15,
     )
     fig.subplots_adjust(
@@ -822,7 +830,7 @@ def plot_models_combined_individual(
             value = correlation_summary[model].get(layout, float("nan"))
             rendered = f"{value:.2f}" if math.isfinite(value) else "n/a"
             short_name = (
-                "CEC-IDAAC" if model == "CEC_IDAAC"
+                "DCEC" if model == "CEC_IDAAC"
                 else MODEL_LABELS.get(model, model)
             )
             values.append(f"{short_name} {rendered}")
@@ -920,7 +928,7 @@ def plot_mean_comparison(
     run_label = ", Individual Runs" if individual_runs else ""
     fig.text(
         0.5, 0.98,
-        f"Mean Value Loss and Generalization: CEC vs CEC-IDAAC "
+        f"Mean Value Loss and Generalization: CEC vs DCEC "
         f"({scale_label}{run_label})",
         ha="center", va="top", fontsize=14,
     )
@@ -1068,7 +1076,7 @@ def plot_mean_overview_zoom(
     for model in models:
         overview_data[model] = draw_model(overview_ax, model)
     overview_ax.set_title(
-        "CEC vs. CEC-IDAAC",
+        "CEC vs. DCEC",
         fontsize=18 if center_overview else 12.5,
         pad=10 if center_overview else None,
     )

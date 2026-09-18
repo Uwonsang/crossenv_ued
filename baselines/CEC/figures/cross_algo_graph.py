@@ -5,6 +5,7 @@ import argparse
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 
@@ -18,13 +19,13 @@ ALGO_RENAME = {
     "IPPO": "IPPO",
     "E3T": "E3T",
     "FCP": "FCP",
-    "CEC_envs64": "CEC (64)",
-    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
-    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
+    "CEC_envs64": "CEC",
+    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_IDAAC_envs256": "DCEC (256)",
 }
 ALGO_ORDER = [
-    "IPPO", "E3T", "FCP", "CEC (64)",
-    "CEC-IDAAC (32)", "CEC-IDAAC (256)",
+    "IPPO", "E3T", "FCP", "CEC",
+    "DCEC (32)", "DCEC (256)",
 ]
 
 LAYOUT_ORDER = [
@@ -41,6 +42,11 @@ LAYOUT_LABEL = {
     "cramped_room_9":      "Cramped Room",
     "forced_coord_9":      "Forced Coord",
 }
+
+CEC_IDAAC_BLUE = LinearSegmentedColormap.from_list(
+    "cec_idaac_blue",
+    ["#C6E8F8", "#35A9E0", "#087FBD", "#004B87"],
+)
 
 
 # ──────────────────────────────────────────────
@@ -73,26 +79,33 @@ def normalize_pivot(pivot: pd.DataFrame) -> pd.DataFrame:
 # Plotting
 # ──────────────────────────────────────────────
 def plot_heatmap(ax: plt.Axes, data: pd.DataFrame, title: str,
-                 xlabel: str, ylabel: str, vmin=0.0, vmax=1.0):
+                 xlabel: str, ylabel: str, vmin: float, vmax: float):
     algos = list(data.index)
     mat = data.values.astype(float)
 
-    im = ax.imshow(mat, cmap="viridis", vmin=vmin, vmax=vmax, aspect="auto")
+    im = ax.imshow(
+        mat,
+        cmap=CEC_IDAAC_BLUE,
+        vmin=vmin,
+        vmax=vmax,
+        aspect="auto",
+    )
     ax.set_xticks(range(len(algos)))
-    ax.set_xticklabels(algos, fontsize=9)
+    ax.set_xticklabels(
+        algos, fontsize=11, rotation=30, ha="right", rotation_mode="anchor"
+    )
     ax.set_yticks(range(len(algos)))
-    ax.set_yticklabels(algos, fontsize=9)
-    ax.set_xlabel(xlabel, fontsize=9)
-    ax.set_ylabel(ylabel, fontsize=9)
-    ax.set_title(title, fontsize=11, fontweight="bold")
+    ax.set_yticklabels(algos, fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=13)
+    ax.set_ylabel(ylabel, fontsize=13)
+    ax.set_title(title, fontsize=15, fontweight="bold")
 
     for i in range(len(algos)):
         for j in range(len(algos)):
             v = mat[i, j]
             if not np.isnan(v):
-                color = "white" if v < (vmin + vmax) * 0.55 else "black"
-                ax.text(j, i, f"{v:.2f}", ha="center", va="center",
-                        fontsize=9, color=color)
+                ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                        fontsize=11, color="black")
     return im
 
 
@@ -101,45 +114,93 @@ def save_figures(
     save_dir: Path,
 ):
     """Generate per-layout + overall figures for a given pivot set."""
-    pivots_norm = {layout: normalize_pivot(p) for layout, p in pivots_raw.items()}
+    finite_values = np.concatenate([
+        pivot.to_numpy(dtype=float).ravel() for pivot in pivots_raw.values()
+    ])
+    finite_values = finite_values[np.isfinite(finite_values)]
+    color_min = min(0.0, float(finite_values.min()))
+    color_max = float(finite_values.max())
 
     # per-layout
-    n = len(pivots_norm)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4.5))
-    if n == 1:
-        axes = [axes]
+    # Five layouts are easier to read as three panels on the first row and
+    # two centered panels on the second row than as one very wide strip.
+    fig = plt.figure(figsize=(18, 11))
+    grid = fig.add_gridspec(2, 6)
+    axes = [
+        fig.add_subplot(grid[0, 0:2]),
+        fig.add_subplot(grid[0, 2:4]),
+        fig.add_subplot(grid[0, 4:6]),
+        fig.add_subplot(grid[1, 1:3]),
+        fig.add_subplot(grid[1, 3:5]),
+    ]
 
-    for ax, (layout, pivot) in zip(axes, pivots_norm.items()):
+    for ax, (layout, pivot) in zip(axes, pivots_raw.items()):
         im = plot_heatmap(ax, pivot, LAYOUT_LABEL[layout],
-                          xlabel=xlabel, ylabel=ylabel)
+                          xlabel=xlabel, ylabel=ylabel,
+                          vmin=color_min, vmax=color_max)
+    for ax in axes[len(pivots_raw):]:
+        ax.set_visible(False)
 
-    fig.subplots_adjust(right=0.88, wspace=0.4)
-    cbar_ax = fig.add_axes([0.90, 0.15, 0.015, 0.7])
+    fig.subplots_adjust(
+        left=0.06, right=0.92, bottom=0.10, top=0.92,
+        wspace=0.90, hspace=0.65,
+    )
+    cbar_ax = fig.add_axes([0.94, 0.17, 0.012, 0.66])
     cbar = fig.colorbar(im, cax=cbar_ax)
-    cbar.set_label("Normalized Reward", fontsize=10)
-    fig.suptitle(f"{suptitle} — per Layout", fontsize=13, y=1.01)
+    cbar.set_label("Mean Reward", fontsize=13)
 
     out = save_dir / f"cross_algo_per_layout_{tag}.pdf"
     fig.savefig(out, bbox_inches="tight")
     print(f"Saved: {out}")
     plt.close(fig)
 
-    # overall: mean of raw pivots, then normalize
+    # Also save one large, publication-friendly PDF per layout. Individual
+    # panels use their own reward range to make within-layout differences
+    # visible; the combined figure above retains common cross-layout limits.
+    for layout, pivot in pivots_raw.items():
+        layout_values = pivot.to_numpy(dtype=float)
+        layout_values = layout_values[np.isfinite(layout_values)]
+        layout_color_min = float(layout_values.min())
+        layout_color_max = float(layout_values.max())
+        if np.isclose(layout_color_min, layout_color_max):
+            layout_color_min -= 0.5
+            layout_color_max += 0.5
+        single_fig, single_ax = plt.subplots(figsize=(7.5, 6.2))
+        single_im = plot_heatmap(
+            single_ax,
+            pivot,
+            LAYOUT_LABEL[layout],
+            xlabel=xlabel,
+            ylabel=ylabel,
+            vmin=layout_color_min,
+            vmax=layout_color_max,
+        )
+        single_cbar = single_fig.colorbar(
+            single_im, ax=single_ax, pad=0.04, fraction=0.05
+        )
+        single_cbar.set_label("Mean Reward", fontsize=13)
+        single_fig.tight_layout()
+        single_out = save_dir / f"cross_algo_{layout}_{tag}.pdf"
+        single_fig.savefig(single_out, bbox_inches="tight")
+        print(f"Saved: {single_out}")
+        plt.close(single_fig)
+
+    # Overall raw reward: mean across layouts.
     stacked = np.stack([p.values for p in pivots_raw.values()], axis=0)
     mean_mat = np.nanmean(stacked, axis=0)
     ref = next(iter(pivots_raw.values()))
-    overall_pivot = normalize_pivot(
-        pd.DataFrame(mean_mat, index=ref.index, columns=ref.columns)
+    overall_pivot = pd.DataFrame(
+        mean_mat, index=ref.index, columns=ref.columns
     )
 
     fig2, ax2 = plt.subplots(figsize=(5, 4.5))
-    im2 = plot_heatmap(ax2, overall_pivot, "Overall (Mean across Layouts)",
-                       xlabel=xlabel, ylabel=ylabel)
+    im2 = plot_heatmap(ax2, overall_pivot, "",
+                       xlabel=xlabel, ylabel=ylabel,
+                       vmin=color_min, vmax=color_max)
     fig2.subplots_adjust(right=0.85)
     cbar_ax2 = fig2.add_axes([0.87, 0.15, 0.025, 0.7])
     cbar2 = fig2.colorbar(im2, cax=cbar_ax2)
-    cbar2.set_label("Normalized Reward", fontsize=10)
-    fig2.suptitle(f"{suptitle} — Overall", fontsize=13)
+    cbar2.set_label("Mean Reward", fontsize=13)
 
     out2 = save_dir / f"cross_algo_overall_{tag}.pdf"
     fig2.savefig(out2, bbox_inches="tight")
@@ -177,8 +238,8 @@ def main():
     save_figures(
         pivots_raw,
         tag="directional",
-        xlabel="Algorithm 2 (Agent 1)",
-        ylabel="Algorithm 1 (Agent 0)",
+        xlabel="Agent 1",
+        ylabel="Agent 0",
         suptitle="Cross-Algorithm XP (Directional)",
         save_dir=args.save_dir,
     )

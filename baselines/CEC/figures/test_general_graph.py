@@ -12,13 +12,13 @@ from omegaconf import OmegaConf
 
 plt.rcParams.update(
     {
-        "font.size": 14,
-        "axes.titlesize": 16,
-        "axes.labelsize": 15,
-        "xtick.labelsize": 13,
-        "ytick.labelsize": 13,
-        "figure.titlesize": 18,
-        "legend.fontsize": 13,
+        "font.size": 18,
+        "axes.titlesize": 20,
+        "axes.labelsize": 20,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+        "figure.titlesize": 22,
+        "legend.fontsize": 18,
     }
 )
 
@@ -52,9 +52,9 @@ ALG_LABELS = {
     "IPPO": "IPPO",
     "E3T": "E3T",
     "FCP": "FCP",
-    "CEC_envs64": "CEC (64)",
-    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
-    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
+    "CEC_envs64": "CEC",
+    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_IDAAC_envs256": "DCEC (256)",
 }
 
 ALG_COLORS = [
@@ -62,8 +62,8 @@ ALG_COLORS = [
     "#7b126b",  # E3T
     "#e3a21a",  # FCP
     "#117733",  # CEC (64)
-    "#56B4E9",  # CEC-IDAAC (32): Okabe-Ito sky blue
-    "#0072B2",  # CEC-IDAAC (256): Okabe-Ito blue
+    "#56B4E9",  # DCEC (32): Okabe-Ito sky blue
+    "#0072B2",  # DCEC (256): Okabe-Ito blue
 ]
 
 MAP_ORDER = [
@@ -253,9 +253,6 @@ def plot_per_map(
     for j in range(len(MAP_ORDER), len(axes_flat)):
         axes_flat[j].set_visible(False)
 
-    fig.suptitle(
-        f"{evaluation_label} performance per layout", fontsize=18, y=1.02
-    )
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -277,7 +274,7 @@ def plot_overall(
     errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
-    fig, ax = plt.subplots(figsize=(12.5, 6.0))
+    fig, ax = plt.subplots(figsize=(14.0, 7.5))
     x = np.arange(len(ALG_ORDER))
     colors = [_alg_color_map()[a] for a in ALG_ORDER]
     ax.bar(
@@ -291,20 +288,21 @@ def plot_overall(
         alpha=0.92,
     )
     ax.set_xticks(x)
-    ax.set_xticklabels(
-        [ALG_LABELS[alg] for alg in ALG_ORDER],
-        rotation=25,
-        ha="right",
-    )
-    ax.set_ylabel("mean reward (average over maps)")
-    ax.set_title(
-        f"Overall {evaluation_label.lower()} performance — "
-        "average over 5 layouts"
-    )
+    overall_labels = [
+        ALG_LABELS[alg].replace(" ", "\n", 1)
+        if ALG_LABELS[alg].startswith("DCEC ")
+        else ALG_LABELS[alg]
+        for alg in ALG_ORDER
+    ]
+    ax.set_xticklabels(overall_labels, rotation=0, ha="center")
+    ax.tick_params(axis="x", labelsize=24, pad=12)
+    ax.tick_params(axis="y", labelsize=24)
+    ax.set_ylabel("mean reward (average over maps)", fontsize=26)
+    ax.set_title("(a) Fixed tasks", fontsize=28, fontweight="bold", pad=16)
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path)
     plt.close(fig)
 
 

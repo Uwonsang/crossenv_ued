@@ -1,4 +1,4 @@
-"""Plot train and evaluation learning curves for CEC and CEC-IDAAC.
+"""Plot train and evaluation learning curves for CEC and DCEC.
 
 The first invocation downloads run histories from W&B and stores a long-form
 CSV. Later invocations reuse that CSV unless --refresh-wandb is supplied.
@@ -17,6 +17,14 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
 
 try:
     from .value_loss_generalization_graph import finite_float, select_runs
@@ -46,7 +54,7 @@ LAYOUT_LABELS = {
     "counter_circuit_9": "Counter Circuit",
     "forced_coord_9": "Forced Coordination",
 }
-MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "CEC-IDAAC"}
+MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#377eb8", "CEC_IDAAC": "#e68632"}
 ENV_COLORS = {
     32: "#9ecae1",
@@ -242,7 +250,7 @@ def aggregate_seeds(rows):
 
 
 def plot_num_envs(rows, args: argparse.Namespace, num_envs: int, output_path: Path):
-    fig, axes = plt.subplots(2, 3, figsize=(11.2, 7.0), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.0), sharex=True)
     axes = axes.ravel()
 
     for ax, layout in zip(axes, PANELS):
@@ -286,20 +294,10 @@ def plot_num_envs(rows, args: argparse.Namespace, num_envs: int, output_path: Pa
             unique.values(), unique.keys(), loc="upper center", ncol=4,
             bbox_to_anchor=(0.5, 0.94), frameon=True,
         )
-    model_title = (
-        "CEC"
-        if args.model_names == ["CEC"]
-        else " and ".join(MODEL_LABELS.get(model, model) for model in args.model_names)
-    )
-    fig.suptitle(
-        f"{model_title} Train and Evaluation Learning Curves "
-        f"(NUM_ENVS={num_envs}, NUM_MINIBATCHES={args.num_minibatches})",
-        fontsize=15, y=0.982,
-    )
     # Explicit margins avoid the large title/legend gap introduced by
     # tight_layout while retaining enough room for the shared legend.
     fig.subplots_adjust(
-        left=0.065, right=0.985, bottom=0.09, top=0.84,
+        left=0.065, right=0.985, bottom=0.09, top=0.88,
         wspace=0.22, hspace=0.28,
     )
     fig.savefig(output_path)
@@ -308,7 +306,7 @@ def plot_num_envs(rows, args: argparse.Namespace, num_envs: int, output_path: Pa
 
 def plot_all_num_envs(rows, args: argparse.Namespace, output_path: Path):
     """Overlay CEC curves for all requested NUM_ENVS values in one figure."""
-    fig, axes = plt.subplots(2, 3, figsize=(11.8, 7.2), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.0), sharex=True)
     axes = axes.ravel()
 
     for ax, layout in zip(axes, PANELS):
@@ -351,15 +349,10 @@ def plot_all_num_envs(rows, args: argparse.Namespace, output_path: Path):
             unique.values(), unique.keys(), loc="upper center", ncol=4,
             bbox_to_anchor=(0.5, 0.945), frameon=True,
         )
-    fig.suptitle(
-        f"CEC Train and Evaluation Learning Curves "
-        f"(NUM_MINIBATCHES={args.num_minibatches})",
-        fontsize=15, y=0.982,
-    )
     # The all-environment legend uses two rows, so it needs slightly more
     # headroom than the individual NUM_ENVS figures.
     fig.subplots_adjust(
-        left=0.065, right=0.985, bottom=0.09, top=0.80,
+        left=0.065, right=0.985, bottom=0.09, top=0.84,
         wspace=0.22, hspace=0.28,
     )
     fig.savefig(output_path)

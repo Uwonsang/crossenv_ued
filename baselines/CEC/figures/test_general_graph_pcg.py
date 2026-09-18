@@ -15,13 +15,13 @@ import matplotlib.pyplot as plt
 
 plt.rcParams.update(
     {
-        "font.size": 14,
-        "axes.titlesize": 16,
-        "axes.labelsize": 15,
-        "xtick.labelsize": 13,
-        "ytick.labelsize": 13,
-        "figure.titlesize": 18,
-        "legend.fontsize": 13,
+        "font.size": 18,
+        "axes.titlesize": 20,
+        "axes.labelsize": 20,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+        "figure.titlesize": 22,
+        "legend.fontsize": 18,
     }
 )
 
@@ -66,9 +66,9 @@ ALGORITHM_LABELS = {
     "IPPO": "IPPO",
     "E3T": "E3T",
     "FCP": "FCP",
-    "CEC_envs64": "CEC (64)",
-    "CEC_IDAAC_envs32": "CEC-IDAAC (32)",
-    "CEC_IDAAC_envs256": "CEC-IDAAC (256)",
+    "CEC_envs64": "CEC",
+    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_IDAAC_envs256": "DCEC (256)",
 }
 
 ALGORITHM_COLORS = {
@@ -78,6 +78,22 @@ ALGORITHM_COLORS = {
     "CEC_envs64": "#117733",
     "CEC_IDAAC_envs32": "#56B4E9",
     "CEC_IDAAC_envs256": "#0072B2",
+}
+
+GENERATED_LAYOUT_ORDER = [
+    "CEC_envs64",
+    "CEC_IDAAC_envs32",
+    "CEC_IDAAC_envs64",
+    "CEC_IDAAC_envs128",
+    "CEC_IDAAC_envs256",
+]
+
+GENERATED_LAYOUT_LABELS = {
+    "CEC_envs64": "CEC",
+    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_IDAAC_envs64": "DCEC (64)",
+    "CEC_IDAAC_envs128": "DCEC (128)",
+    "CEC_IDAAC_envs256": "DCEC (256)",
 }
 
 CHECKPOINT_LAYOUT_ORDER = [
@@ -227,7 +243,7 @@ def make_checkpoint_summary(pair_units: pd.DataFrame) -> pd.DataFrame:
 
 def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
     indexed = summary.set_index("algorithm").reindex(ALGORITHM_ORDER)
-    fig, ax = plt.subplots(figsize=(12.5, 6.0))
+    fig, ax = plt.subplots(figsize=(14.0, 7.5))
     x = np.arange(len(ALGORITHM_ORDER))
     ax.bar(
         x,
@@ -240,17 +256,26 @@ def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
         alpha=0.92,
     )
     ax.set_xticks(x)
-    ax.set_xticklabels(
-        [ALGORITHM_LABELS[a] for a in ALGORITHM_ORDER],
-        rotation=25,
-        ha="right",
+    overall_labels = [
+        ALGORITHM_LABELS[algorithm].replace(" ", "\n", 1)
+        if ALGORITHM_LABELS[algorithm].startswith("DCEC ")
+        else ALGORITHM_LABELS[algorithm]
+        for algorithm in ALGORITHM_ORDER
+    ]
+    ax.set_xticklabels(overall_labels, rotation=0, ha="center")
+    ax.tick_params(axis="x", labelsize=24, pad=12)
+    ax.tick_params(axis="y", labelsize=24)
+    ax.set_ylabel("mean reward", fontsize=26)
+    ax.set_title(
+        "(b) Procedurally generated tasks",
+        fontsize=28,
+        fontweight="bold",
+        pad=16,
     )
-    ax.set_ylabel("mean reward")
-    ax.set_title("Cross-play performance on 100 PCG layouts")
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches="tight")
+    fig.savefig(output_path)
     plt.close(fig)
 
 
@@ -285,11 +310,29 @@ def plot_per_checkpoint_layout(
         ax.grid(axis="y", alpha=0.35)
         ax.set_axisbelow(True)
     axes_flat[-1].set_visible(False)
-    fig.suptitle(
-        "PCG cross-play by specialist checkpoint layout",
-        fontsize=18,
-        y=1.01,
+    fig.tight_layout()
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_generated_layout_heatmap(
+    summary: pd.DataFrame, output_path: Path
+) -> None:
+    """Plot cached mean rewards for each generated held-out layout."""
+    heatmap = summary.pivot(
+        index="algorithm",
+        columns="held_out_layout_idx",
+        values="mean_reward",
+    ).reindex(GENERATED_LAYOUT_ORDER)
+    fig, ax = plt.subplots(figsize=(14.5, 4.7))
+    image = ax.imshow(heatmap.to_numpy(dtype=float), aspect="auto")
+    ax.set_yticks(np.arange(len(GENERATED_LAYOUT_ORDER)))
+    ax.set_yticklabels(
+        [GENERATED_LAYOUT_LABELS[key] for key in GENERATED_LAYOUT_ORDER]
     )
+    ax.set_xlabel("held-out PCG layout index")
+    colorbar = fig.colorbar(image, ax=ax)
+    colorbar.set_label("mean reward")
     fig.tight_layout()
     fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)

@@ -12,6 +12,14 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 import numpy as np
 
+plt.rcParams.update({
+    "font.size": 14,
+    "axes.labelsize": 15,
+    "xtick.labelsize": 13,
+    "ytick.labelsize": 13,
+    "legend.fontsize": 13,
+})
+
 try:
     from .td_error_generalization_graph import (
         LAYOUTS,
@@ -146,7 +154,7 @@ def rolling_mean(values, window):
 
 
 def plot_num_envs(rows, args, num_envs, output_path):
-    fig, axes = plt.subplots(2, 3, figsize=(11.2, 7.0), sharex=True)
+    fig, axes = plt.subplots(2, 3, figsize=(15.0, 9.0), sharex=True)
     axes = axes.ravel()
 
     for ax, layout in zip(axes, PANELS):
@@ -194,19 +202,8 @@ def plot_num_envs(rows, args, num_envs, output_path):
         handles=handles, loc="upper center", ncol=2,
         bbox_to_anchor=(0.5, 0.91), frameon=True,
     )
-    model_label = args.model_name.replace("_", "-")
-    fig.text(
-        0.5, 0.982,
-        f"{model_label}: Train vs Evaluation TD-error Learning Curves",
-        ha="center", va="top", fontsize=14,
-    )
-    fig.text(
-        0.5, 0.948,
-        f"NUM_ENVS={num_envs}, NUM_MINIBATCHES={args.num_minibatches}",
-        ha="center", va="top", fontsize=12,
-    )
     fig.subplots_adjust(
-        left=0.07, right=0.985, bottom=0.09, top=0.80,
+        left=0.07, right=0.985, bottom=0.09, top=0.86,
         wspace=0.22, hspace=0.28,
     )
     fig.savefig(output_path)

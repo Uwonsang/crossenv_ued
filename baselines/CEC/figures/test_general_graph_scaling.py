@@ -12,13 +12,13 @@ from omegaconf import OmegaConf
 
 plt.rcParams.update(
     {
-        "font.size": 14,
-        "axes.titlesize": 16,
-        "axes.labelsize": 15,
-        "xtick.labelsize": 12,
-        "ytick.labelsize": 13,
-        "figure.titlesize": 18,
-        "legend.fontsize": 13,
+        "font.size": 18,
+        "axes.titlesize": 20,
+        "axes.labelsize": 20,
+        "xtick.labelsize": 16,
+        "ytick.labelsize": 18,
+        "figure.titlesize": 22,
+        "legend.fontsize": 18,
     }
 )
 
@@ -53,25 +53,25 @@ ALG_SOURCES = {
 }
 
 ALG_LABELS = {
-    "CEC_envs32": "CEC-32",
-    "CEC_IDAAC_envs32": "CEC-IDAAC-32",
-    "CEC_envs64": "CEC-64",
-    "CEC_IDAAC_envs64": "CEC-IDAAC-64",
-    "CEC_envs128": "CEC-128",
-    "CEC_IDAAC_envs128": "CEC-IDAAC-128",
-    "CEC_envs256": "CEC-256",
-    "CEC_IDAAC_envs256": "CEC-IDAAC-256",
+    "CEC_envs32": "CEC (32)",
+    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_envs64": "CEC (64)",
+    "CEC_IDAAC_envs64": "DCEC (64)",
+    "CEC_envs128": "CEC (128)",
+    "CEC_IDAAC_envs128": "DCEC (128)",
+    "CEC_envs256": "CEC (256)",
+    "CEC_IDAAC_envs256": "DCEC (256)",
 }
 
 ALG_COLORS = [
     "#8FD19E",  # CEC-32
-    "#56B4E9",  # CEC-IDAAC-32
+    "#56B4E9",  # DCEC (32)
     "#5ABF75",  # CEC-64
-    "#3D9BD3",  # CEC-IDAAC-64
+    "#3D9BD3",  # DCEC (64)
     "#2F9956",  # CEC-128
-    "#1F86C2",  # CEC-IDAAC-128
+    "#1F86C2",  # DCEC (128)
     "#117733",  # CEC-256
-    "#0072B2",  # CEC-IDAAC-256
+    "#0072B2",  # DCEC (256)
 ]
 
 MAP_ORDER = [
@@ -261,9 +261,6 @@ def plot_per_map(
     for j in range(len(MAP_ORDER), len(axes_flat)):
         axes_flat[j].set_visible(False)
 
-    fig.suptitle(
-        f"{evaluation_label} performance per layout", fontsize=18, y=1.02
-    )
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -285,7 +282,7 @@ def plot_overall(
     errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
-    fig, ax = plt.subplots(figsize=(14.0, 6.5))
+    fig, ax = plt.subplots(figsize=(14.0, 7.5))
     x = np.arange(len(ALG_ORDER))
     colors = [_alg_color_map()[a] for a in ALG_ORDER]
     ax.bar(
@@ -299,18 +296,79 @@ def plot_overall(
         alpha=0.92,
     )
     ax.set_xticks(x)
-    ax.set_xticklabels(
-        [ALG_LABELS[alg] for alg in ALG_ORDER],
-        rotation=25,
-        ha="right",
-    )
-    ax.set_ylabel("mean reward (average over maps)")
-    ax.set_title(
-        f"Overall {evaluation_label.lower()} performance — "
-        "average over 5 layouts"
-    )
+    overall_labels = [
+        ALG_LABELS[algorithm].replace(" ", "\n", 1)
+        for algorithm in ALG_ORDER
+    ]
+    ax.set_xticklabels(overall_labels, rotation=0, ha="center")
+    ax.tick_params(axis="x", labelsize=24, pad=12)
+    ax.tick_params(axis="y", labelsize=24)
+    ax.set_ylabel("mean reward (average over maps)", fontsize=26)
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def plot_overall_line(
+    grid: pd.DataFrame,
+    out_path: Path,
+    evaluation_label: str,
+) -> None:
+    """Plot scaling as one line per architecture without replacing the bars."""
+    overall = (
+        grid.groupby("algorithm", as_index=False)
+        .agg(
+            mean_reward=("mean_reward", "mean"),
+            std_maps=("mean_reward", "std"),
+            n_maps=("mean_reward", "count"),
+        )
+        .set_index("algorithm")
+    )
+    overall["sem_maps"] = (
+        overall["std_maps"] / np.sqrt(overall["n_maps"])
+    ).fillna(0.0)
+
+    env_counts = np.asarray([32, 64, 128, 256])
+    x = np.arange(len(env_counts))
+    families = (
+        (
+            "CEC",
+            [f"CEC_envs{num_envs}" for num_envs in env_counts],
+            "#117733",
+            "o",
+        ),
+        (
+            "DCEC",
+            [f"CEC_IDAAC_envs{num_envs}" for num_envs in env_counts],
+            "#0072B2",
+            "s",
+        ),
+    )
+
+    fig, ax = plt.subplots(figsize=(9.0, 6.5))
+    for label, algorithm_keys, color, marker in families:
+        family = overall.reindex(algorithm_keys)
+        ax.errorbar(
+            x,
+            family["mean_reward"].to_numpy(dtype=float),
+            yerr=family["sem_maps"].to_numpy(dtype=float),
+            label=label,
+            color=color,
+            marker=marker,
+            markersize=9,
+            linewidth=2.8,
+            capsize=5,
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(env_counts)
+    ax.set_xlabel("Number of parallel training environments")
+    ax.set_ylabel("mean reward (average over maps)")
+    ax.grid(alpha=0.35)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False)
     fig.tight_layout()
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -341,11 +399,13 @@ def save_graph_set(
     os.makedirs(out_path, exist_ok=True)
     per_map_pdf = out_path / f"{file_prefix}_per_map.pdf"
     overall_pdf = out_path / f"{file_prefix}_overall.pdf"
+    overall_line_pdf = out_path / f"{file_prefix}_overall_line.pdf"
     per_map_csv = out_path / f"{file_prefix}_per_map_table.csv"
     overall_csv = out_path / f"{file_prefix}_overall_table.csv"
 
     plot_per_map(grid, per_map_pdf, evaluation_label)
     plot_overall(grid, overall_pdf, evaluation_label)
+    plot_overall_line(grid, overall_line_pdf, evaluation_label)
 
     pivot = grid.pivot_table(
         index="map", columns="algorithm", values="mean_reward", aggfunc="first"
@@ -370,6 +430,7 @@ def save_graph_set(
 
     print(f"Saved: {per_map_pdf}")
     print(f"Saved: {overall_pdf}")
+    print(f"Saved: {overall_line_pdf}")
     print(f"Saved: {per_map_csv}")
     print(f"Saved: {overall_csv}")
 
@@ -410,9 +471,9 @@ def main(config):
             else "test_general_scaling_xp_with_sp"
         ),
         (
-            "CEC vs CEC-IDAAC scaling cross-play"
+            "CEC vs DCEC scaling cross-play"
             if xp_only
-            else "CEC vs CEC-IDAAC scaling cross-play + self-play"
+            else "CEC vs DCEC scaling cross-play + self-play"
         ),
     )
     human_proxy_grid = load_human_proxy_grid(human_proxy_results_path)
@@ -421,7 +482,7 @@ def main(config):
         human_proxy_results_path,
         human_proxy_out_path,
         "test_general_scaling_human_proxy",
-        "CEC vs CEC-IDAAC scaling human-proxy",
+        "CEC vs DCEC scaling human-proxy",
     )
 
 

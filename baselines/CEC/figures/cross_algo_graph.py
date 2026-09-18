@@ -9,11 +9,25 @@ from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 import pandas as pd
 
+plt.rcParams.update(
+    {
+        "font.size": 18,
+        "axes.titlesize": 22,
+        "axes.labelsize": 20,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+    }
+)
+
 # ──────────────────────────────────────────────
 # Config
 # ──────────────────────────────────────────────
-DEFAULT_RESULTS_DIR = Path(__file__).parent.parent / "results" / "cross_algo"
-DEFAULT_SAVE_DIR = Path(__file__).parent / "results" / "cross_algo_graph"
+DEFAULT_RESULTS_DIR = Path(
+    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/xp_results_diff_algo"
+)
+DEFAULT_SAVE_DIR = (
+    Path(__file__).resolve().parents[3] / "artifacts" / "cross_algo_graph"
+)
 
 ALGO_RENAME = {
     "IPPO": "IPPO",
@@ -78,9 +92,27 @@ def normalize_pivot(pivot: pd.DataFrame) -> pd.DataFrame:
 # ──────────────────────────────────────────────
 # Plotting
 # ──────────────────────────────────────────────
-def plot_heatmap(ax: plt.Axes, data: pd.DataFrame, title: str,
-                 xlabel: str, ylabel: str, vmin: float, vmax: float):
+def plot_heatmap(
+    ax: plt.Axes,
+    data: pd.DataFrame,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+    vmin: float,
+    vmax: float,
+    *,
+    label_fontsize: int = 20,
+    axis_fontsize: int = 22,
+    title_fontsize: int = 24,
+    value_fontsize: int = 17,
+):
     algos = list(data.index)
+    display_algos = [
+        algorithm.replace(" ", "\n", 1)
+        if algorithm.startswith("DCEC ")
+        else algorithm
+        for algorithm in algos
+    ]
     mat = data.values.astype(float)
 
     im = ax.imshow(
@@ -88,24 +120,24 @@ def plot_heatmap(ax: plt.Axes, data: pd.DataFrame, title: str,
         cmap=CEC_IDAAC_BLUE,
         vmin=vmin,
         vmax=vmax,
-        aspect="auto",
+        aspect="equal",
     )
     ax.set_xticks(range(len(algos)))
     ax.set_xticklabels(
-        algos, fontsize=11, rotation=30, ha="right", rotation_mode="anchor"
+        display_algos, fontsize=label_fontsize, rotation=0, ha="center"
     )
     ax.set_yticks(range(len(algos)))
-    ax.set_yticklabels(algos, fontsize=11)
-    ax.set_xlabel(xlabel, fontsize=13)
-    ax.set_ylabel(ylabel, fontsize=13)
-    ax.set_title(title, fontsize=15, fontweight="bold")
+    ax.set_yticklabels(display_algos, fontsize=label_fontsize)
+    ax.set_xlabel(xlabel, fontsize=axis_fontsize)
+    ax.set_ylabel(ylabel, fontsize=axis_fontsize)
+    ax.set_title(title, fontsize=title_fontsize, fontweight="bold", pad=12)
 
     for i in range(len(algos)):
         for j in range(len(algos)):
             v = mat[i, j]
             if not np.isnan(v):
                 ax.text(j, i, f"{v:.1f}", ha="center", va="center",
-                        fontsize=11, color="black")
+                        fontsize=value_fontsize, color="black")
     return im
 
 
@@ -124,7 +156,7 @@ def save_figures(
     # per-layout
     # Five layouts are easier to read as three panels on the first row and
     # two centered panels on the second row than as one very wide strip.
-    fig = plt.figure(figsize=(18, 11))
+    fig = plt.figure(figsize=(24.6, 12.4))
     grid = fig.add_gridspec(2, 6)
     axes = [
         fig.add_subplot(grid[0, 0:2]),
@@ -135,9 +167,19 @@ def save_figures(
     ]
 
     for ax, (layout, pivot) in zip(axes, pivots_raw.items()):
-        im = plot_heatmap(ax, pivot, LAYOUT_LABEL[layout],
-                          xlabel=xlabel, ylabel=ylabel,
-                          vmin=color_min, vmax=color_max)
+        im = plot_heatmap(
+            ax,
+            pivot,
+            LAYOUT_LABEL[layout],
+            xlabel=xlabel,
+            ylabel=ylabel,
+            vmin=color_min,
+            vmax=color_max,
+            label_fontsize=14,
+            axis_fontsize=17,
+            title_fontsize=20,
+            value_fontsize=14,
+        )
     for ax in axes[len(pivots_raw):]:
         ax.set_visible(False)
 
@@ -147,7 +189,8 @@ def save_figures(
     )
     cbar_ax = fig.add_axes([0.94, 0.17, 0.012, 0.66])
     cbar = fig.colorbar(im, cax=cbar_ax)
-    cbar.set_label("Mean Reward", fontsize=13)
+    cbar.set_label("Mean Reward", fontsize=18)
+    cbar.ax.tick_params(labelsize=15)
 
     out = save_dir / f"cross_algo_per_layout_{tag}.pdf"
     fig.savefig(out, bbox_inches="tight")
@@ -165,7 +208,7 @@ def save_figures(
         if np.isclose(layout_color_min, layout_color_max):
             layout_color_min -= 0.5
             layout_color_max += 0.5
-        single_fig, single_ax = plt.subplots(figsize=(7.5, 6.2))
+        single_fig, single_ax = plt.subplots(figsize=(14.0, 7.5))
         single_im = plot_heatmap(
             single_ax,
             pivot,
@@ -178,7 +221,8 @@ def save_figures(
         single_cbar = single_fig.colorbar(
             single_im, ax=single_ax, pad=0.04, fraction=0.05
         )
-        single_cbar.set_label("Mean Reward", fontsize=13)
+        single_cbar.set_label("Mean Reward", fontsize=22)
+        single_cbar.ax.tick_params(labelsize=18)
         single_fig.tight_layout()
         single_out = save_dir / f"cross_algo_{layout}_{tag}.pdf"
         single_fig.savefig(single_out, bbox_inches="tight")
@@ -193,14 +237,14 @@ def save_figures(
         mean_mat, index=ref.index, columns=ref.columns
     )
 
-    fig2, ax2 = plt.subplots(figsize=(5, 4.5))
-    im2 = plot_heatmap(ax2, overall_pivot, "",
+    fig2, ax2 = plt.subplots(figsize=(14.0, 7.5))
+    im2 = plot_heatmap(ax2, overall_pivot, "Overall",
                        xlabel=xlabel, ylabel=ylabel,
                        vmin=color_min, vmax=color_max)
-    fig2.subplots_adjust(right=0.85)
-    cbar_ax2 = fig2.add_axes([0.87, 0.15, 0.025, 0.7])
-    cbar2 = fig2.colorbar(im2, cax=cbar_ax2)
-    cbar2.set_label("Mean Reward", fontsize=13)
+    cbar2 = fig2.colorbar(im2, ax=ax2, pad=0.04, fraction=0.05)
+    cbar2.set_label("Mean Reward", fontsize=22)
+    cbar2.ax.tick_params(labelsize=18)
+    fig2.tight_layout()
 
     out2 = save_dir / f"cross_algo_overall_{tag}.pdf"
     fig2.savefig(out2, bbox_inches="tight")

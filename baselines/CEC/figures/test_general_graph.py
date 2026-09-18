@@ -23,7 +23,7 @@ plt.rcParams.update(
 )
 
 DEFAULT_XP_RESULTS_DIR = Path(
-    "/app/nas/models/ICRL/xp_results"
+    "/mnt/nas/wonsang/crossenv_ued/models/ICRL/xp_results"
 )
 DEFAULT_HUMAN_PROXY_RESULTS_DIR = Path(
     "/app/nas/models/ICRL/human_proxy_results"
@@ -205,7 +205,7 @@ def plot_per_map(
     fig, axes = plt.subplots(
         nrows,
         ncols,
-        figsize=(6.0 * ncols, 4.8 * nrows),
+        figsize=(8.2 * ncols, 6.2 * nrows),
         squeeze=False,
     )
     axes_flat = axes.ravel()
@@ -239,14 +239,18 @@ def plot_per_map(
             alpha=0.9,
         )
         ax.set_xticks(x)
-        ax.set_xticklabels(
-            [ALG_LABELS[alg] for alg in ALG_ORDER],
-            rotation=30,
-            ha="right",
-        )
+        panel_labels = [
+            ALG_LABELS[alg].replace(" ", "\n", 1)
+            if ALG_LABELS[alg].startswith("DCEC ")
+            else ALG_LABELS[alg]
+            for alg in ALG_ORDER
+        ]
+        ax.set_xticklabels(panel_labels, rotation=0, ha="center")
+        ax.tick_params(axis="x", labelsize=18, pad=8)
+        ax.tick_params(axis="y", labelsize=18)
         label = MAP_LABEL_KO.get(map_name, map_name)
-        ax.set_title(label)
-        ax.set_ylabel("mean reward")
+        ax.set_title(label, fontsize=22, fontweight="bold", pad=12)
+        ax.set_ylabel("mean reward", fontsize=20)
         ax.grid(axis="y", alpha=0.35)
         ax.set_axisbelow(True)
 

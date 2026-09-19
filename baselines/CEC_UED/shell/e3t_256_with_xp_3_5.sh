@@ -4,7 +4,7 @@ set -e
 cd "$(dirname "$0")/../../.."
 export PYTHONPATH="$PWD/baselines/CEC_UED:$PWD:${PYTHONPATH:-}"
 
-seeds=(1 2)
+seeds=(4 5)
 
 for map in wall_a; do
   group="E3T 256 ${map^^}"

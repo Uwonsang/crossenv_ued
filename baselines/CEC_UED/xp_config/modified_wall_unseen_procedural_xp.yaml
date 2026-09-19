@@ -12,10 +12,14 @@
   "incentivize_strat": 2
 
 "MODEL_GROUP": "ippo_empty"
-"CKPT_NUM_ENVS": 64
+"CKPT_NUM_ENVS": 256
 "SEEDS": [0, 1, 2, 3, 4, 5]
 "layout_names": ["empty", "wall_a"]
 "NUM_PROCEDURAL_TASKS": 100
+"TASKS_PER_UNSEEN_LAYOUT": 100
+"TASK_LIMITS": [100, 200, 300, 400, 500]
+"EVAL_BATCH_SIZE": 100
+"STATE_SEED": 20260919
 "ACTION_SEED": 2026
 "BETA": 1.0
 "ARGMAX": false
@@ -24,9 +28,5 @@
 "IDAAC_CLF_HIDDEN_SIZE": 4
 
 "HELDOUT_PATH": "baselines/CEC_UED/results/procedural_xp/modified_wall_heldout_100.npz"
-"RESULTS_DIR": "baselines/CEC_UED/results/procedural_xp"
-
-"ENTITY": "overcooked_ai"
-"PROJECT": "crossenv_ued_ICLR_dual_destination"
-"WANDB_MODE": "disabled"
-"WANDB_GROUP": null
+"UNSEEN_BANK_PATH": "baselines/CEC_UED/results/unseen_procedural_xp/procedural_500.npz"
+"RESULTS_DIR": "baselines/CEC_UED/results/unseen_procedural_xp"

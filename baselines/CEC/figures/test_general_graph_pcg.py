@@ -67,8 +67,8 @@ ALGORITHM_LABELS = {
     "E3T": "E3T",
     "FCP": "FCP",
     "CEC_envs64": "CEC",
-    "CEC_IDAAC_envs32": "DCEC (32)",
-    "CEC_IDAAC_envs256": "DCEC (256)",
+    "CEC_IDAAC_envs32": "DCEC (8K)",
+    "CEC_IDAAC_envs256": "DCEC (65K)",
 }
 
 ALGORITHM_COLORS = {
@@ -90,10 +90,10 @@ GENERATED_LAYOUT_ORDER = [
 
 GENERATED_LAYOUT_LABELS = {
     "CEC_envs64": "CEC",
-    "CEC_IDAAC_envs32": "DCEC (32)",
+    "CEC_IDAAC_envs32": "DCEC (8K)",
     "CEC_IDAAC_envs64": "DCEC (64)",
     "CEC_IDAAC_envs128": "DCEC (128)",
-    "CEC_IDAAC_envs256": "DCEC (256)",
+    "CEC_IDAAC_envs256": "DCEC (65K)",
 }
 
 CHECKPOINT_LAYOUT_ORDER = [

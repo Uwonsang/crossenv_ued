@@ -62,6 +62,18 @@ COLORS = {
     128: "#ff7f0e",
     256: "#d62728",
 }
+NUM_ENVS_LABELS = {
+    32: "8K",
+    64: "16K",
+    128: "32K",
+    256: "65K",
+}
+
+
+def num_envs_label(num_envs) -> str:
+    """Return the effective batch-size label used in publication figures."""
+    value = int(num_envs)
+    return NUM_ENVS_LABELS.get(value, str(value))
 
 
 def parse_args() -> argparse.Namespace:
@@ -434,7 +446,7 @@ def plot_model(
             label_dx = -5 if px > x_mid else 5
             label_dy = -5 if py > y_mid else 5
             ax.annotate(
-                str(point["num_envs"]), (px, py),
+                num_envs_label(point["num_envs"]), (px, py),
                 xytext=(label_dx, label_dy), textcoords="offset points",
                 ha="right" if label_dx < 0 else "left",
                 va="top" if label_dy < 0 else "bottom",
@@ -561,7 +573,7 @@ def plot_model_individual_runs(
         legend_handles.append(Line2D(
             [0], [0], marker="o", linestyle="none", markersize=6,
             markerfacecolor=COLORS.get(num_envs, "#1f4e99"),
-            markeredgecolor="white", label=f"{num_envs} envs",
+            markeredgecolor="white", label=num_envs_label(num_envs),
         ))
     fig.legend(
         handles=legend_handles, loc="upper center", ncol=len(legend_handles),
@@ -646,7 +658,7 @@ def plot_models_combined(rows, models, output_path: Path, aggregation: str):
                 if py >= y_mid and math.isclose(py, float(y.max())):
                     label_dy = -5
                 ax.annotate(
-                    str(point["num_envs"]), (px, py),
+                    num_envs_label(point["num_envs"]), (px, py),
                     xytext=(label_dx, label_dy), textcoords="offset points",
                     ha="right" if label_dx < 0 else "left",
                     va="top" if label_dy < 0 else "bottom",
@@ -804,7 +816,7 @@ def plot_models_combined_individual(
         Line2D(
             [0], [0], marker="o", linestyle="none", markersize=6,
             markerfacecolor=COLORS.get(num_envs, "#1f4e99"),
-            markeredgecolor="white", label=f"{num_envs} envs",
+            markeredgecolor="white", label=num_envs_label(num_envs),
         )
         for num_envs in sorted({row["num_envs"] for row in rows})
     ]
@@ -901,7 +913,7 @@ def plot_mean_comparison(
             dx = -6 if px > x_mid else 6
             dy = -6 if py > y_mid else 6
             ax.annotate(
-                str(point["num_envs"]), (px, py),
+                num_envs_label(point["num_envs"]), (px, py),
                 xytext=(dx, dy), textcoords="offset points",
                 ha="right" if dx < 0 else "left",
                 va="top" if dy < 0 else "bottom",
@@ -984,7 +996,7 @@ def plot_mean_separate(model, rows, output_path: Path):
         dx = -6 if px > x_mid else 6
         dy = -6 if py > y_mid else 6
         ax.annotate(
-            str(point["num_envs"]), (px, py),
+            num_envs_label(point["num_envs"]), (px, py),
             xytext=(dx, dy), textcoords="offset points",
             ha="right" if dx < 0 else "left",
             va="top" if dy < 0 else "bottom",
@@ -1057,7 +1069,7 @@ def plot_mean_overview_zoom(
             dx = -6 if px > x_mid else 6
             dy = -6 if py > y_mid else 6
             ax.annotate(
-                str(point["num_envs"]), (px, py),
+                num_envs_label(point["num_envs"]), (px, py),
                 xytext=(dx, dy), textcoords="offset points",
                 ha="right" if dx < 0 else "left",
                 va="top" if dy < 0 else "bottom",

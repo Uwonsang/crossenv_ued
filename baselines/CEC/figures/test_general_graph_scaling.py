@@ -53,25 +53,25 @@ ALG_SOURCES = {
 }
 
 ALG_LABELS = {
-    "CEC_envs32": "CEC (32)",
-    "CEC_IDAAC_envs32": "DCEC (32)",
-    "CEC_envs64": "CEC (64)",
-    "CEC_IDAAC_envs64": "DCEC (64)",
-    "CEC_envs128": "CEC (128)",
-    "CEC_IDAAC_envs128": "DCEC (128)",
-    "CEC_envs256": "CEC (256)",
-    "CEC_IDAAC_envs256": "DCEC (256)",
+    "CEC_envs32": "CEC (8K)",
+    "CEC_IDAAC_envs32": "DCEC (8K)",
+    "CEC_envs64": "CEC (16K)",
+    "CEC_IDAAC_envs64": "DCEC (16K)",
+    "CEC_envs128": "CEC (32K)",
+    "CEC_IDAAC_envs128": "DCEC (32K)",
+    "CEC_envs256": "CEC (65K)",
+    "CEC_IDAAC_envs256": "DCEC (65K)",
 }
 
 ALG_COLORS = [
-    "#8FD19E",  # CEC-32
-    "#56B4E9",  # DCEC (32)
-    "#5ABF75",  # CEC-64
-    "#3D9BD3",  # DCEC (64)
-    "#2F9956",  # CEC-128
-    "#1F86C2",  # DCEC (128)
-    "#117733",  # CEC-256
-    "#0072B2",  # DCEC (256)
+    "#8FD19E",  # CEC (8K)
+    "#56B4E9",  # DCEC (8K)
+    "#5ABF75",  # CEC (16K)
+    "#3D9BD3",  # DCEC (16K)
+    "#2F9956",  # CEC (32K)
+    "#1F86C2",  # DCEC (32K)
+    "#117733",  # CEC (65K)
+    "#0072B2",  # DCEC (65K)
 ]
 
 MAP_ORDER = [
@@ -363,7 +363,7 @@ def plot_overall_line(
         )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(env_counts)
+    ax.set_xticklabels(["8K", "16K", "32K", "65K"])
     ax.set_xlabel("Number of parallel training environments")
     ax.set_ylabel("mean reward (average over maps)")
     ax.grid(alpha=0.35)

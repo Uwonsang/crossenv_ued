@@ -53,8 +53,8 @@ ALG_LABELS = {
     "E3T": "E3T",
     "FCP": "FCP",
     "CEC_envs64": "CEC",
-    "CEC_IDAAC_envs32": "DCEC (32)",
-    "CEC_IDAAC_envs256": "DCEC (256)",
+    "CEC_IDAAC_envs32": "DCEC (8K)",
+    "CEC_IDAAC_envs256": "DCEC (65K)",
 }
 
 ALG_COLORS = [
@@ -62,8 +62,8 @@ ALG_COLORS = [
     "#7b126b",  # E3T
     "#e3a21a",  # FCP
     "#117733",  # CEC (64)
-    "#56B4E9",  # DCEC (32): Okabe-Ito sky blue
-    "#0072B2",  # DCEC (256): Okabe-Ito blue
+    "#56B4E9",  # DCEC (8K): Okabe-Ito sky blue
+    "#0072B2",  # DCEC (65K): Okabe-Ito blue
 ]
 
 MAP_ORDER = [

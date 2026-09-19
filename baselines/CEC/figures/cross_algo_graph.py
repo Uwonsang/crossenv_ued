@@ -34,12 +34,12 @@ ALGO_RENAME = {
     "E3T": "E3T",
     "FCP": "FCP",
     "CEC_envs64": "CEC",
-    "CEC_IDAAC_envs32": "DCEC (32)",
-    "CEC_IDAAC_envs256": "DCEC (256)",
+    "CEC_IDAAC_envs32": "DCEC (8K)",
+    "CEC_IDAAC_envs256": "DCEC (65K)",
 }
 ALGO_ORDER = [
     "IPPO", "E3T", "FCP", "CEC",
-    "DCEC (32)", "DCEC (256)",
+    "DCEC (8K)", "DCEC (65K)",
 ]
 
 LAYOUT_ORDER = [

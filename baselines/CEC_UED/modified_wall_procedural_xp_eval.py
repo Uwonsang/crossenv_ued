@@ -77,10 +77,28 @@ def resolve_path(path):
     return Path(get_original_cwd()) / path
 
 
+def fixed_checkpoint_variant(config, train_map):
+    num_envs = int(config["CKPT_NUM_ENVS"])
+    if num_envs == 64:
+        return train_map
+    if num_envs == 256:
+        return f"{train_map}_with_xp_numenv256"
+    raise ValueError(f"CKPT_NUM_ENVS must be 64 or 256, got {num_envs}")
+
+
+def mixed_checkpoint_variant(config):
+    num_envs = int(config["CKPT_NUM_ENVS"])
+    if num_envs not in (64, 256):
+        raise ValueError(f"CKPT_NUM_ENVS must be 64 or 256, got {num_envs}")
+    return f"mixed_empty_wall_a_with_xp_numenv{num_envs}"
+
+
 def checkpoint_patterns(config, model_group, seed):
     base = Path("ckpts")
     if model_group.startswith("ippo_"):
-        train_map = MODEL_SPECS[model_group]["train_map"]
+        train_map = fixed_checkpoint_variant(
+            config, MODEL_SPECS[model_group]["train_map"]
+        )
         return [
             str(
                 base
@@ -96,7 +114,9 @@ def checkpoint_patterns(config, model_group, seed):
             )
         ]
     if model_group.startswith("e3t_"):
-        train_map = MODEL_SPECS[model_group]["train_map"]
+        train_map = fixed_checkpoint_variant(
+            config, MODEL_SPECS[model_group]["train_map"]
+        )
         return [
             str(
                 base
@@ -112,7 +132,7 @@ def checkpoint_patterns(config, model_group, seed):
             )
         ]
     if model_group == "cec":
-        root = f"mixed_empty_wall_a_{config['CEC_CKPT_TAG']}"
+        root = mixed_checkpoint_variant(config)
         return [
             str(
                 base
@@ -128,7 +148,7 @@ def checkpoint_patterns(config, model_group, seed):
             )
         ]
     if model_group == "idaac_cec":
-        root = f"mixed_empty_wall_a_{config['IDAAC_CKPT_TAG']}"
+        root = mixed_checkpoint_variant(config)
         return [
             str(
                 base
@@ -513,7 +533,7 @@ def initialize_wandb(config, spec, model_group, checkpoint_paths, manifest):
         entity=config["ENTITY"],
         project=config["PROJECT"],
         group=group,
-        name=f"FINAL_XP_{model_group}",
+        name=f"FINAL_XP_{model_group}_numenv{config['CKPT_NUM_ENVS']}",
         job_type="final_xp_eval",
         tags=["final_xp", "procedural_100", model_group],
         config=wandb_config,
@@ -533,6 +553,11 @@ def main(config):
         valid = ", ".join(MODEL_SPECS)
         raise ValueError(f"Unknown MODEL_GROUP={model_group!r}. Choose one of: {valid}")
     spec = MODEL_SPECS[model_group]
+    checkpoint_num_envs = int(config["CKPT_NUM_ENVS"])
+    if checkpoint_num_envs not in (64, 256):
+        raise ValueError(
+            f"CKPT_NUM_ENVS must be 64 or 256, got {checkpoint_num_envs}"
+        )
     seeds = [int(seed) for seed in config["SEEDS"]]
     if len(seeds) < 2:
         raise ValueError("Cross-play requires at least two seeds")
@@ -581,6 +606,7 @@ def main(config):
                 {
                     "model_group": model_group,
                     "algorithm": spec["algorithm"],
+                    "num_envs": checkpoint_num_envs,
                     "train_map": spec["train_map"],
                     "split": "procedural",
                     "state_id": int(state_id),
@@ -597,6 +623,7 @@ def main(config):
                 {
                     "model_group": model_group,
                     "algorithm": spec["algorithm"],
+                    "num_envs": checkpoint_num_envs,
                     "train_map": spec["train_map"],
                     "split": "fixed",
                     "state_id": int(state_id),
@@ -614,14 +641,16 @@ def main(config):
     for frame in (ordered_summary, pair_summary, summary):
         frame.insert(0, "model_group", model_group)
         frame.insert(1, "algorithm", spec["algorithm"])
-        frame.insert(2, "train_map", spec["train_map"])
+        frame.insert(2, "num_envs", checkpoint_num_envs)
+        frame.insert(3, "train_map", spec["train_map"])
 
     results_dir = resolve_path(config["RESULTS_DIR"])
     results_dir.mkdir(parents=True, exist_ok=True)
-    episodes_path = results_dir / f"{model_group}_episodes.csv"
-    ordered_path = results_dir / f"{model_group}_ordered_pairs.csv"
-    pairs_path = results_dir / f"{model_group}_pairs.csv"
-    summary_path = results_dir / f"{model_group}_summary.csv"
+    result_prefix = f"{model_group}_numenv{checkpoint_num_envs}"
+    episodes_path = results_dir / f"{result_prefix}_episodes.csv"
+    ordered_path = results_dir / f"{result_prefix}_ordered_pairs.csv"
+    pairs_path = results_dir / f"{result_prefix}_pairs.csv"
+    summary_path = results_dir / f"{result_prefix}_summary.csv"
     episodes.to_csv(episodes_path, index=False)
     ordered_summary.to_csv(ordered_path, index=False)
     pair_summary.to_csv(pairs_path, index=False)

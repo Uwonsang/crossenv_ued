@@ -1,0 +1,266 @@
+[
+  {
+    "algorithm": "CEC",
+    "num_envs": 64,
+    "layout": "mixed",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 3,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "CEC",
+    "num_envs": 256,
+    "layout": "mixed",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  },
+  {
+    "algorithm": "E3T",
+    "num_envs": 64,
+    "layout": "empty",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "E3T",
+    "num_envs": 64,
+    "layout": "wall_a",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "E3T",
+    "num_envs": 256,
+    "layout": "empty",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  },
+  {
+    "algorithm": "E3T",
+    "num_envs": 256,
+    "layout": "wall_a",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  },
+  {
+    "algorithm": "IDAAC+CEC",
+    "num_envs": 64,
+    "layout": "mixed",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "IDAAC+CEC",
+    "num_envs": 256,
+    "layout": "mixed",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  },
+  {
+    "algorithm": "IPPO",
+    "num_envs": 64,
+    "layout": "empty",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "IPPO",
+    "num_envs": 64,
+    "layout": "wall_a",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      15625
+    ]
+  },
+  {
+    "algorithm": "IPPO",
+    "num_envs": 256,
+    "layout": "empty",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  },
+  {
+    "algorithm": "IPPO",
+    "num_envs": 256,
+    "layout": "wall_a",
+    "seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "extra_seeds": [
+      98
+    ],
+    "configs_found": 6,
+    "valid_arrays": 6,
+    "distinct_parameters": 6,
+    "updates": [
+      3906
+    ]
+  }
+]

@@ -1,199 +1,217 @@
 import argparse
-import shutil
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import pandas as pd
-import yaml
 
 
-ALGORITHM_FILES = {
-    "IPPO": ["ippo_empty_pairs.csv", "ippo_wall_a_pairs.csv"],
-    "E3T": ["e3t_empty_pairs.csv", "e3t_wall_a_pairs.csv"],
-    "CEC": ["cec_pairs.csv"],
-    "CEC+IDAAC": ["idaac_cec_pairs.csv"],
+ENV_LABELS = {
+    32: "8K",
+    64: "16K",
+    128: "32K",
+    256: "65K",
 }
 
-MODEL_GROUPS = (
-    "ippo_empty",
-    "ippo_wall_a",
-    "e3t_empty",
-    "e3t_wall_a",
-    "cec",
-    "idaac_cec",
+ALGORITHM_GROUPS = {
+    "IPPO": ("ippo_empty", "ippo_wall_a"),
+    "E3T": ("e3t_empty", "e3t_wall_a"),
+    "CEC": ("cec",),
+    "DCEC": ("idaac_cec",),
+}
+
+COLORS = {
+    "IPPO": "#D62F3A",
+    "E3T": "#92278F",
+    "CEC": "#238B45",
+    "DCEC_16K": "#67B7DF",
+    "DCEC_65K": "#1F82B7",
+}
+
+PLOT_SPECS = (
+    {
+        "name": "fixed_env64_all_algorithms",
+        "split": "fixed",
+        "series": (("IPPO", 64), ("E3T", 64), ("CEC", 64), ("DCEC", 64)),
+    },
+    {
+        "name": "fixed_env256_all_algorithms",
+        "split": "fixed",
+        "series": (("IPPO", 256), ("E3T", 256), ("CEC", 256), ("DCEC", 256)),
+    },
+    {
+        "name": "procedural_env64_all_algorithms",
+        "split": "procedural",
+        "series": (("IPPO", 64), ("E3T", 64), ("CEC", 64), ("DCEC", 64)),
+    },
+    {
+        "name": "procedural_env256_all_algorithms",
+        "split": "procedural",
+        "series": (("IPPO", 256), ("E3T", 256), ("CEC", 256), ("DCEC", 256)),
+    },
+    {
+        "name": "fixed_selected",
+        "split": "fixed",
+        "series": (
+            ("IPPO", 64),
+            ("E3T", 64),
+            ("CEC", 64),
+            ("DCEC", 64),
+            ("DCEC", 256),
+        ),
+    },
+    {
+        "name": "procedural_selected",
+        "split": "procedural",
+        "series": (
+            ("IPPO", 64),
+            ("E3T", 64),
+            ("CEC", 64),
+            ("DCEC", 64),
+            ("DCEC", 256),
+        ),
+    },
 )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Plot ToyCoopNoPink cross-play rewards with SEM error bars."
+    )
     parser.add_argument(
         "--results-dir",
-        default="baselines/CEC_UED/results/procedural_xp",
+        type=Path,
+        default=Path("baselines/CEC_UED/results/procedural_xp"),
     )
-    parser.add_argument("--entity", default="overcooked_ai")
-    parser.add_argument("--project", default="crossenv_ued_ICLR_dual_destination")
-    parser.add_argument("--wandb-mode", default="online")
-    parser.add_argument("--download-artifacts", action="store_true")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("baselines/CEC_UED/results/procedural_xp/plots"),
+    )
     return parser.parse_args()
 
 
-def load_algorithm_results(results_dir, algorithm, filenames):
+def load_pair_values(results_dir, algorithm, num_envs):
     frames = []
-    for filename in filenames:
-        path = results_dir / filename
+    for model_group in ALGORITHM_GROUPS[algorithm]:
+        path = results_dir / f"{model_group}_numenv{num_envs}_pairs.csv"
         if not path.exists():
-            raise FileNotFoundError(f"Missing evaluation result: {path}")
+            raise FileNotFoundError(f"Missing XP pair results: {path}")
         frames.append(pd.read_csv(path))
+
     frame = pd.concat(frames, ignore_index=True)
-    frame = (
+    # IPPO/E3T have separate empty and wall_a populations. Average the two
+    # training conditions within each seed pair before computing SEM.
+    return (
         frame.groupby(["split", "seed_pair"], as_index=False)
         .agg(
-            normalized_return_mean=("normalized_return_mean", "mean"),
-            success_rate=("success_rate", "mean"),
+            reward=("reward_mean", "mean"),
+            normalized=("normalized_return_mean", "mean"),
         )
     )
+
+
+def build_statistics(results_dir):
     rows = []
-    for split, split_frame in frame.groupby("split"):
-        rows.append(
-            {
-                "algorithm": algorithm,
-                "split": split,
-                "normalized_return_mean": float(
-                    split_frame["normalized_return_mean"].mean()
-                ),
-                "normalized_return_sem": float(
-                    split_frame["normalized_return_mean"].sem()
-                ),
-                "success_rate": float(split_frame["success_rate"].mean()),
-                "num_seed_pair_samples": int(len(split_frame)),
-            }
-        )
-    return rows
-
-
-def download_evaluation_artifacts(args, results_dir):
-    import wandb
-
-    api = wandb.Api()
-    artifact_root = results_dir / "wandb_artifacts"
-    for model_group in MODEL_GROUPS:
-        artifact = api.artifact(
-            f"{args.entity}/{args.project}/"
-            f"modified-wall-procedural-xp-{model_group}:latest"
-        )
-        download_dir = Path(
-            artifact.download(root=str(artifact_root / model_group))
-        )
-        source = download_dir / f"{model_group}_pairs.csv"
-        if not source.exists():
-            matches = list(download_dir.rglob(f"{model_group}_pairs.csv"))
-            if len(matches) != 1:
-                raise FileNotFoundError(
-                    f"Artifact for {model_group} does not contain its pair results"
+    for algorithm in ALGORITHM_GROUPS:
+        for num_envs in (64, 256):
+            pair_values = load_pair_values(results_dir, algorithm, num_envs)
+            for split, split_frame in pair_values.groupby("split"):
+                rows.append(
+                    {
+                        "algorithm": algorithm,
+                        "num_envs": num_envs,
+                        "budget": ENV_LABELS[num_envs],
+                        "split": split,
+                        "reward_mean": split_frame["reward"].mean(),
+                        "reward_sem": split_frame["reward"].sem(),
+                        "normalized_mean": split_frame["normalized"].mean(),
+                        "normalized_sem": split_frame["normalized"].sem(),
+                        "num_seed_pairs": len(split_frame),
+                    }
                 )
-            source = matches[0]
-        shutil.copy2(source, results_dir / source.name)
+    return pd.DataFrame(rows)
 
 
-def make_figure(summary, output_png, output_pdf):
-    algorithms = list(ALGORITHM_FILES)
-    split_titles = {
-        "fixed": "Fixed Tasks",
-        "procedural": "100 Procedural Tasks",
-    }
-    colors = ["#4C78A8", "#F58518", "#54A24B", "#B279A2"]
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=True)
-    for axis, split in zip(axes, ("fixed", "procedural")):
-        split_frame = summary[summary["split"] == split].set_index("algorithm")
-        means = [split_frame.loc[name, "normalized_return_mean"] for name in algorithms]
-        sems = [split_frame.loc[name, "normalized_return_sem"] for name in algorithms]
-        axis.bar(algorithms, means, yerr=sems, capsize=4, color=colors)
-        axis.set_title(split_titles[split])
-        axis.set_xlabel("Algorithm")
-        axis.grid(axis="y", alpha=0.25)
-        axis.tick_params(axis="x", rotation=15)
-    axes[0].set_ylabel("Normalized XP Return")
+def bar_color(algorithm, budget):
+    if algorithm == "DCEC":
+        return COLORS[f"DCEC_{budget}"]
+    return COLORS[algorithm]
+
+
+def draw_plot(statistics, spec, metric, output_dir):
+    mean_column = f"{metric}_mean"
+    sem_column = f"{metric}_sem"
+    rows = []
+    labels = []
+    colors = []
+
+    for algorithm, num_envs in spec["series"]:
+        match = statistics[
+            (statistics["algorithm"] == algorithm)
+            & (statistics["num_envs"] == num_envs)
+            & (statistics["split"] == spec["split"])
+        ]
+        if len(match) != 1:
+            raise ValueError(
+                f"Expected one row for {algorithm}, NUM_ENVS={num_envs}, "
+                f"split={spec['split']}; found {len(match)}"
+            )
+        row = match.iloc[0]
+        rows.append(row)
+        labels.append(f"{algorithm}\n({row['budget']})")
+        colors.append(bar_color(algorithm, row["budget"]))
+
+    means = [row[mean_column] for row in rows]
+    sems = [row[sem_column] for row in rows]
+    fig, axis = plt.subplots(figsize=(7.2, 4.4))
+    axis.bar(
+        labels,
+        means,
+        yerr=sems,
+        capsize=4,
+        color=colors,
+        edgecolor="#222222",
+        linewidth=0.8,
+        error_kw={"elinewidth": 1.1, "capthick": 1.1},
+    )
+    axis.axhline(0, color="#222222", linewidth=0.8)
+    axis.set_axisbelow(True)
+    axis.grid(axis="y", color="#D9D9D9", linewidth=0.8, alpha=0.75)
+    axis.set_title(
+        "Fixed tasks" if spec["split"] == "fixed" else "100 procedurally generated tasks",
+        fontweight="bold",
+    )
+    axis.set_ylabel("Normalized XP reward" if metric == "normalized" else "Mean XP reward")
+    if metric == "normalized":
+        axis.set_ylim(-0.55, 1.05)
+    axis.tick_params(axis="x", labelsize=9)
     fig.tight_layout()
-    fig.savefig(output_png, dpi=300, bbox_inches="tight")
-    fig.savefig(output_pdf, bbox_inches="tight")
+
+    stem = f"{spec['name']}_{metric}"
+    png_path = output_dir / f"{stem}.png"
+    pdf_path = output_dir / f"{stem}.pdf"
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    fig.savefig(pdf_path, bbox_inches="tight")
     plt.close(fig)
-
-
-def log_wandb(args, summary, output_paths):
-    if args.wandb_mode == "disabled":
-        return
-    import wandb
-
-    if args.wandb_mode == "online":
-        with open("private.yaml", encoding="utf-8") as file:
-            private_info = yaml.load(file, Loader=yaml.FullLoader)
-        wandb.login(key=private_info["wandb_key"])
-    run = wandb.init(
-        entity=args.entity,
-        project=args.project,
-        group="FINAL_XP_BAR_PLOTS",
-        name="FIGURE3_MODIFIED_WALL",
-        job_type="final_plot",
-        tags=["final_xp", "bar_plot", "procedural_100"],
-        mode=args.wandb_mode,
-        config=vars(args),
-    )
-    table = wandb.Table(dataframe=summary)
-    fixed_table = wandb.Table(
-        dataframe=summary[summary["split"] == "fixed"]
-    )
-    procedural_table = wandb.Table(
-        dataframe=summary[summary["split"] == "procedural"]
-    )
-    run.log(
-        {
-            "final_xp/bar_plot": wandb.Image(str(output_paths["png"])),
-            "final_xp/summary": table,
-            "final_xp/fixed_bar": wandb.plot.bar(
-                fixed_table,
-                "algorithm",
-                "normalized_return_mean",
-                title="Fixed Tasks",
-            ),
-            "final_xp/procedural_bar": wandb.plot.bar(
-                procedural_table,
-                "algorithm",
-                "normalized_return_mean",
-                title="100 Procedural Tasks",
-            ),
-        }
-    )
-    artifact = wandb.Artifact("modified-wall-final-xp-figure", type="figure")
-    for path in output_paths.values():
-        artifact.add_file(str(path))
-    run.log_artifact(artifact)
-    run.finish()
+    return png_path, pdf_path
 
 
 def main():
     args = parse_args()
-    results_dir = Path(args.results_dir)
-    results_dir.mkdir(parents=True, exist_ok=True)
-    if args.download_artifacts:
-        download_evaluation_artifacts(args, results_dir)
-    rows = []
-    for algorithm, filenames in ALGORITHM_FILES.items():
-        rows.extend(
-            load_algorithm_results(results_dir, algorithm, filenames)
-        )
-    summary = pd.DataFrame(rows)
-    summary_path = results_dir / "final_xp_bar_values.csv"
-    output_png = results_dir / "figure3_modified_wall.png"
-    output_pdf = results_dir / "figure3_modified_wall.pdf"
-    summary.to_csv(summary_path, index=False)
-    make_figure(summary, output_png, output_pdf)
-    print(summary.to_string(index=False))
-    print(f"Saved {output_png}")
-    log_wandb(
-        args,
-        summary,
-        {"png": output_png, "pdf": output_pdf, "csv": summary_path},
-    )
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    statistics = build_statistics(args.results_dir)
+    values_path = args.output_dir / "plot_values.csv"
+    statistics.to_csv(values_path, index=False)
+
+    output_paths = []
+    for spec in PLOT_SPECS:
+        for metric in ("normalized", "reward"):
+            output_paths.extend(draw_plot(statistics, spec, metric, args.output_dir))
+
+    print(statistics.to_string(index=False))
+    print(f"Saved plot values: {values_path}")
+    print(f"Saved {len(output_paths)} plot files to {args.output_dir}")
 
 
 if __name__ == "__main__":

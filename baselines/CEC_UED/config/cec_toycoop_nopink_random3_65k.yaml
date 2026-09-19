@@ -1,0 +1,99 @@
+"ENV_NAME": "ToyCoopNoPink"
+"LR": 3e-4
+"NUM_ENVS": 256
+"NUM_SEEDS": 1
+"NUM_STEPS": 100
+"FC_DIM_SIZE": 256
+"GRU_HIDDEN_DIM": 256
+"TOTAL_TIMESTEPS": 1e8
+"MAX_TRAIN_STEPS": 1e8
+"UPDATE_EPOCHS": 32
+"NUM_MINIBATCHES": 2
+"GAMMA": 0.99
+"GAE_LAMBDA": 0.95
+"CLIP_EPS": 0.2
+"SCALE_CLIP_EPS": false
+"ENT_COEF": 0.005
+"VF_COEF": 1.0
+"MOA_COEF": 1.0
+"MAX_GRAD_NORM": 0.5
+"ACTIVATION": "relu"
+"ANNEAL_LR": true
+"SEED": 0
+
+"ENV_KWARGS":
+  "random_reset": true
+  "max_steps": 100
+  "check_held_out": true
+  "debug": false
+  "partial_obs": false
+  "incentivize_strat": 2
+  "randomize_walls": true
+  "num_random_walls": 3
+  "heldout_ignore_agent_order": true
+  "shuffle_inv_and_pot": false
+  "layout": "cramped_room_9"
+  "random_reset_fn": "reset_all"
+
+"TRAINING": true
+"TRAIN_KWARGS":
+  "ckpt_id": 0
+  "overwrite_ckpt": true
+  "finetune": false
+  "e3t_beta": 0.55
+
+"TEST_KWARGS":
+  "beta": 1.0
+  "argmax": false
+  "num_trajs": 2
+  "plot": false
+  "self_play": false
+  "ik": false
+  "debug": false
+  "use_ckpt": true
+
+"CONV_NET": true
+"LSTM": true
+"FCP": false
+"FCP_KWARGS":
+  "train_oracle": false
+
+"ENTITY": "overcooked_ai"
+"PROJECT": "crossenv_ued_ICLR_dual_destination"
+"WANDB_MODE": "online"
+"WANDB_GROUP": "RANDOM3 CEC 65K"
+"model_name": "CEC_RANDOM3"
+
+"save_frames": false
+"save_frames_interval": 200
+"save_env_state": false
+"save_env_state_interval": 10
+
+"EVAL_KWARGS":
+  "eval_interval": 50
+  "num_envs": 5
+  "num_steps": 100
+  "max_steps": 100
+  "random_reset": false
+  "check_held_out": false
+  "shuffle_inv_and_pot": false
+  "random_reset_fn": "reset_all"
+  "beta": 1.0
+  "argmax": false
+
+"map_name": "random_3_walls"
+"TOY_HELDOUT_NUM": 100
+"TOY_HELDOUT_SEED": 0
+"CKPT_TAG": "with_xp_numenv256"
+"layout_names":
+  - "empty"
+  - "wall_a"
+
+"XP_KWARGS":
+  "enabled": true
+  "partner_seed": 98
+  "partner_path": "ckpts/ippo/ToyCoopNoPink/modified_wall/mixed_empty_wall_a_with_xp_numenv256/ikTrue/reset_all/cec_layout_eval/lr-20260831-062443/seed98_ckpt0_improved_updates3906.pkl"
+  "num_envs": 5
+  "num_steps": 100
+  "beta": 1.0
+  "argmax": false

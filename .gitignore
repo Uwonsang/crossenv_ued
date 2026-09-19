@@ -191,8 +191,14 @@ baselines/CEC/figures/results/*
 baselines/CEC_UED/dataset/*
 .idea/*
 
-baselines/CEC_UED/results/*
+ckpts/*
 
+
+
+baselines/CEC_UED/results/*
 
 #paper
 ongoingworks.pdf
+2504.12714v2.pdf
+
+

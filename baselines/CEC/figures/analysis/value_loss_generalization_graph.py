@@ -473,7 +473,7 @@ def plot_model(
             continue
         if index // 3 == 1:
             x_label = (
-                "Value loss (last logged value)"
+                "Value loss"
                 if aggregation == "last"
                 else "Value loss (final-window mean)"
             )
@@ -482,27 +482,12 @@ def plot_model(
             ax.set_ylabel("Evaluation return")
 
     label = MODEL_LABELS.get(model, model.replace("_", "-"))
-    statistic_label = (
-        "Last logged metrics"
-        if aggregation == "last"
-        else "Final-window mean metrics"
-    )
-    # Draw the heading and subtitle separately.  A multiline suptitle can have
-    # inconsistent line spacing across matplotlib/font versions and collide
-    # with the first row of subplot titles.
     fig.text(
-        0.5, 0.982, f"{label}: Value Loss and Generalization",
+        0.5, 0.975, f"{label}: Value Loss and Generalization",
         ha="center", va="top", fontsize=14,
     )
-    fig.text(
-        0.5, 0.948,
-        f"{statistic_label}; point labels denote parallel training environments",
-        ha="center", va="top", fontsize=12,
-    )
-    # tight_layout reserves too much space below the two-line figure title.
-    # Explicit margins keep the panels compact without clipping axis labels.
     fig.subplots_adjust(
-        left=0.075, right=0.985, bottom=0.095, top=0.855,
+        left=0.075, right=0.985, bottom=0.095, top=0.895,
         wspace=0.30, hspace=0.32,
     )
     fig.savefig(output_path, dpi=200)

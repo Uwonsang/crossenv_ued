@@ -301,7 +301,7 @@ def plot_overall(
     ax.set_xticklabels(overall_labels, rotation=0, ha="center")
     ax.tick_params(axis="x", labelsize=24, pad=12)
     ax.tick_params(axis="y", labelsize=24)
-    ax.set_ylabel("mean reward (average over maps)", fontsize=26)
+    ax.set_ylabel("XP Reward", fontsize=26)
     ax.set_title("(a) Fixed tasks", fontsize=28, fontweight="bold", pad=16)
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)

@@ -19,6 +19,10 @@ def main():
         help="Maximum arrow length in simplex-coordinate units.",
     )
     parser.add_argument("--title", default="Role-averaged empirical meta-game")
+    parser.add_argument("--model-fontsize", type=float, default=16,
+                        help="Font size for model names at simplex vertices.")
+    parser.add_argument("--title-fontsize", type=float, default=18,
+                        help="Font size for the figure title.")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--filename-stem", default="baseline_panels")
     args = parser.parse_args()
@@ -26,6 +30,9 @@ def main():
         parser.error("resolution must be >= 2")
     if not np.isfinite(args.arrow_scale) or args.arrow_scale <= 0:
         parser.error("arrow-scale must be finite and positive")
+    if (not np.isfinite(args.model_fontsize) or args.model_fontsize <= 0
+            or not np.isfinite(args.title_fontsize) or args.title_fontsize <= 0):
+        parser.error("font sizes must be finite and positive")
     if (not args.filename_stem
             or Path(args.filename_stem).name != args.filename_stem):
         parser.error("filename-stem must be a nonempty filename without a path")
@@ -56,8 +63,11 @@ def main():
     maximum = max(max(float(p[3].max()) for p in panels), 1e-12)
     cols = min(3, len(panels))
     rows = (len(panels) + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(4.3*cols, 3.9*rows),
+    fig, axes = plt.subplots(rows, cols, figsize=(3.75*cols, 3.9*rows),
                              squeeze=False, constrained_layout=True)
+    fig.set_constrained_layout_pads(
+        w_pad=0.01, h_pad=0.02, wspace=0.01, hspace=0.02
+    )
     checks = []
     for ax, (names, payoff, velocity, speed) in zip(axes.flat, panels):
         border = vertices[[0, 1, 2, 0]]
@@ -67,10 +77,13 @@ def main():
         q = ax.quiver(*xy[nonzero].T, *arrows[nonzero].T, speed[nonzero]/maximum,
                       angles="xy", scale_units="xy", scale=1, cmap="viridis",
                       clim=(0, 1), width=.009, headwidth=3.5)
-        ax.text(.5, .94, display_name(names[2]), ha="center", fontsize=11)
-        ax.text(0, -.065, display_name(names[0]), ha="center", fontsize=10)
-        ax.text(1, -.065, display_name(names[1]), ha="center", fontsize=10)
-        ax.set(xlim=(-.23, 1.23), ylim=(-.15, 1.02), aspect="equal")
+        ax.text(.5, .90, display_name(names[2]), ha="center", va="bottom",
+                fontsize=args.model_fontsize)
+        ax.text(0, -.055, display_name(names[0]), ha="center", va="top",
+                fontsize=args.model_fontsize)
+        ax.text(1, -.055, display_name(names[1]), ha="center", va="top",
+                fontsize=args.model_fontsize)
+        ax.set(xlim=(-.10, 1.10), ylim=(-.19, .99), aspect="equal")
         ax.axis("off")
         for baseline in range(2):
             differences = payoff[2] - payoff[baseline]
@@ -83,7 +96,7 @@ def main():
                                focal_pure_nash_gap=nash_gap(np.array([0., 0., 1.]), payoff)))
     for ax in list(axes.flat)[len(panels):]:
         ax.axis("off")
-    fig.suptitle(args.title, fontsize=13)
+    fig.suptitle(args.title, fontsize=args.title_fontsize, fontweight="bold")
     fig.colorbar(q, ax=list(axes.flat), shrink=.7, label="Relative speed (shared scale)")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "pdf"):
@@ -95,6 +108,8 @@ def main():
     metadata = dict(payoff=str(args.payoff.resolve()), focal=args.focal, pairs=pairs,
                     resolution=n, grid_points_per_panel=len(points), title=args.title,
                     arrow_scale=args.arrow_scale,
+                    model_fontsize=args.model_fontsize,
+                    title_fontsize=args.title_fontsize,
                     filename_stem=args.filename_stem,
                     shared_speed_max=maximum,
                     interpretation="Point estimates within each selected subgame; not statistical significance or full-game validation")

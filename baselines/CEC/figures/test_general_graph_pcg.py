@@ -265,7 +265,7 @@ def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
     ax.set_xticklabels(overall_labels, rotation=0, ha="center")
     ax.tick_params(axis="x", labelsize=24, pad=12)
     ax.tick_params(axis="y", labelsize=24)
-    ax.set_ylabel("mean reward", fontsize=26)
+    ax.set_ylabel("XP Reward", fontsize=26)
     ax.set_title(
         "(b) Procedurally generated tasks",
         fontsize=28,

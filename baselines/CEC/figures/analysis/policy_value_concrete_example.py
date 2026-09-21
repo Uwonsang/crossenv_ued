@@ -36,6 +36,15 @@ FAMILY_LABELS = {
 }
 
 
+def js_divergence(left, right):
+    midpoint = .5 * (left + right)
+    left_mask, right_mask = left > 0, right > 0
+    return float(.5 * (
+        np.sum(left[left_mask] * np.log(left[left_mask] / midpoint[left_mask]))
+        + np.sum(right[right_mask] * np.log(right[right_mask] / midpoint[right_mask]))
+    ))
+
+
 def neighbors(position, floor):
     x, y = position
     return [(x + dx, y + dy) for dx, dy in DIRECTIONS
@@ -151,6 +160,110 @@ def instantiate(config, record, horizon):
     return env, state, record
 
 
+def make_policy_predictor(config, model, checkpoint):
+    """Return a zero-history policy evaluator for controlled candidate states."""
+    import jax
+    import jax.numpy as jnp
+    from actor_networks import ScannedRNN
+
+    if model == "FCP":
+        from actor_networks import ActorCriticRNN
+        spec = {
+            "value_network": ActorCriticRNN,
+            "value_separate_hidden": False,
+        }
+    else:
+        spec = MODEL_SPECS[model]
+    network = spec["value_network"](6, config=config)
+    params = load_params(checkpoint)
+    hidden_dim = int(config["GRU_HIDDEN_DIM"])
+
+    @jax.jit
+    def predict(obs_batch, positions):
+        hidden = ScannedRNN.initialize_carry(2, hidden_dim)
+        if spec["value_separate_hidden"]:
+            hidden = (hidden, hidden)
+        _, policy, _ = network.apply(
+            params, hidden,
+            (obs_batch[None], jnp.zeros((1, 2), dtype=bool), positions[None]),
+        )
+        return policy.probs[0, 0]
+
+    def predict_record(record, horizon):
+        env, state, _ = instantiate(config, record, horizon)
+        obs = env.get_obs(state)
+        obs_batch = jnp.stack([obs[agent].reshape(-1) for agent in env.agents])
+        return np.asarray(predict(obs_batch, state.agent_pos))
+
+    return predict_record
+
+
+def make_reference_return_evaluator(config, checkpoint, args):
+    """Return an FCP Monte Carlo evaluator for one controlled state."""
+    import jax
+    import jax.numpy as jnp
+    from actor_networks import ActorCriticRNN, ScannedRNN
+
+    network = ActorCriticRNN(6, config=config)
+    params = load_params(checkpoint)
+    hidden_dim = int(config["GRU_HIDDEN_DIM"])
+
+    def evaluate(record):
+        env, initial, _ = instantiate(config, record, args.horizon)
+
+        def initial_carry():
+            return ScannedRNN.initialize_carry(2, hidden_dim)
+
+        def rollout(key):
+            def step(carry_value, time):
+                state, hidden, done, key = carry_value
+                obs = env.get_obs(state)
+                obs_batch = jnp.stack([obs[a].reshape(-1) for a in env.agents])
+                hidden, policy, _ = network.apply(
+                    params, hidden,
+                    (obs_batch[None], done[None], state.agent_pos[None]),
+                )
+                key, action_key, step_key = jax.random.split(key, 3)
+                actions = policy.sample(seed=action_key)[0]
+                action_dict = {a: actions[i] for i, a in enumerate(env.agents)}
+                _, next_state, reward, dones, _ = env.step_env(
+                    step_key, state, action_dict
+                )
+                finished = jnp.all(done)
+                next_done = jnp.asarray([dones[a] for a in env.agents])
+                reward_value = jnp.where(finished, 0.0, reward["agent_0"])
+                return (next_state, hidden, next_done, key), args.gamma**time * reward_value
+
+            _, rewards = jax.lax.scan(
+                step,
+                (initial, initial_carry(), jnp.zeros(2, dtype=bool), key),
+                jnp.arange(args.horizon),
+            )
+            return rewards.sum()
+
+        keys = jax.random.split(
+            jax.random.PRNGKey(args.selection_rollout_seed),
+            args.selection_rollouts,
+        )
+        return np.asarray(jax.jit(jax.vmap(rollout))(keys))
+
+    return evaluate
+
+
+def resolve_reference_checkpoint(args):
+    if args.reference_checkpoint is not None:
+        checkpoint = args.reference_checkpoint.expanduser()
+    else:
+        checkpoint = (
+            args.model_root / "FCP" / f"{args.family}_9"
+            / f"seed{args.reference_seed}"
+            / f"fcp_seed{args.reference_seed}_best.pkl"
+        )
+    if not checkpoint.is_file():
+        raise RuntimeError(f"FCP reference checkpoint was not found: {checkpoint}")
+    return checkpoint
+
+
 def choose_example(config, args):
     import jax
     from jaxmarl.environments.overcooked import layouts
@@ -170,14 +283,99 @@ def choose_example(config, args):
             candidates.append(record)
     if not candidates:
         raise RuntimeError("Could not construct a valid concrete state")
-    easy = min((item for item in candidates if item["variant"] == "A"),
-               key=lambda item: item["route_cost"])
-    hard_pool = [item for item in candidates if item["variant"] == "B"
-                 and item["map_seed"] != easy["map_seed"]]
-    if not hard_pool:
-        raise RuntimeError("Could not find two distinct layout variants")
-    hard = max(hard_pool, key=lambda item: item["route_cost"])
-    return easy, hard
+
+    predictor = make_policy_predictor(config, "FCP", args.reference_checkpoint)
+
+    eligible = {"A": [], "B": []}
+    for record in candidates:
+        probabilities = predictor(record, args.horizon)
+        if (int(probabilities.argmax()) == 5
+                and float(probabilities[5])
+                >= args.selection_min_interact_probability):
+            eligible[record["variant"]].append((record, probabilities))
+
+    matches = []
+    for easy, easy_probs in eligible["A"]:
+        for hard, hard_probs in eligible["B"]:
+            if easy["map_seed"] == hard["map_seed"]:
+                continue
+            route_gap = hard["route_cost"] - easy["route_cost"]
+            if route_gap < args.min_route_cost_gap:
+                continue
+            divergence = js_divergence(easy_probs, hard_probs)
+            if divergence > args.selection_max_policy_js:
+                continue
+            matches.append((
+                -route_gap, divergence,
+                easy["map_seed"], hard["map_seed"],
+                easy, hard, easy_probs, hard_probs,
+            ))
+    if not matches:
+        raise RuntimeError(
+            "No concrete pair satisfied the FCP reference policy filter. "
+            f"Eligible individual states: A={len(eligible['A'])}, "
+            f"B={len(eligible['B'])}. Increase --map-candidates or relax "
+            "--selection-min-interact-probability/--selection-max-policy-js."
+        )
+    return_evaluator = make_reference_return_evaluator(
+        config, args.reference_checkpoint, args
+    )
+    return_cache = {}
+    qualified = []
+    for match in sorted(matches)[:args.selection_return_candidates]:
+        easy, hard = match[4], match[5]
+        for record in (easy, hard):
+            key = (record["variant"], record["map_seed"])
+            if key not in return_cache:
+                return_cache[key] = return_evaluator(record)
+        returns_a = return_cache[(easy["variant"], easy["map_seed"])]
+        returns_b = return_cache[(hard["variant"], hard["map_seed"])]
+        delta = returns_a - returns_b
+        if abs(float(delta.mean())) < args.selection_min_return_gap:
+            continue
+        qualified.append((
+            -abs(float(delta.mean())), *match,
+            float(returns_a.mean()), float(returns_b.mean()),
+            float(delta.mean()),
+            float(delta.std(ddof=1) / np.sqrt(len(delta))),
+        ))
+    if not qualified:
+        raise RuntimeError(
+            "Policy-qualified pairs were found, but none passed the FCP return "
+            "gap. Increase --selection-return-candidates/--selection-rollouts "
+            "or relax --selection-min-return-gap."
+        )
+    selected = min(qualified)
+    # qualified prepends return score, shifting the original match fields by one.
+    divergence = selected[2]
+    easy, hard = selected[5], selected[6]
+    easy_probs, hard_probs = selected[7], selected[8]
+    return_a, return_b, return_delta, return_delta_sem = selected[9:13]
+    selection = {
+        "policy": "FCP",
+        "seed": args.reference_seed,
+        "checkpoint": str(args.reference_checkpoint),
+        "max_policy_js": args.selection_max_policy_js,
+        "min_interact_probability": args.selection_min_interact_probability,
+        "min_abs_return_gap": args.selection_min_return_gap,
+        "min_route_cost_gap": args.min_route_cost_gap,
+        "route_cost_gap": hard["route_cost"] - easy["route_cost"],
+        "policy_metrics": {
+            "probabilities_a": easy_probs.tolist(),
+            "probabilities_b": hard_probs.tolist(),
+            "interact_a": float(easy_probs[5]),
+            "interact_b": float(hard_probs[5]),
+            "js_nats": divergence,
+        },
+        "return_metrics": {
+            "mean_a": return_a,
+            "mean_b": return_b,
+            "delta_a_minus_b": return_delta,
+            "delta_sem": return_delta_sem,
+            "rollouts": args.selection_rollouts,
+        },
+    }
+    return (easy, hard), selection
 
 
 def draw_example(records, output_dir):
@@ -239,9 +437,13 @@ def draw_example(records, output_dir):
         fontweight="bold",
     )
     figure.tight_layout()
-    figure.savefig(output_dir / "concrete_state_pair.pdf", bbox_inches="tight")
-    figure.savefig(output_dir / "concrete_state_pair.png", dpi=300, bbox_inches="tight")
+    figure.savefig(
+        output_dir / "concrete_state_pair.png", dpi=300, bbox_inches="tight"
+    )
+    figure.canvas.draw()
+    state_image = np.asarray(figure.canvas.buffer_rgba()).copy()
     plt.close(figure)
+    return state_image
 
 
 def cosine_distance(left, right):
@@ -249,7 +451,7 @@ def cosine_distance(left, right):
     return float(1 - np.dot(left, right) / denominator) if denominator else float("nan")
 
 
-def draw_checkpoint_reports(rows, output_dir):
+def draw_checkpoint_reports(rows, output_dir, state_image):
     """Create one directly inspectable A/B report for every checkpoint."""
     import matplotlib
 
@@ -258,7 +460,6 @@ def draw_checkpoint_reports(rows, output_dir):
 
     report_dir = output_dir / "checkpoint_visualizations"
     report_dir.mkdir(parents=True, exist_ok=True)
-    state_image = plt.imread(output_dir / "concrete_state_pair.png")
     action_x = np.arange(len(ACTION_NAMES))
     for row in rows:
         figure = plt.figure(figsize=(10.5, 8.0))
@@ -330,7 +531,6 @@ def draw_checkpoint_reports(rows, output_dir):
         stem = report_dir / (
             f"{label.lower()}_{row['num_envs']}_seed{row['seed']}"
         )
-        figure.savefig(stem.with_suffix(".pdf"), bbox_inches="tight")
         figure.savefig(stem.with_suffix(".png"), dpi=220, bbox_inches="tight")
         plt.close(figure)
 
@@ -416,6 +616,7 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
     row = {
         "model": model, "num_envs": num_envs, "seed": seed,
         "checkpoint": str(checkpoint),
+        "used_for_pair_selection": False,
         "policy_rep_source": a["policy_rep_source"],
         "value_rep_source": a["value_rep_source"],
         "policy_js_nats": float(.5 * (kl(a["probabilities"]) + kl(b["probabilities"]))),
@@ -461,6 +662,17 @@ def main():
     parser.add_argument("--models", nargs="+", type=parse_model_spec,
                         default=[("CEC", 64), ("CEC_IDAAC", 64)])
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(6)))
+    parser.add_argument("--reference-checkpoint", type=Path,
+                        help="FCP checkpoint; default is inferred from model root/family/seed")
+    parser.add_argument("--reference-seed", type=int, default=0)
+    parser.add_argument("--selection-max-policy-js", type=float, default=.05)
+    parser.add_argument("--selection-min-interact-probability", type=float,
+                        default=.9)
+    parser.add_argument("--selection-min-return-gap", type=float, default=10.0)
+    parser.add_argument("--selection-rollouts", type=int, default=32)
+    parser.add_argument("--selection-rollout-seed", type=int, default=3701)
+    parser.add_argument("--selection-return-candidates", type=int, default=20)
+    parser.add_argument("--min-route-cost-gap", type=int, default=2)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
     parser.add_argument("--map-seed", type=int, default=1701)
@@ -470,7 +682,7 @@ def main():
     parser.add_argument("--rollout-seed", type=int, default=2701)
     parser.add_argument("--gamma", type=float, default=.99)
     parser.add_argument("--max-policy-js", type=float, default=.05)
-    parser.add_argument("--min-interact-probability", type=float, default=.5)
+    parser.add_argument("--min-interact-probability", type=float, default=.9)
     parser.add_argument("--min-abs-return-delta", type=float, default=1.0)
     parser.add_argument(
         "--config", type=Path,
@@ -480,16 +692,31 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     args.model_root = args.model_root.expanduser()
+    args.reference_checkpoint = resolve_reference_checkpoint(args)
     args.output_dir = args.output_dir or (
         args.model_root / "analysis" / "policy_value_concrete_example"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
-    records = choose_example(config, args)
-    (args.output_dir / "concrete_state_pair.json").write_text(
-        json.dumps({"states": records}, indent=2), encoding="utf-8"
+    records, pair_selection = choose_example(config, args)
+    print(
+        f"Selected maps: A seed={records[0]['map_seed']}, "
+        f"B seed={records[1]['map_seed']}, "
+        f"route-cost gap={pair_selection['route_cost_gap']}"
     )
-    draw_example(records, args.output_dir)
+    policy = pair_selection["policy_metrics"]
+    returns = pair_selection["return_metrics"]
+    print(
+        f"Pair filter FCP: JS={policy['js_nats']:.6f}, "
+        f"Interact(A)={policy['interact_a']:.4f}, "
+        f"Interact(B)={policy['interact_b']:.4f}, "
+        f"return delta={returns['delta_a_minus_b']:.3f}"
+    )
+    (args.output_dir / "concrete_state_pair.json").write_text(
+        json.dumps({"states": records, "pair_selection": pair_selection}, indent=2),
+        encoding="utf-8",
+    )
+    state_image = draw_example(records, args.output_dir)
     print(f"Environment A route cost: {records[0]['route_cost']}")
     print(f"Environment B route cost: {records[1]['route_cost']}")
     if args.prepare_only:
@@ -556,13 +783,14 @@ def main():
                 row["value_rep_cosine_distance"] for row in group
             ]),
         })
-    with (args.output_dir / "concrete_example_summary.csv").open(
-        "w", newline="", encoding="utf-8"
-    ) as file:
-        writer = csv.DictWriter(file, fieldnames=list(summary[0]))
-        writer.writeheader()
-        writer.writerows(summary)
-    draw_checkpoint_reports(rows, args.output_dir)
+    if summary:
+        with (args.output_dir / "concrete_example_summary.csv").open(
+            "w", newline="", encoding="utf-8"
+        ) as file:
+            writer = csv.DictWriter(file, fieldnames=list(summary[0]))
+            writer.writeheader()
+            writer.writerows(summary)
+    draw_checkpoint_reports(rows, args.output_dir, state_image)
     print(f"Saved concrete example and metrics to {args.output_dir}")
 
 

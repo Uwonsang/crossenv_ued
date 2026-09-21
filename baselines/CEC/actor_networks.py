@@ -147,6 +147,8 @@ class ActorCriticRNN(nn.Module):
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
+        if self.is_mutable_collection("intermediates"):
+            self.sow("intermediates", "critic_penultimate", critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -272,6 +274,90 @@ class IDAACActorRNN(nn.Module):
         )(actor_mean)
         pi = distrax.Categorical(logits=logits)
         return hidden, pi, jnp.zeros(logits.shape[:-1])
+
+
+class IDAACActorCriticRNN(nn.Module):
+    """Inference module exposing both IDAAC policy and value representations."""
+
+    action_dim: Sequence[int]
+    config: Dict
+
+    @nn.compact
+    def __call__(self, hidden, x):
+        obs, dones, _agent_positions = x
+        actor_hidden, critic_hidden = hidden
+        actor_hidden, actor_embedding = IDAACActorTrunk(
+            config=self.config, name="actor_trunk"
+        )(actor_hidden, obs, dones)
+        critic_hidden, critic_embedding = IDAACActorTrunk(
+            config=self.config, name="critic_trunk"
+        )(critic_hidden, obs, dones)
+
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"], kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="actor_hidden_0",
+        )(actor_embedding)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"] * 3 // 4,
+            kernel_init=orthogonal(2), bias_init=constant(0.0),
+            name="actor_hidden_1",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            self.config["GRU_HIDDEN_DIM"] // 2,
+            kernel_init=orthogonal(2), bias_init=constant(0.0),
+            name="actor_hidden_2",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        if self.config["ENV_NAME"] == "overcooked":
+            actor_mean = nn.Dense(
+                self.config["GRU_HIDDEN_DIM"] // 4,
+                kernel_init=orthogonal(2), bias_init=constant(0.0),
+                name="actor_hidden_3",
+            )(actor_mean)
+            actor_mean = nn.relu(actor_mean)
+        if self.is_mutable_collection("intermediates"):
+            self.sow("intermediates", "actor_penultimate", actor_mean)
+        logits = nn.Dense(
+            self.action_dim, kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0), name="actor_output",
+        )(actor_mean)
+        policy = distrax.Categorical(logits=logits)
+
+        critic = nn.Dense(
+            self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="critic_hidden_0",
+        )(critic_embedding)
+        critic = nn.relu(critic)
+        critic = nn.Dense(
+            self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2),
+            bias_init=constant(0.0), name="critic_hidden_1",
+        )(critic)
+        critic = nn.relu(critic)
+        if self.config["ENV_NAME"] == "overcooked":
+            critic = nn.Dense(
+                self.config["FC_DIM_SIZE"] * 3 // 4,
+                kernel_init=orthogonal(2), bias_init=constant(0.0),
+                name="critic_hidden_2",
+            )(critic)
+            critic = nn.relu(critic)
+            critic = nn.Dense(
+                self.config["FC_DIM_SIZE"] // 2,
+                kernel_init=orthogonal(2), bias_init=constant(0.0),
+                name="critic_hidden_3",
+            )(critic)
+            critic = nn.relu(critic)
+        if self.is_mutable_collection("intermediates"):
+            self.sow("intermediates", "critic_penultimate", critic)
+        value = nn.Dense(
+            1, kernel_init=orthogonal(1.0), bias_init=constant(0.0),
+            name="critic_output",
+        )(critic)
+        return (
+            (actor_hidden, critic_hidden), policy,
+            jnp.squeeze(value, axis=-1),
+        )
 
 
 class ActorCriticE3T(nn.Module):

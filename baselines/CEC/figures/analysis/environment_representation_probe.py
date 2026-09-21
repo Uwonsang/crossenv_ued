@@ -37,6 +37,7 @@ from jaxmarl.environments.overcooked import overcooked_layouts  # noqa: E402
 
 from actor_networks import (  # noqa: E402
     ActorCriticRNN,
+    IDAACActorCriticRNN,
     IDAACActorRNN,
     ScannedRNN,
 )
@@ -50,10 +51,17 @@ LAYOUT_FAMILIES = (
     ("Cramped Room", "reset_cramped_room"),
 )
 MODEL_SPECS = {
-    "CEC": {"display": "CEC", "network": ActorCriticRNN},
+    "CEC": {
+        "display": "CEC",
+        "actor_network": ActorCriticRNN,
+        "value_network": ActorCriticRNN,
+        "value_separate_hidden": False,
+    },
     "CEC_IDAAC": {
         "display": "DCEC",
-        "network": IDAACActorRNN,
+        "actor_network": IDAACActorRNN,
+        "value_network": IDAACActorCriticRNN,
+        "value_separate_hidden": True,
     },
 }
 MODEL_FILE_LABELS = {"CEC": "cec", "CEC_IDAAC": "dcec"}
@@ -93,6 +101,12 @@ def parse_args() -> argparse.Namespace:
             "Models to probe, formatted as cec_<num_envs> or "
             "dcec_<num_envs> (default: cec_64 dcec_64)."
         ),
+    )
+    parser.add_argument(
+        "--representation",
+        choices=("actor", "value"),
+        default="actor",
+        help="Penultimate representation to probe (default: actor).",
     )
     parser.add_argument("--seeds", type=int, nargs="+", default=list(range(6)))
     parser.add_argument("--episodes-per-layout", type=int, default=20)
@@ -146,18 +160,32 @@ def load_params(path: Path):
 
 def make_family_env(config: dict):
     kwargs = dict(config["ENV_KWARGS"])
+    base_layout = overcooked_layouts["cramped_room_9"]
     kwargs.update({
-        "layout": overcooked_layouts["cramped_room_9"],
+        "layout": base_layout,
         "random_reset": True,
         "check_held_out": False,
         "shuffle_inv_and_pot": False,
     })
-    return jaxmarl.make("overcooked", **kwargs)
+    env = jaxmarl.make("overcooked", **kwargs)
+    # Some older Overcooked implementations trace the held-out comparison
+    # even when check_held_out=False.  Give that branch shape-valid arrays.
+    _, placeholder_state = env.custom_reset(
+        jax.random.PRNGKey(0),
+        layout=base_layout,
+        random_reset=False,
+        shuffle_inv_and_pot=False,
+    )
+    env.held_out_goal = placeholder_state.goal_pos[jnp.newaxis, ...]
+    env.held_out_wall = placeholder_state.wall_map[jnp.newaxis, ...]
+    env.held_out_pot = placeholder_state.pot_pos[jnp.newaxis, ...]
+    return env
 
 
 def rollout_family(
     network, params, env, reset_name: str, config: dict, episode_keys,
-    steps: int, argmax: bool,
+    steps: int, argmax: bool, representation: str,
+    separate_hidden: bool,
 ) -> np.ndarray:
     """Return features with shape [episode, step, agent, feature]."""
     num_agents = env.num_agents
@@ -169,6 +197,8 @@ def rollout_family(
             reset_key, params={"random_reset_fn": reset_name}
         )
         hidden = ScannedRNN.initialize_carry(num_agents, hidden_dim)
+        if separate_hidden:
+            hidden = (hidden, hidden)
         done = jnp.zeros((num_agents,), dtype=bool)
 
         def step(carry, _):
@@ -189,7 +219,12 @@ def rollout_family(
                 mutable=["intermediates"],
             )
             hidden, policy, _ = outputs
-            features = captured["intermediates"]["actor_penultimate"][0][0]
+            feature_name = (
+                "actor_penultimate"
+                if representation == "actor"
+                else "critic_penultimate"
+            )
+            features = captured["intermediates"][feature_name][0][0]
             key, action_key, step_key = jax.random.split(key, 3)
             actions = (
                 jnp.argmax(policy.logits[0], axis=-1)
@@ -215,6 +250,7 @@ def rollout_family(
 
 def collect_dataset(
     network, params, env, config: dict, args: argparse.Namespace, model_seed: int,
+    separate_hidden: bool,
 ):
     all_features = []
     all_labels = []
@@ -233,7 +269,7 @@ def collect_dataset(
         episode_keys = jax.random.split(family_key, args.episodes_per_layout)
         features = rollout_family(
             network, params, env, reset_name, config, episode_keys,
-            args.steps, args.argmax,
+            args.steps, args.argmax, args.representation, separate_hidden,
         )
         features = features[:, sample_steps, :, :]
         per_episode = features.shape[1] * features.shape[2]
@@ -301,6 +337,7 @@ def run_probes(
             "model": model,
             "model_label": MODEL_SPECS[model]["display"],
             "model_num_envs": num_envs,
+            "representation": args.representation,
             "checkpoint_seed": seed,
             "probe_split": split,
             "accuracy": accuracy,
@@ -338,9 +375,14 @@ def main():
     for model, num_envs in args.models:
         spec = MODEL_SPECS[model]
         model_rows = []
-        network = spec["network"](
+        network_key = f"{args.representation}_network"
+        network = spec[network_key](
             env.action_space("agent_0").n,
             config=config,
+        )
+        separate_hidden = (
+            args.representation == "value"
+            and bool(spec["value_separate_hidden"])
         )
         for seed in args.seeds:
             ckpt = checkpoint_path(args.model_root, model, num_envs, seed)
@@ -353,7 +395,7 @@ def main():
             print(f"Loading {spec['display']} seed {seed}: {ckpt}")
             params = load_params(ckpt)
             features, labels, episode_ids = collect_dataset(
-                network, params, env, config, args, seed
+                network, params, env, config, args, seed, separate_hidden
             )
             model_rows.extend(run_probes(
                 features, labels, episode_ids, args, model, num_envs,
@@ -361,8 +403,13 @@ def main():
             ))
 
         if model_rows:
+            representation_prefix = (
+                "" if args.representation == "actor"
+                else f"{args.representation}_"
+            )
             csv_path = args.output_dir / (
-                f"environment_probe_{MODEL_FILE_LABELS[model]}_{num_envs}.csv"
+                "environment_probe_"
+                f"{representation_prefix}{MODEL_FILE_LABELS[model]}_{num_envs}.csv"
             )
             write_csv(model_rows, csv_path)
             saved_csv_paths.append(csv_path)

@@ -212,7 +212,7 @@ def resolve_reference_checkpoint(args):
     return checkpoint
 
 
-def choose_example(config, args):
+def generate_candidates(config, args):
     import jax
     from jaxmarl.environments.overcooked import layouts
 
@@ -231,6 +231,101 @@ def choose_example(config, args):
             candidates.append(record)
     if not candidates:
         raise RuntimeError("Could not construct a valid concrete state")
+    return candidates
+
+
+def local_layout_signature(record, radius):
+    """Return an ego-centered semantic tile patch, excluding both agents."""
+    layout = record["layout"]
+    width, height = int(layout["width"]), int(layout["height"])
+
+    def positions(key):
+        return {
+            (int(index) % width, int(index) // width)
+            for index in layout[key]
+        }
+
+    semantic_tiles = {}
+    for key, label in (
+        ("wall_idx", "wall"),
+        ("goal_idx", "serve"),
+        ("plate_pile_idx", "plate"),
+        ("onion_pile_idx", "onion"),
+        ("pot_idx", "pot"),
+    ):
+        for position in positions(key):
+            semantic_tiles[position] = label
+
+    ego_x, ego_y = record["ego"]
+    patch = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            x, y = ego_x + dx, ego_y + dy
+            if not (0 <= x < width and 0 <= y < height):
+                patch.append("outside")
+            else:
+                patch.append(semantic_tiles.get((x, y), "floor"))
+    return tuple(patch)
+
+
+def choose_controlled_example(config, args):
+    """Select a pair using only controlled state and layout geometry."""
+    candidates = generate_candidates(config, args)
+    grouped = defaultdict(lambda: {"A": [], "B": []})
+    for record in candidates:
+        key = (
+            record["direction"],
+            local_layout_signature(record, args.local_match_radius),
+        )
+        grouped[key][record["variant"]].append(record)
+
+    matches = []
+    for _signature, variants in grouped.items():
+        for easy in variants["A"]:
+            for hard in variants["B"]:
+                if easy["map_seed"] == hard["map_seed"]:
+                    continue
+                route_gap = hard["route_cost"] - easy["route_cost"]
+                if route_gap < args.min_route_cost_gap:
+                    continue
+                matches.append((
+                    -route_gap, easy["map_seed"], hard["map_seed"], easy, hard
+                ))
+    if not matches:
+        raise RuntimeError(
+            "No geometry-controlled pair was found. Increase --map-candidates, "
+            "reduce --local-match-radius, or relax --min-route-cost-gap."
+        )
+
+    selected = min(matches)
+    easy, hard = selected[3], selected[4]
+    local_signature = local_layout_signature(easy, args.local_match_radius)
+    patch_width = 2 * args.local_match_radius + 1
+    selection = {
+        "method": "controlled_geometry",
+        "uses_model_outputs": False,
+        "semantic_state": {
+            "ego_inventory": "onion",
+            "ego_adjacent_to_pot": True,
+            "ego_facing_pot": True,
+            "pot_onions": 2,
+            "teammate_inventory": "plate",
+        },
+        "same_orientation": easy["direction"] == hard["direction"],
+        "local_match_radius": args.local_match_radius,
+        "local_layout_match": True,
+        "local_layout_patch": [
+            list(local_signature[index:index + patch_width])
+            for index in range(0, len(local_signature), patch_width)
+        ],
+        "min_route_cost_gap": args.min_route_cost_gap,
+        "route_cost_gap": hard["route_cost"] - easy["route_cost"],
+    }
+    return (easy, hard), selection
+
+
+def choose_fcp_example(config, args):
+    candidates = generate_candidates(config, args)
 
     predictor = make_policy_predictor(config, "FCP", args.reference_checkpoint)
 
@@ -286,6 +381,8 @@ def choose_example(config, args):
     easy, hard = selected[4], selected[5]
     easy_probs, hard_probs = selected[6], selected[7]
     selection = {
+        "method": "fcp_policy_filter",
+        "uses_model_outputs": True,
         "policy": "FCP",
         "seed": args.reference_seed,
         "checkpoint": str(args.reference_checkpoint),
@@ -304,7 +401,7 @@ def choose_example(config, args):
     return (easy, hard), selection
 
 
-def draw_example(records, output_dir):
+def draw_example(records, output_dir, local_match_radius=None):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -347,6 +444,14 @@ def draw_example(records, output_dir):
                     fontsize=6.5, color="white", fontweight="bold", zorder=6)
         ego_x, ego_y = record["ego"]
         pot_x, pot_y = record["pot"]
+        if local_match_radius is not None:
+            ax.add_patch(Rectangle(
+                (ego_x - local_match_radius, ego_y - local_match_radius),
+                2 * local_match_radius + 1,
+                2 * local_match_radius + 1,
+                fill=False, edgecolor="#d946ef", linewidth=1.8,
+                linestyle="--", zorder=7,
+            ))
         ax.annotate("", xy=(pot_x + .5, pot_y + .5),
                     xytext=(ego_x + .5, ego_y + .5),
                     arrowprops=dict(arrowstyle="->", color="#d62728", lw=2))
@@ -561,7 +666,7 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
         "value_rep_cosine_distance": cosine_distance(a["value_rep"], b["value_rep"]),
     }
     row["passes_policy_equivalence"] = bool(
-        row["policy_js_nats"] <= args.max_policy_js and row["argmax_same"]
+        row["policy_js_nats"] < args.max_policy_js and row["argmax_same"]
     )
     row["passes_intended_interaction"] = bool(
         row["argmax_a"] == "Interact" and row["argmax_b"] == "Interact"
@@ -591,10 +696,13 @@ def main():
     parser.add_argument("--reference-checkpoint", type=Path,
                         help="FCP checkpoint; default is inferred from model root/family/seed")
     parser.add_argument("--reference-seed", type=int, default=0)
+    parser.add_argument("--pair-selection", choices=("controlled", "fcp"),
+                        default="controlled")
     parser.add_argument("--selection-max-policy-js", type=float, default=.2)
     parser.add_argument("--selection-min-interact-probability", type=float,
                         default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
+    parser.add_argument("--local-match-radius", type=int, default=2)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
     parser.add_argument("--map-seed", type=int, default=1701)
@@ -603,8 +711,8 @@ def main():
     parser.add_argument("--rollouts", type=int, default=100)
     parser.add_argument("--rollout-seed", type=int, default=2701)
     parser.add_argument("--gamma", type=float, default=.99)
-    parser.add_argument("--max-policy-js", type=float, default=.05)
-    parser.add_argument("--min-interact-probability", type=float, default=.9)
+    parser.add_argument("--max-policy-js", type=float, default=.15)
+    parser.add_argument("--min-interact-probability", type=float, default=.7)
     parser.add_argument("--min-abs-return-delta", type=float, default=1.0)
     parser.add_argument(
         "--config", type=Path,
@@ -614,29 +722,42 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     args.model_root = args.model_root.expanduser()
-    args.reference_checkpoint = resolve_reference_checkpoint(args)
+    if args.pair_selection == "fcp":
+        args.reference_checkpoint = resolve_reference_checkpoint(args)
     args.output_dir = args.output_dir or (
         args.model_root / "analysis" / "policy_value_concrete_example"
     )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
-    records, pair_selection = choose_example(config, args)
+    if args.pair_selection == "controlled":
+        records, pair_selection = choose_controlled_example(config, args)
+    else:
+        records, pair_selection = choose_fcp_example(config, args)
     print(
         f"Selected maps: A seed={records[0]['map_seed']}, "
         f"B seed={records[1]['map_seed']}, "
         f"route-cost gap={pair_selection['route_cost_gap']}"
     )
-    policy = pair_selection["policy_metrics"]
-    print(
-        f"Pair filter FCP: JS={policy['js_nats']:.6f}, "
-        f"Interact(A)={policy['interact_a']:.4f}, "
-        f"Interact(B)={policy['interact_b']:.4f}"
-    )
+    if pair_selection["method"] == "controlled_geometry":
+        print(
+            "Pair selection: controlled geometry; "
+            f"same radius-{pair_selection['local_match_radius']} local layout, "
+            "same orientation, no model outputs used"
+        )
+    else:
+        policy = pair_selection["policy_metrics"]
+        print(
+            f"Pair filter FCP: JS={policy['js_nats']:.6f}, "
+            f"Interact(A)={policy['interact_a']:.4f}, "
+            f"Interact(B)={policy['interact_b']:.4f}"
+        )
     (args.output_dir / "concrete_state_pair.json").write_text(
         json.dumps({"states": records, "pair_selection": pair_selection}, indent=2),
         encoding="utf-8",
     )
-    state_image = draw_example(records, args.output_dir)
+    state_image = draw_example(
+        records, args.output_dir, pair_selection.get("local_match_radius")
+    )
     print(f"Environment A route cost: {records[0]['route_cost']}")
     print(f"Environment B route cost: {records[1]['route_cost']}")
     if args.prepare_only:

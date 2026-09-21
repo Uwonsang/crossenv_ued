@@ -355,17 +355,14 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
         )
         probabilities = np.asarray(policy.probs[0, 0])
         intermediate = captured["intermediates"]
-        if model == "CEC":
-            policy_rep = value_rep = np.asarray(
-                intermediate["shared_trunk_penultimate"][0][0, 0]
-            )
-        else:
-            policy_rep = np.asarray(
-                intermediate["actor_trunk_penultimate"][0][0, 0]
-            )
-            value_rep = np.asarray(
-                intermediate["critic_trunk_penultimate"][0][0, 0]
-            )
+        policy_rep = np.asarray(
+            intermediate["actor_penultimate"][0][0, 0]
+        )
+        value_rep = np.asarray(
+            intermediate["critic_penultimate"][0][0, 0]
+        )
+        policy_source = "actor_penultimate"
+        value_source = "critic_penultimate"
 
         def rollout(key):
             def step(carry_value, time):
@@ -398,6 +395,8 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
             "predicted_value": float(value[0, 0]),
             "policy_rep": policy_rep,
             "value_rep": value_rep,
+            "policy_rep_source": policy_source,
+            "value_rep_source": value_source,
             "mc_return": float(returns.mean()),
             "mc_returns": returns,
         }
@@ -411,6 +410,8 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
     row = {
         "model": model, "num_envs": num_envs, "seed": seed,
         "checkpoint": str(checkpoint),
+        "policy_rep_source": a["policy_rep_source"],
+        "value_rep_source": a["value_rep_source"],
         "policy_js_nats": float(.5 * (kl(a["probabilities"]) + kl(b["probabilities"]))),
         "argmax_a": ACTION_NAMES[int(a["probabilities"].argmax())],
         "argmax_b": ACTION_NAMES[int(b["probabilities"].argmax())],

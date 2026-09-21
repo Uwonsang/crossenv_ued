@@ -2,7 +2,7 @@
 
 The workflow is split into three executable files:
 
-- `policy_value_asymmetry_pairs.py`: generate and save fixed state pairs.
+- `policy_value_asymmetry_pairs.py`: generate, save, and visualize fixed state pairs.
 - `policy_value_asymmetry.py`: evaluate checkpoints on those saved pairs.
 - `policy_value_asymmetry_graph.py`: plot saved CSV results locally.
 
@@ -37,6 +37,28 @@ pots, time zero, and zero recurrent history are used. This is a controlled state
 intervention, not a claim that states follow the training occupancy distribution.
 The planner includes orientation and treats the partner as an obstacle. Its
 objective is the first delivery, not the optimal full episode return.
+
+## Generated-map visualization
+
+Map visualization runs automatically immediately after `state_pairs.json` is
+saved. The output directory defaults to a `map_visualizations` subdirectory
+beside the JSON. For example:
+
+```bash
+python baselines/CEC/figures/analysis/policy_value_asymmetry_pairs.py \
+  --candidates-per-family 500 \
+  --pairs-per-family 5 \
+  --output /app/nas/models/ICRL/analysis/policy_value_asymmetry/state_pairs.json
+```
+
+For this example, family-level PDF and PNG files are written under:
+
+```text
+/app/nas/models/ICRL/analysis/policy_value_asymmetry/map_visualizations/
+```
+
+Every row displays one short/long pair. It includes facilities, both agents,
+the focal agent's soup marker, shortest route, path length, and map seed.
 
 ## Evaluate from a model root
 

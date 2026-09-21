@@ -19,7 +19,10 @@ sys.path.insert(0, str(ROOT / "baselines/CEC"))
 
 CLI_MODEL_NAMES = {"cec": "CEC", "dcec": "CEC_IDAAC"}
 
-from policy_value_asymmetry_common import initial_state  # noqa: E402
+try:  # Support both direct execution and package-style imports in tests.
+    from .policy_value_asymmetry_common import initial_state
+except ImportError:
+    from policy_value_asymmetry_common import initial_state  # noqa: E402
 
 
 def parse_model_spec(value):

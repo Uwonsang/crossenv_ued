@@ -702,11 +702,11 @@ def main():
     parser.add_argument("--selection-min-interact-probability", type=float,
                         default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
-    parser.add_argument("--local-match-radius", type=int, default=2)
+    parser.add_argument("--local-match-radius", type=int, default=1)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
     parser.add_argument("--map-seed", type=int, default=1701)
-    parser.add_argument("--map-candidates", type=int, default=100)
+    parser.add_argument("--map-candidates", type=int, default=1000)
     parser.add_argument("--horizon", type=int, default=200)
     parser.add_argument("--rollouts", type=int, default=100)
     parser.add_argument("--rollout-seed", type=int, default=2701)

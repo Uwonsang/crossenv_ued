@@ -468,6 +468,38 @@ def cosine_distance(left, right):
     return float(1 - np.dot(left, right) / denominator) if denominator else float("nan")
 
 
+def euclidean_distance(left, right):
+    return float(np.linalg.norm(left - right))
+
+
+def add_dataset_normalized_distances(rows):
+    """Add per-checkpoint z-scored distances and remove temporary features."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["model"], row["num_envs"], row["seed"])].append(row)
+
+    for group in grouped.values():
+        for prefix in ("policy", "value"):
+            features = np.stack([
+                row[f"_{prefix}_rep_{variant}"]
+                for row in group for variant in ("a", "b")
+            ])
+            mean = features.mean(axis=0)
+            std = features.std(axis=0)
+            safe_std = np.where(std > 1e-8, std, 1.0)
+            for row in group:
+                normalized_a = (row[f"_{prefix}_rep_a"] - mean) / safe_std
+                normalized_b = (row[f"_{prefix}_rep_b"] - mean) / safe_std
+                row[f"{prefix}_rep_zscored_euclidean_distance"] = (
+                    euclidean_distance(normalized_a, normalized_b)
+                )
+
+    for row in rows:
+        for prefix in ("policy", "value"):
+            del row[f"_{prefix}_rep_a"]
+            del row[f"_{prefix}_rep_b"]
+
+
 def draw_checkpoint_reports(rows, output_dir, state_images):
     """Create one directly inspectable A/B report for every checkpoint."""
     import matplotlib
@@ -530,9 +562,15 @@ def draw_checkpoint_reports(rows, output_dir, state_images):
             f"Predicted value A−B: {row['predicted_value_delta_a_minus_b']:.3f}   |   "
             f"MC return A−B: {row['mc_return_delta_a_minus_b']:.3f} "
             f"± {row['mc_return_delta_sem']:.3f}   |   "
-            f"policy/value rep distance: "
+            f"Rep cosine (policy/value): "
             f"{row['policy_rep_cosine_distance']:.4f} / "
             f"{row['value_rep_cosine_distance']:.4f}\n"
+            f"Rep raw L2 (policy/value): "
+            f"{row['policy_rep_raw_euclidean_distance']:.4f} / "
+            f"{row['value_rep_raw_euclidean_distance']:.4f}   |   "
+            f"z-scored L2: "
+            f"{row['policy_rep_zscored_euclidean_distance']:.4f} / "
+            f"{row['value_rep_zscored_euclidean_distance']:.4f}\n"
             f"Automatic filter: {status}"
         )
         text_axis.text(
@@ -659,6 +697,16 @@ def evaluate_checkpoint(
         "mc_return_delta_sem": float(delta.std(ddof=1) / np.sqrt(len(delta))),
         "policy_rep_cosine_distance": cosine_distance(a["policy_rep"], b["policy_rep"]),
         "value_rep_cosine_distance": cosine_distance(a["value_rep"], b["value_rep"]),
+        "policy_rep_raw_euclidean_distance": euclidean_distance(
+            a["policy_rep"], b["policy_rep"]
+        ),
+        "value_rep_raw_euclidean_distance": euclidean_distance(
+            a["value_rep"], b["value_rep"]
+        ),
+        "_policy_rep_a": a["policy_rep"],
+        "_policy_rep_b": b["policy_rep"],
+        "_value_rep_a": a["value_rep"],
+        "_value_rep_b": b["value_rep"],
     }
     row["passes_policy_equivalence"] = bool(
         row["policy_js_nats"] < args.max_policy_js and row["argmax_same"]
@@ -776,6 +824,7 @@ def main():
             )
     if not rows:
         raise RuntimeError("No usable checkpoint was found")
+    add_dataset_normalized_distances(rows)
     with (args.output_dir / "concrete_example_metrics.csv").open(
         "w", newline="", encoding="utf-8"
     ) as file:
@@ -845,6 +894,18 @@ def main():
             "mean_value_rep_distance": np.mean([
                 row["value_rep_cosine_distance"] for row in group
             ]),
+            "mean_policy_rep_raw_euclidean_distance": np.mean([
+                row["policy_rep_raw_euclidean_distance"] for row in group
+            ]),
+            "mean_value_rep_raw_euclidean_distance": np.mean([
+                row["value_rep_raw_euclidean_distance"] for row in group
+            ]),
+            "mean_policy_rep_zscored_euclidean_distance": np.mean([
+                row["policy_rep_zscored_euclidean_distance"] for row in group
+            ]),
+            "mean_value_rep_zscored_euclidean_distance": np.mean([
+                row["value_rep_zscored_euclidean_distance"] for row in group
+            ]),
         })
     with (args.output_dir / "concrete_example_pair_summary.csv").open(
         "w", newline="", encoding="utf-8"
@@ -887,6 +948,18 @@ def main():
             ]),
             "mean_value_rep_distance": np.mean([
                 row["value_rep_cosine_distance"] for row in group
+            ]),
+            "mean_policy_rep_raw_euclidean_distance": np.mean([
+                row["policy_rep_raw_euclidean_distance"] for row in group
+            ]),
+            "mean_value_rep_raw_euclidean_distance": np.mean([
+                row["value_rep_raw_euclidean_distance"] for row in group
+            ]),
+            "mean_policy_rep_zscored_euclidean_distance": np.mean([
+                row["policy_rep_zscored_euclidean_distance"] for row in group
+            ]),
+            "mean_value_rep_zscored_euclidean_distance": np.mean([
+                row["value_rep_zscored_euclidean_distance"] for row in group
             ]),
         })
     if summary:

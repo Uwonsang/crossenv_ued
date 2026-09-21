@@ -118,8 +118,14 @@ def instantiate(config, record, horizon):
     empty = jnp.array([OBJECT_TO_INDEX["empty"], 0, 0], dtype=jnp.uint8)
     for x, y in np.asarray(state.agent_pos):
         maze = maze.at[pad + int(y), pad + int(x)].set(empty)
-    agent_positions = jnp.asarray([ego, teammate])
-    agent_directions = jnp.asarray([direction, 2])
+    # Preserve the environment state's exact dtypes. JAX scan requires every
+    # carry leaf to have the same dtype before and after env.step_env().
+    agent_positions = jnp.asarray(
+        [ego, teammate], dtype=state.agent_pos.dtype
+    )
+    agent_directions = jnp.asarray(
+        [direction, 2], dtype=state.agent_dir_idx.dtype
+    )
     for index, ((x, y), facing) in enumerate(zip(agent_positions, agent_directions)):
         agent = jnp.array([
             OBJECT_TO_INDEX["agent"], COLOR_TO_INDEX["red"] + index * 2,
@@ -127,17 +133,19 @@ def instantiate(config, record, horizon):
         ], dtype=jnp.uint8)
         maze = maze.at[pad + y, pad + x].set(agent)
     pot_x, pot_y = pot
-    maze = maze.at[pad + pot_y, pad + pot_x, 2].set(21)  # two onions
+    maze = maze.at[pad + pot_y, pad + pot_x, 2].set(
+        jnp.asarray(21, dtype=maze.dtype)
+    )  # two onions
     state = state.replace(
         agent_pos=agent_positions,
         agent_dir_idx=agent_directions,
         agent_dir=DIR_TO_VEC[agent_directions],
         agent_inv=jnp.asarray([
             OBJECT_TO_INDEX["onion"], OBJECT_TO_INDEX["plate"],
-        ]),
+        ], dtype=state.agent_inv.dtype),
         maze_map=maze,
-        time=jnp.asarray(0),
-        terminal=jnp.asarray(False),
+        time=jnp.asarray(0, dtype=state.time.dtype),
+        terminal=jnp.asarray(False, dtype=state.terminal.dtype),
     )
     record = dict(record, ego=list(ego), teammate=list(teammate), pot=list(pot),
                   goals=[list(value) for value in goals], direction=direction,

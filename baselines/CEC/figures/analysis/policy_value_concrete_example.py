@@ -287,12 +287,21 @@ def choose_example(config, args):
     predictor = make_policy_predictor(config, "FCP", args.reference_checkpoint)
 
     eligible = {"A": [], "B": []}
+    interact_argmax_count = {"A": 0, "B": 0}
+    max_interact_probability = {"A": 0.0, "B": 0.0}
     for record in candidates:
         probabilities = predictor(record, args.horizon)
+        variant = record["variant"]
+        interact_probability = float(probabilities[5])
+        max_interact_probability[variant] = max(
+            max_interact_probability[variant], interact_probability
+        )
+        if int(probabilities.argmax()) == 5:
+            interact_argmax_count[variant] += 1
         if (int(probabilities.argmax()) == 5
                 and float(probabilities[5])
                 >= args.selection_min_interact_probability):
-            eligible[record["variant"]].append((record, probabilities))
+            eligible[variant].append((record, probabilities))
 
     matches = []
     for easy, easy_probs in eligible["A"]:
@@ -314,8 +323,14 @@ def choose_example(config, args):
         raise RuntimeError(
             "No concrete pair satisfied the FCP reference policy filter. "
             f"Eligible individual states: A={len(eligible['A'])}, "
-            f"B={len(eligible['B'])}. Increase --map-candidates or relax "
-            "--selection-min-interact-probability/--selection-max-policy-js."
+            f"B={len(eligible['B'])}. Interact-argmax states: "
+            f"A={interact_argmax_count['A']}, B={interact_argmax_count['B']}; "
+            f"maximum Interact probabilities: "
+            f"A={max_interact_probability['A']:.4f}, "
+            f"B={max_interact_probability['B']:.4f}. Increase "
+            "--map-candidates, choose another --reference-seed, or set "
+            "--selection-min-interact-probability no higher than the reported "
+            "maximum. The Interact-argmax requirement remains active."
         )
     return_evaluator = make_reference_return_evaluator(
         config, args.reference_checkpoint, args
@@ -665,7 +680,7 @@ def main():
     parser.add_argument("--reference-checkpoint", type=Path,
                         help="FCP checkpoint; default is inferred from model root/family/seed")
     parser.add_argument("--reference-seed", type=int, default=0)
-    parser.add_argument("--selection-max-policy-js", type=float, default=.05)
+    parser.add_argument("--selection-max-policy-js", type=float, default=.15)
     parser.add_argument("--selection-min-interact-probability", type=float,
                         default=.9)
     parser.add_argument("--selection-min-return-gap", type=float, default=10.0)

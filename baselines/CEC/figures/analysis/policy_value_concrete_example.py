@@ -144,8 +144,6 @@ def instantiate(config, record, horizon):
             OBJECT_TO_INDEX["onion"], OBJECT_TO_INDEX["plate"],
         ], dtype=state.agent_inv.dtype),
         maze_map=maze,
-        time=jnp.asarray(0, dtype=state.time.dtype),
-        terminal=jnp.asarray(False, dtype=state.terminal.dtype),
     )
     record = dict(record, ego=list(ego), teammate=list(teammate), pot=list(pot),
                   goals=[list(value) for value in goals], direction=direction,

@@ -297,31 +297,53 @@ def choose_controlled_example(config, args):
             "reduce --local-match-radius, or relax --min-route-cost-gap."
         )
 
-    selected = min(matches)
-    easy, hard = selected[3], selected[4]
-    local_signature = local_layout_signature(easy, args.local_match_radius)
+    ordered = sorted(matches)
+    selected_matches = []
+    used_map_seeds = set()
+    for match in ordered:
+        seed_a, seed_b = match[1], match[2]
+        if seed_a in used_map_seeds or seed_b in used_map_seeds:
+            continue
+        selected_matches.append(match)
+        used_map_seeds.update((seed_a, seed_b))
+        if len(selected_matches) == args.num_pairs:
+            break
+    if len(selected_matches) < args.num_pairs:
+        selected_keys = {(match[1], match[2]) for match in selected_matches}
+        for match in ordered:
+            if (match[1], match[2]) in selected_keys:
+                continue
+            selected_matches.append(match)
+            if len(selected_matches) == args.num_pairs:
+                break
+
+    selections = []
     patch_width = 2 * args.local_match_radius + 1
-    selection = {
-        "method": "controlled_geometry",
-        "uses_model_outputs": False,
-        "semantic_state": {
-            "ego_inventory": "onion",
-            "ego_adjacent_to_pot": True,
-            "ego_facing_pot": True,
-            "pot_onions": 2,
-            "teammate_inventory": "plate",
-        },
-        "same_orientation": easy["direction"] == hard["direction"],
-        "local_match_radius": args.local_match_radius,
-        "local_layout_match": True,
-        "local_layout_patch": [
-            list(local_signature[index:index + patch_width])
-            for index in range(0, len(local_signature), patch_width)
-        ],
-        "min_route_cost_gap": args.min_route_cost_gap,
-        "route_cost_gap": hard["route_cost"] - easy["route_cost"],
-    }
-    return (easy, hard), selection
+    for selected in selected_matches:
+        easy, hard = selected[3], selected[4]
+        local_signature = local_layout_signature(easy, args.local_match_radius)
+        selection = {
+            "method": "controlled_geometry",
+            "uses_model_outputs": False,
+            "semantic_state": {
+                "ego_inventory": "onion",
+                "ego_adjacent_to_pot": True,
+                "ego_facing_pot": True,
+                "pot_onions": 2,
+                "teammate_inventory": "plate",
+            },
+            "same_orientation": easy["direction"] == hard["direction"],
+            "local_match_radius": args.local_match_radius,
+            "local_layout_match": True,
+            "local_layout_patch": [
+                list(local_signature[index:index + patch_width])
+                for index in range(0, len(local_signature), patch_width)
+            ],
+            "min_route_cost_gap": args.min_route_cost_gap,
+            "route_cost_gap": hard["route_cost"] - easy["route_cost"],
+        }
+        selections.append(((easy, hard), selection))
+    return selections
 
 
 def choose_fcp_example(config, args):
@@ -375,33 +397,34 @@ def choose_fcp_example(config, args):
             "--selection-min-interact-probability no higher than the reported "
             "maximum. The Interact-argmax requirement remains active."
         )
-    # Prefer the largest route-cost gap, then the smallest policy divergence.
-    selected = min(matches)
-    divergence = selected[1]
-    easy, hard = selected[4], selected[5]
-    easy_probs, hard_probs = selected[6], selected[7]
-    selection = {
-        "method": "fcp_policy_filter",
-        "uses_model_outputs": True,
-        "policy": "FCP",
-        "seed": args.reference_seed,
-        "checkpoint": str(args.reference_checkpoint),
-        "max_policy_js": args.selection_max_policy_js,
-        "min_interact_probability": args.selection_min_interact_probability,
-        "min_route_cost_gap": args.min_route_cost_gap,
-        "route_cost_gap": hard["route_cost"] - easy["route_cost"],
-        "policy_metrics": {
-            "probabilities_a": easy_probs.tolist(),
-            "probabilities_b": hard_probs.tolist(),
-            "interact_a": float(easy_probs[5]),
-            "interact_b": float(hard_probs[5]),
-            "js_nats": divergence,
-        },
-    }
-    return (easy, hard), selection
+    selections = []
+    for selected in sorted(matches)[:args.num_pairs]:
+        divergence = selected[1]
+        easy, hard = selected[4], selected[5]
+        easy_probs, hard_probs = selected[6], selected[7]
+        selection = {
+            "method": "fcp_policy_filter",
+            "uses_model_outputs": True,
+            "policy": "FCP",
+            "seed": args.reference_seed,
+            "checkpoint": str(args.reference_checkpoint),
+            "max_policy_js": args.selection_max_policy_js,
+            "min_interact_probability": args.selection_min_interact_probability,
+            "min_route_cost_gap": args.min_route_cost_gap,
+            "route_cost_gap": hard["route_cost"] - easy["route_cost"],
+            "policy_metrics": {
+                "probabilities_a": easy_probs.tolist(),
+                "probabilities_b": hard_probs.tolist(),
+                "interact_a": float(easy_probs[5]),
+                "interact_b": float(hard_probs[5]),
+                "js_nats": divergence,
+            },
+        }
+        selections.append(((easy, hard), selection))
+    return selections
 
 
-def draw_example(records, output_dir, local_match_radius=None):
+def draw_example(records, output_dir, pair_id, local_match_radius=None):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -469,7 +492,8 @@ def draw_example(records, output_dir, local_match_radius=None):
     )
     figure.tight_layout()
     figure.savefig(
-        output_dir / "concrete_state_pair.png", dpi=300, bbox_inches="tight"
+        output_dir / f"concrete_state_pair_{pair_id:02d}.png",
+        dpi=300, bbox_inches="tight"
     )
     figure.canvas.draw()
     state_image = np.asarray(figure.canvas.buffer_rgba()).copy()
@@ -482,7 +506,7 @@ def cosine_distance(left, right):
     return float(1 - np.dot(left, right) / denominator) if denominator else float("nan")
 
 
-def draw_checkpoint_reports(rows, output_dir, state_image):
+def draw_checkpoint_reports(rows, output_dir, state_images):
     """Create one directly inspectable A/B report for every checkpoint."""
     import matplotlib
 
@@ -496,7 +520,7 @@ def draw_checkpoint_reports(rows, output_dir, state_image):
         figure = plt.figure(figsize=(10.5, 8.0))
         grid = figure.add_gridspec(3, 2, height_ratios=(1.7, 1, .75), hspace=.38)
         map_axis = figure.add_subplot(grid[0, :])
-        map_axis.imshow(state_image)
+        map_axis.imshow(state_images[row["pair_id"]])
         map_axis.axis("off")
 
         action_axis = figure.add_subplot(grid[1, 0])
@@ -556,17 +580,21 @@ def draw_checkpoint_reports(rows, output_dir, state_image):
         )
         label = "DCEC" if row["model"] == "CEC_IDAAC" else row["model"]
         figure.suptitle(
-            f"{label} ({row['num_envs']}) · seed {row['seed']}",
+            f"Pair {row['pair_id']:02d} · {label} ({row['num_envs']}) · "
+            f"seed {row['seed']}",
             fontsize=15, fontweight="bold",
         )
         stem = report_dir / (
-            f"{label.lower()}_{row['num_envs']}_seed{row['seed']}"
+            f"pair{row['pair_id']:02d}_{label.lower()}_"
+            f"{row['num_envs']}_seed{row['seed']}"
         )
         figure.savefig(stem.with_suffix(".png"), dpi=220, bbox_inches="tight")
         plt.close(figure)
 
 
-def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args):
+def evaluate_checkpoint(
+    config, records, pair_id, model, num_envs, seed, checkpoint, args
+):
     import jax
     import jax.numpy as jnp
     from actor_networks import ScannedRNN
@@ -645,6 +673,11 @@ def evaluate_checkpoint(config, records, model, num_envs, seed, checkpoint, args
         return np.sum(probabilities[mask] * np.log(probabilities[mask] / midpoint[mask]))
     delta = a["mc_returns"] - b["mc_returns"]
     row = {
+        "pair_id": pair_id,
+        "map_seed_a": records[0]["map_seed"],
+        "map_seed_b": records[1]["map_seed"],
+        "route_cost_a": records[0]["route_cost"],
+        "route_cost_b": records[1]["route_cost"],
         "model": model, "num_envs": num_envs, "seed": seed,
         "checkpoint": str(checkpoint),
         "used_for_pair_selection": False,
@@ -703,6 +736,7 @@ def main():
                         default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
     parser.add_argument("--local-match-radius", type=int, default=1)
+    parser.add_argument("--num-pairs", type=int, default=10)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
     parser.add_argument("--map-seed", type=int, default=1701)
@@ -730,38 +764,41 @@ def main():
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
     if args.pair_selection == "controlled":
-        records, pair_selection = choose_controlled_example(config, args)
+        selected_pairs = choose_controlled_example(config, args)
     else:
-        records, pair_selection = choose_fcp_example(config, args)
-    print(
-        f"Selected maps: A seed={records[0]['map_seed']}, "
-        f"B seed={records[1]['map_seed']}, "
-        f"route-cost gap={pair_selection['route_cost_gap']}"
-    )
-    if pair_selection["method"] == "controlled_geometry":
+        selected_pairs = choose_fcp_example(config, args)
+    print(f"Selected {len(selected_pairs)} pair(s)")
+
+    serialized_pairs = []
+    state_images = {}
+    for pair_id, (records, pair_selection) in enumerate(selected_pairs):
         print(
-            "Pair selection: controlled geometry; "
-            f"same radius-{pair_selection['local_match_radius']} local layout, "
-            "same orientation, no model outputs used"
+            f"Pair {pair_id:02d}: A seed={records[0]['map_seed']}, "
+            f"B seed={records[1]['map_seed']}, "
+            f"route-cost gap={pair_selection['route_cost_gap']}"
         )
-    else:
-        policy = pair_selection["policy_metrics"]
-        print(
-            f"Pair filter FCP: JS={policy['js_nats']:.6f}, "
-            f"Interact(A)={policy['interact_a']:.4f}, "
-            f"Interact(B)={policy['interact_b']:.4f}"
+        if pair_selection["method"] == "fcp_policy_filter":
+            policy = pair_selection["policy_metrics"]
+            print(
+                f"  FCP: JS={policy['js_nats']:.6f}, "
+                f"Interact(A)={policy['interact_a']:.4f}, "
+                f"Interact(B)={policy['interact_b']:.4f}"
+            )
+        serialized_pairs.append({
+            "pair_id": pair_id,
+            "states": records,
+            "pair_selection": pair_selection,
+        })
+        state_images[pair_id] = draw_example(
+            records, args.output_dir, pair_id,
+            pair_selection.get("local_match_radius"),
         )
-    (args.output_dir / "concrete_state_pair.json").write_text(
-        json.dumps({"states": records, "pair_selection": pair_selection}, indent=2),
+    (args.output_dir / "concrete_state_pairs.json").write_text(
+        json.dumps({"pairs": serialized_pairs}, indent=2),
         encoding="utf-8",
     )
-    state_image = draw_example(
-        records, args.output_dir, pair_selection.get("local_match_radius")
-    )
-    print(f"Environment A route cost: {records[0]['route_cost']}")
-    print(f"Environment B route cost: {records[1]['route_cost']}")
     if args.prepare_only:
-        print(f"Saved concrete example to {args.output_dir}")
+        print(f"Saved {len(selected_pairs)} concrete pairs to {args.output_dir}")
         return
     rows = []
     for model, num_envs in args.models:
@@ -770,10 +807,15 @@ def main():
             if checkpoint is None:
                 print(f"Missing checkpoint: {model} {num_envs} seed {seed}")
                 continue
-            rows.append(evaluate_checkpoint(
-                config, records, model, num_envs, seed, checkpoint, args
-            ))
-            print(f"Evaluated {model} {num_envs} seed {seed}")
+            for pair_id, (records, _) in enumerate(selected_pairs):
+                rows.append(evaluate_checkpoint(
+                    config, records, pair_id, model, num_envs, seed,
+                    checkpoint, args
+                ))
+            print(
+                f"Evaluated {model} {num_envs} seed {seed} on "
+                f"{len(selected_pairs)} pairs"
+            )
     if not rows:
         raise RuntimeError("No usable checkpoint was found")
     with (args.output_dir / "concrete_example_metrics.csv").open(
@@ -790,6 +832,51 @@ def main():
         writer.writeheader()
         writer.writerows(filtered)
 
+    pair_groups = defaultdict(list)
+    for row in rows:
+        pair_groups[(row["model"], row["num_envs"], row["pair_id"])].append(row)
+    pair_summary = []
+    for (model, num_envs, pair_id), group in pair_groups.items():
+        pair_summary.append({
+            "model": model,
+            "num_envs": num_envs,
+            "pair_id": pair_id,
+            "map_seed_a": group[0]["map_seed_a"],
+            "map_seed_b": group[0]["map_seed_b"],
+            "route_cost_gap": group[0]["route_cost_b"] - group[0]["route_cost_a"],
+            "seeds": len(group),
+            "policy_equivalence_rate": np.mean([
+                row["passes_policy_equivalence"] for row in group
+            ]),
+            "intended_interaction_rate": np.mean([
+                row["passes_intended_interaction"] for row in group
+            ]),
+            "return_distinction_rate": np.mean([
+                row["passes_return_distinction"] for row in group
+            ]),
+            "full_example_pass_rate": np.mean([
+                row["passes_concrete_example"] for row in group
+            ]),
+            "mean_policy_js_nats": np.mean([
+                row["policy_js_nats"] for row in group
+            ]),
+            "mean_abs_mc_return_delta": np.mean([
+                abs(row["mc_return_delta_a_minus_b"]) for row in group
+            ]),
+            "mean_policy_rep_distance": np.mean([
+                row["policy_rep_cosine_distance"] for row in group
+            ]),
+            "mean_value_rep_distance": np.mean([
+                row["value_rep_cosine_distance"] for row in group
+            ]),
+        })
+    with (args.output_dir / "concrete_example_pair_summary.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(pair_summary[0]))
+        writer.writeheader()
+        writer.writerows(pair_summary)
+
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["model"], row["num_envs"])].append(row)
@@ -798,7 +885,9 @@ def main():
         summary.append({
             "model": model,
             "num_envs": num_envs,
-            "seeds": len(group),
+            "seeds": len({row["seed"] for row in group}),
+            "pairs": len({row["pair_id"] for row in group}),
+            "evaluations": len(group),
             "policy_equivalence_rate": np.mean([
                 row["passes_policy_equivalence"] for row in group
             ]),
@@ -831,8 +920,8 @@ def main():
             writer = csv.DictWriter(file, fieldnames=list(summary[0]))
             writer.writeheader()
             writer.writerows(summary)
-    draw_checkpoint_reports(rows, args.output_dir, state_image)
-    print(f"Saved concrete example and metrics to {args.output_dir}")
+    draw_checkpoint_reports(rows, args.output_dir, state_images)
+    print(f"Saved concrete pairs and metrics to {args.output_dir}")
 
 
 if __name__ == "__main__":

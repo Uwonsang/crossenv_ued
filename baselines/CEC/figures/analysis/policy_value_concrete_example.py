@@ -198,58 +198,6 @@ def make_policy_predictor(config, model, checkpoint):
     return predict_record
 
 
-def make_reference_return_evaluator(config, checkpoint, args):
-    """Return an FCP Monte Carlo evaluator for one controlled state."""
-    import jax
-    import jax.numpy as jnp
-    from actor_networks import ActorCriticRNN, ScannedRNN
-
-    network = ActorCriticRNN(6, config=config)
-    params = load_params(checkpoint)
-    hidden_dim = int(config["GRU_HIDDEN_DIM"])
-
-    def evaluate(record):
-        env, initial, _ = instantiate(config, record, args.horizon)
-
-        def initial_carry():
-            return ScannedRNN.initialize_carry(2, hidden_dim)
-
-        def rollout(key):
-            def step(carry_value, time):
-                state, hidden, done, key = carry_value
-                obs = env.get_obs(state)
-                obs_batch = jnp.stack([obs[a].reshape(-1) for a in env.agents])
-                hidden, policy, _ = network.apply(
-                    params, hidden,
-                    (obs_batch[None], done[None], state.agent_pos[None]),
-                )
-                key, action_key, step_key = jax.random.split(key, 3)
-                actions = policy.sample(seed=action_key)[0]
-                action_dict = {a: actions[i] for i, a in enumerate(env.agents)}
-                _, next_state, reward, dones, _ = env.step_env(
-                    step_key, state, action_dict
-                )
-                finished = jnp.all(done)
-                next_done = jnp.asarray([dones[a] for a in env.agents])
-                reward_value = jnp.where(finished, 0.0, reward["agent_0"])
-                return (next_state, hidden, next_done, key), args.gamma**time * reward_value
-
-            _, rewards = jax.lax.scan(
-                step,
-                (initial, initial_carry(), jnp.zeros(2, dtype=bool), key),
-                jnp.arange(args.horizon),
-            )
-            return rewards.sum()
-
-        keys = jax.random.split(
-            jax.random.PRNGKey(args.selection_rollout_seed),
-            args.selection_rollouts,
-        )
-        return np.asarray(jax.jit(jax.vmap(rollout))(keys))
-
-    return evaluate
-
-
 def resolve_reference_checkpoint(args):
     if args.reference_checkpoint is not None:
         checkpoint = args.reference_checkpoint.expanduser()
@@ -332,47 +280,17 @@ def choose_example(config, args):
             "--selection-min-interact-probability no higher than the reported "
             "maximum. The Interact-argmax requirement remains active."
         )
-    return_evaluator = make_reference_return_evaluator(
-        config, args.reference_checkpoint, args
-    )
-    return_cache = {}
-    qualified = []
-    for match in sorted(matches)[:args.selection_return_candidates]:
-        easy, hard = match[4], match[5]
-        for record in (easy, hard):
-            key = (record["variant"], record["map_seed"])
-            if key not in return_cache:
-                return_cache[key] = return_evaluator(record)
-        returns_a = return_cache[(easy["variant"], easy["map_seed"])]
-        returns_b = return_cache[(hard["variant"], hard["map_seed"])]
-        delta = returns_a - returns_b
-        if abs(float(delta.mean())) < args.selection_min_return_gap:
-            continue
-        qualified.append((
-            -abs(float(delta.mean())), *match,
-            float(returns_a.mean()), float(returns_b.mean()),
-            float(delta.mean()),
-            float(delta.std(ddof=1) / np.sqrt(len(delta))),
-        ))
-    if not qualified:
-        raise RuntimeError(
-            "Policy-qualified pairs were found, but none passed the FCP return "
-            "gap. Increase --selection-return-candidates/--selection-rollouts "
-            "or relax --selection-min-return-gap."
-        )
-    selected = min(qualified)
-    # qualified prepends return score, shifting the original match fields by one.
-    divergence = selected[2]
-    easy, hard = selected[5], selected[6]
-    easy_probs, hard_probs = selected[7], selected[8]
-    return_a, return_b, return_delta, return_delta_sem = selected[9:13]
+    # Prefer the largest route-cost gap, then the smallest policy divergence.
+    selected = min(matches)
+    divergence = selected[1]
+    easy, hard = selected[4], selected[5]
+    easy_probs, hard_probs = selected[6], selected[7]
     selection = {
         "policy": "FCP",
         "seed": args.reference_seed,
         "checkpoint": str(args.reference_checkpoint),
         "max_policy_js": args.selection_max_policy_js,
         "min_interact_probability": args.selection_min_interact_probability,
-        "min_abs_return_gap": args.selection_min_return_gap,
         "min_route_cost_gap": args.min_route_cost_gap,
         "route_cost_gap": hard["route_cost"] - easy["route_cost"],
         "policy_metrics": {
@@ -381,13 +299,6 @@ def choose_example(config, args):
             "interact_a": float(easy_probs[5]),
             "interact_b": float(hard_probs[5]),
             "js_nats": divergence,
-        },
-        "return_metrics": {
-            "mean_a": return_a,
-            "mean_b": return_b,
-            "delta_a_minus_b": return_delta,
-            "delta_sem": return_delta_sem,
-            "rollouts": args.selection_rollouts,
         },
     }
     return (easy, hard), selection
@@ -680,13 +591,9 @@ def main():
     parser.add_argument("--reference-checkpoint", type=Path,
                         help="FCP checkpoint; default is inferred from model root/family/seed")
     parser.add_argument("--reference-seed", type=int, default=0)
-    parser.add_argument("--selection-max-policy-js", type=float, default=.15)
+    parser.add_argument("--selection-max-policy-js", type=float, default=.2)
     parser.add_argument("--selection-min-interact-probability", type=float,
-                        default=.9)
-    parser.add_argument("--selection-min-return-gap", type=float, default=10.0)
-    parser.add_argument("--selection-rollouts", type=int, default=32)
-    parser.add_argument("--selection-rollout-seed", type=int, default=3701)
-    parser.add_argument("--selection-return-candidates", type=int, default=20)
+                        default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
@@ -720,12 +627,10 @@ def main():
         f"route-cost gap={pair_selection['route_cost_gap']}"
     )
     policy = pair_selection["policy_metrics"]
-    returns = pair_selection["return_metrics"]
     print(
         f"Pair filter FCP: JS={policy['js_nats']:.6f}, "
         f"Interact(A)={policy['interact_a']:.4f}, "
-        f"Interact(B)={policy['interact_b']:.4f}, "
-        f"return delta={returns['delta_a_minus_b']:.3f}"
+        f"Interact(B)={policy['interact_b']:.4f}"
     )
     (args.output_dir / "concrete_state_pair.json").write_text(
         json.dumps({"states": records, "pair_selection": pair_selection}, indent=2),

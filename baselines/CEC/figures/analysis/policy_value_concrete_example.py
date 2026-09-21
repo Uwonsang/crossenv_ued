@@ -745,11 +745,12 @@ def main():
     parser.add_argument("--selection-min-interact-probability", type=float,
                         default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
-    parser.add_argument("--num-pairs", type=int, default=10)
+    parser.add_argument("--num-pairs", type=int)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
     parser.add_argument("--map-seed", type=int, default=1701)
-    parser.add_argument("--map-candidates", type=int, default=1000)
+    parser.add_argument("--map-candidates", type=int)
+    parser.add_argument("--large-scale", action="store_true")
     parser.add_argument("--horizon", type=int, default=200)
     parser.add_argument("--rollouts", type=int, default=100)
     parser.add_argument("--rollout-seed", type=int, default=2701)
@@ -765,11 +766,20 @@ def main():
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
     args.model_root = args.model_root.expanduser()
+    if args.map_candidates is None:
+        args.map_candidates = 3000 if args.large_scale else 1000
+    if args.num_pairs is None:
+        args.num_pairs = 50 if args.large_scale else 10
     if args.pair_selection == "fcp":
         args.reference_checkpoint = resolve_reference_checkpoint(args)
-    args.output_dir = args.output_dir or (
-        args.model_root / "analysis" / "policy_value_concrete_example"
+    default_output_name = (
+        "policy_value_large_scale"
+        if args.large_scale else "policy_value_concrete_example"
     )
+    output_root = args.output_dir or (
+        args.model_root / "analysis" / default_output_name
+    )
+    args.output_dir = output_root / args.family
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config = load_config(args.config)
     if args.pair_selection == "controlled":

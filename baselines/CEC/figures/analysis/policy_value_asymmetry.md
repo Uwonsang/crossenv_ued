@@ -32,20 +32,52 @@ python baselines/CEC/figures/analysis/policy_value_concrete_example.py \
   --rollouts 100
 ```
 
+The default pair selection uses only four controlled conditions: the ego holds
+an onion, is adjacent to a pot containing exactly two onions, faces that pot,
+and has the same orientation in A and B. It pairs distinct maps without using
+local-layout similarity, teammate state, route cost, FCP, CEC, or DCEC output.
+It selects up to 10 pairs while preferring not to reuse map seeds. Use
+`--num-pairs N` to change the requested number.
+
+The previous FCP policy filter remains available with `--pair-selection fcp`.
+It uses the seed-0 FCP checkpoint by default, requires Interact to be the argmax
+with probability at least 0.6 in A and B, and requires policy JS at most 0.2.
 The output directory is
-`<model-root>/analysis/policy_value_concrete_example/`. It contains the A/B map
-figure and JSON, all checkpoint metrics, rows passing the automatic filter, and
-a seed-level model summary. The default filter requires policy JS at most 0.05,
-Interact as both argmax actions with probability at least 0.5, and an absolute
+`<model-root>/analysis/policy_value_concrete_example/<family>/`. A custom
+`--output-dir` is also treated as a root and receives the same `<family>`
+subdirectory. It contains one A/B map
+figure per pair, pair JSON, all checkpoint-pair metrics, rows passing the
+automatic filter, and a model summary. The default filter requires policy JS below 0.15,
+Interact as both argmax actions with probability at least 0.7, and an absolute
 Monte Carlo return gap of at least 1.0. These can be changed with
 `--max-policy-js`, `--min-interact-probability`, and
 `--min-abs-return-delta`.
 
-The `checkpoint_visualizations/` subdirectory contains one PDF and PNG per
+`concrete_example_model_filtered.csv` contains independently passing
+model/pair rows. `concrete_example_filtered.csv` is the joint result: a pair and
+seed appear only when every model requested through `--models` passes all three
+conditions on that same pair.
+
+The `checkpoint_visualizations/` subdirectory contains one PNG per pair and
 checkpoint. Each page shows the exact A/B maps, both six-action distributions,
 predicted values, Monte Carlo returns, representation distances, and the
-automatic filter decision. `concrete_state_pair.json` contains the complete
-layout and controlled state coordinates for exact inspection or reconstruction.
+automatic filter decision. `concrete_state_pairs.json` contains every selected
+pair's complete layout and controlled state coordinates for exact inspection
+or reconstruction.
+
+Use `--large-scale` for the large-run preset. It changes the defaults from
+1,000 maps and 10 pairs to 3,000 maps and 50 pairs, and stores results under
+`<model-root>/analysis/policy_value_large_scale/<family>/`. Explicit
+`--map-candidates`, `--num-pairs`, or `--output-dir` values override the
+corresponding preset values.
+
+Policy and value representation distances are each reported as cosine
+distance, raw Euclidean distance, and z-scored Euclidean distance. For the
+z-scored metric, every representation dimension is standardized using all A/B
+states from all selected pairs for that specific model checkpoint. Dimensions
+with near-zero standard deviation are left at unit scale to avoid division by
+zero. Representations from different models or seeds are never mixed when
+computing normalization statistics.
 
 This diagnostic uses the existing `make_*_9x9(..., ik=True)` generators for
 Asymmetric Advantages, Coordination Ring, Counter Circuit, Forced Coordination,
@@ -247,10 +279,12 @@ python baselines/CEC/figures/analysis/policy_value_geometry_graph.py \
 
 Because the networks are recurrent, all checkpoints are teacher-forced through
 the same complete reference observation histories. The comparison therefore
-does not reset the LSTM independently at each sampled state. For CEC, the
-primary policy and value distances both refer to its shared recurrent trunk.
-For DCEC, they refer to its separate policy and value trunks. Distances at the
-actor and critic head inputs are also saved separately.
+does not reset the LSTM independently at each sampled state. For both CEC and
+DCEC, policy geometry uses `actor_penultimate` and value geometry uses
+`critic_penultimate`, immediately before their output layers. In CEC these
+features follow a shared recurrent trunk but belong to separate heads, so this
+analysis compares final policy/value features rather than directly measuring
+the shared trunk itself.
 
 The graph contains two panels with `|delta G|` on the x-axis and cosine distance
 on the y-axis. It plots only rows where the evaluated model itself also has low

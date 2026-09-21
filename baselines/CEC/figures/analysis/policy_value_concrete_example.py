@@ -1,9 +1,8 @@
-"""Build and evaluate one visible policy-equivalent/value-distinct example.
+"""Build and evaluate visible policy-equivalent/value-distinct candidates.
 
-Both states put agent 0 directly in front of a pot containing two onions while
-holding the third onion.  Agent 1 holds a plate.  Environment A is selected for
-a short plate-to-pot-to-serving route; environment B is selected for a long
-route.  Checkpoints are evaluated without using their outputs to choose maps.
+Every state puts agent 0 directly in front of a pot containing two onions while
+holding the third onion. A/B pairs share the ego orientation but otherwise come
+from distinct maps. Checkpoints are evaluated only after pair construction.
 """
 from __future__ import annotations
 
@@ -108,15 +107,20 @@ def instantiate(config, record, horizon):
     ego = min(pot_access)
     direction_vector = (pot[0] - ego[0], pot[1] - ego[1])
     direction = DIRECTIONS.index(direction_vector)
+    original_positions = [
+        tuple(map(int, position)) for position in np.asarray(state.agent_pos)
+    ]
+    teammate_indices = [
+        index for index, position in enumerate(original_positions)
+        if position != ego
+    ]
+    if not teammate_indices:
+        raise ValueError("No original teammate position distinct from ego")
+    teammate_index = teammate_indices[0]
+    teammate = original_positions[teammate_index]
     from_pot = distances(floor - {ego}, [cell for cell in pot_access if cell != ego])
-    candidates = [cell for cell in floor if cell != ego and cell in from_pot]
-    if not candidates:
-        raise ValueError("No teammate placement reachable from the pot")
-    teammate = (
-        min(candidates, key=lambda cell: from_pot[cell])
-        if record["variant"] == "A"
-        else max(candidates, key=lambda cell: from_pot[cell])
-    )
+    if teammate not in from_pot:
+        raise ValueError("Original teammate position is not reachable from the pot")
     pot_to_goal = min(
         distances(floor, pot_access).get(cell, 10**6) for cell in goal_access
     )
@@ -132,9 +136,9 @@ def instantiate(config, record, horizon):
     agent_positions = jnp.asarray(
         [ego, teammate], dtype=state.agent_pos.dtype
     )
-    agent_directions = jnp.asarray(
-        [direction, 2], dtype=state.agent_dir_idx.dtype
-    )
+    agent_directions = jnp.asarray([
+        direction, state.agent_dir_idx[teammate_index]
+    ], dtype=state.agent_dir_idx.dtype)
     for index, ((x, y), facing) in enumerate(zip(agent_positions, agent_directions)):
         agent = jnp.array([
             OBJECT_TO_INDEX["agent"], COLOR_TO_INDEX["red"] + index * 2,
@@ -150,7 +154,7 @@ def instantiate(config, record, horizon):
         agent_dir_idx=agent_directions,
         agent_dir=DIR_TO_VEC[agent_directions],
         agent_inv=jnp.asarray([
-            OBJECT_TO_INDEX["onion"], OBJECT_TO_INDEX["plate"],
+            OBJECT_TO_INDEX["onion"], state.agent_inv[teammate_index],
         ], dtype=state.agent_inv.dtype),
         maze_map=maze,
     )
@@ -215,10 +219,22 @@ def resolve_reference_checkpoint(args):
 def generate_candidates(config, args):
     import jax
     from jaxmarl.environments.overcooked import layouts
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        def tqdm(iterable, **_kwargs):
+            return iterable
 
     candidates = []
     generator = getattr(layouts, f"make_{args.family}_9x9")
-    for offset in range(args.map_candidates):
+    offsets = tqdm(
+        range(args.map_candidates),
+        total=args.map_candidates,
+        desc=f"Generating {args.family} candidates",
+        unit="map",
+        dynamic_ncols=True,
+    )
+    for offset in offsets:
         seed = args.map_seed + offset
         base = layout_record(generator(jax.random.PRNGKey(seed), ik=True), seed, args.family)
         for variant in ("A", "B"):
@@ -234,74 +250,38 @@ def generate_candidates(config, args):
     return candidates
 
 
-def local_layout_signature(record, radius):
-    """Return an ego-centered semantic tile patch, excluding both agents."""
-    layout = record["layout"]
-    width, height = int(layout["width"]), int(layout["height"])
-
-    def positions(key):
-        return {
-            (int(index) % width, int(index) // width)
-            for index in layout[key]
-        }
-
-    semantic_tiles = {}
-    for key, label in (
-        ("wall_idx", "wall"),
-        ("goal_idx", "serve"),
-        ("plate_pile_idx", "plate"),
-        ("onion_pile_idx", "onion"),
-        ("pot_idx", "pot"),
-    ):
-        for position in positions(key):
-            semantic_tiles[position] = label
-
-    ego_x, ego_y = record["ego"]
-    patch = []
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            x, y = ego_x + dx, ego_y + dy
-            if not (0 <= x < width and 0 <= y < height):
-                patch.append("outside")
-            else:
-                patch.append(semantic_tiles.get((x, y), "floor"))
-    return tuple(patch)
-
-
 def choose_controlled_example(config, args):
-    """Select a pair using only controlled state and layout geometry."""
+    """Pair states that share only the requested immediate-state template."""
     candidates = generate_candidates(config, args)
     grouped = defaultdict(lambda: {"A": [], "B": []})
     for record in candidates:
-        key = (
-            record["direction"],
-            local_layout_signature(record, args.local_match_radius),
-        )
-        grouped[key][record["variant"]].append(record)
+        grouped[record["direction"]][record["variant"]].append(record)
 
     matches = []
-    for _signature, variants in grouped.items():
-        for easy in variants["A"]:
-            for hard in variants["B"]:
-                if easy["map_seed"] == hard["map_seed"]:
-                    continue
-                route_gap = hard["route_cost"] - easy["route_cost"]
-                if route_gap < args.min_route_cost_gap:
-                    continue
-                matches.append((
-                    -route_gap, easy["map_seed"], hard["map_seed"], easy, hard
-                ))
+    for direction, variants in grouped.items():
+        states_a = sorted(variants["A"], key=lambda record: record["map_seed"])
+        states_b = sorted(variants["B"], key=lambda record: record["map_seed"])
+        if len(states_a) < 2 or len(states_b) < 2:
+            continue
+        for index, state_a in enumerate(states_a):
+            state_b = states_b[(index + 1) % len(states_b)]
+            if state_a["map_seed"] == state_b["map_seed"]:
+                continue
+            matches.append((
+                state_a["map_seed"], state_b["map_seed"], direction,
+                state_a, state_b,
+            ))
     if not matches:
         raise RuntimeError(
-            "No geometry-controlled pair was found. Increase --map-candidates, "
-            "reduce --local-match-radius, or relax --min-route-cost-gap."
+            "No two maps produced the controlled state with the same ego "
+            "orientation. Increase --map-candidates."
         )
 
     ordered = sorted(matches)
     selected_matches = []
     used_map_seeds = set()
     for match in ordered:
-        seed_a, seed_b = match[1], match[2]
+        seed_a, seed_b = match[0], match[1]
         if seed_a in used_map_seeds or seed_b in used_map_seeds:
             continue
         selected_matches.append(match)
@@ -309,40 +289,30 @@ def choose_controlled_example(config, args):
         if len(selected_matches) == args.num_pairs:
             break
     if len(selected_matches) < args.num_pairs:
-        selected_keys = {(match[1], match[2]) for match in selected_matches}
+        selected_keys = {(match[0], match[1]) for match in selected_matches}
         for match in ordered:
-            if (match[1], match[2]) in selected_keys:
+            if (match[0], match[1]) in selected_keys:
                 continue
             selected_matches.append(match)
             if len(selected_matches) == args.num_pairs:
                 break
 
     selections = []
-    patch_width = 2 * args.local_match_radius + 1
     for selected in selected_matches:
-        easy, hard = selected[3], selected[4]
-        local_signature = local_layout_signature(easy, args.local_match_radius)
+        state_a, state_b = selected[3], selected[4]
         selection = {
-            "method": "controlled_geometry",
+            "method": "controlled_semantic_state",
             "uses_model_outputs": False,
             "semantic_state": {
                 "ego_inventory": "onion",
                 "ego_adjacent_to_pot": True,
                 "ego_facing_pot": True,
                 "pot_onions": 2,
-                "teammate_inventory": "plate",
             },
-            "same_orientation": easy["direction"] == hard["direction"],
-            "local_match_radius": args.local_match_radius,
-            "local_layout_match": True,
-            "local_layout_patch": [
-                list(local_signature[index:index + patch_width])
-                for index in range(0, len(local_signature), patch_width)
-            ],
-            "min_route_cost_gap": args.min_route_cost_gap,
-            "route_cost_gap": hard["route_cost"] - easy["route_cost"],
+            "same_orientation": state_a["direction"] == state_b["direction"],
+            "route_cost_gap": state_b["route_cost"] - state_a["route_cost"],
         }
-        selections.append(((easy, hard), selection))
+        selections.append(((state_a, state_b), selection))
     return selections
 
 
@@ -424,7 +394,7 @@ def choose_fcp_example(config, args):
     return selections
 
 
-def draw_example(records, output_dir, pair_id, local_match_radius=None):
+def draw_example(records, output_dir, pair_id):
     import matplotlib
 
     matplotlib.use("Agg")
@@ -458,7 +428,7 @@ def draw_example(records, output_dir, pair_id, local_match_radius=None):
                         fontsize=6.5, color="white" if key == "pot_idx" else "black")
         for position, color, label in (
             (record["ego"], "#d62728", "Ego\nOnion"),
-            (record["teammate"], "#2455d6", "Mate\nPlate"),
+            (record["teammate"], "#2455d6", "Mate"),
         ):
             x, y = position
             ax.add_patch(Circle((x + .5, y + .5), .35, facecolor=color,
@@ -467,14 +437,6 @@ def draw_example(records, output_dir, pair_id, local_match_radius=None):
                     fontsize=6.5, color="white", fontweight="bold", zorder=6)
         ego_x, ego_y = record["ego"]
         pot_x, pot_y = record["pot"]
-        if local_match_radius is not None:
-            ax.add_patch(Rectangle(
-                (ego_x - local_match_radius, ego_y - local_match_radius),
-                2 * local_match_radius + 1,
-                2 * local_match_radius + 1,
-                fill=False, edgecolor="#d946ef", linewidth=1.8,
-                linestyle="--", zorder=7,
-            ))
         ax.annotate("", xy=(pot_x + .5, pot_y + .5),
                     xytext=(ego_x + .5, ego_y + .5),
                     arrowprops=dict(arrowstyle="->", color="#d62728", lw=2))
@@ -487,7 +449,7 @@ def draw_example(records, output_dir, pair_id, local_match_radius=None):
             fontweight="bold",
         )
     figure.suptitle(
-        "Same immediate interaction, different future coordination cost",
+        "Controlled immediate semantic-state pair",
         fontweight="bold",
     )
     figure.tight_layout()
@@ -735,7 +697,6 @@ def main():
     parser.add_argument("--selection-min-interact-probability", type=float,
                         default=.6)
     parser.add_argument("--min-route-cost-gap", type=int, default=2)
-    parser.add_argument("--local-match-radius", type=int, default=1)
     parser.add_argument("--num-pairs", type=int, default=10)
     parser.add_argument("--family", choices=tuple(FAMILY_LABELS),
                         default="counter_circuit")
@@ -789,10 +750,7 @@ def main():
             "states": records,
             "pair_selection": pair_selection,
         })
-        state_images[pair_id] = draw_example(
-            records, args.output_dir, pair_id,
-            pair_selection.get("local_match_radius"),
-        )
+        state_images[pair_id] = draw_example(records, args.output_dir, pair_id)
     (args.output_dir / "concrete_state_pairs.json").write_text(
         json.dumps({"pairs": serialized_pairs}, indent=2),
         encoding="utf-8",
@@ -824,7 +782,25 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    filtered = [row for row in rows if row["passes_concrete_example"]]
+    model_filtered = [row for row in rows if row["passes_concrete_example"]]
+    with (args.output_dir / "concrete_example_model_filtered.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(model_filtered)
+
+    requested_specs = set(args.models)
+    joint_groups = defaultdict(list)
+    for row in rows:
+        joint_groups[(row["pair_id"], row["seed"])].append(row)
+    filtered = []
+    for group in joint_groups.values():
+        by_spec = {(row["model"], row["num_envs"]): row for row in group}
+        if not requested_specs.issubset(by_spec):
+            continue
+        if all(by_spec[spec]["passes_concrete_example"] for spec in requested_specs):
+            filtered.extend(by_spec[spec] for spec in args.models)
     with (args.output_dir / "concrete_example_filtered.csv").open(
         "w", newline="", encoding="utf-8"
     ) as file:

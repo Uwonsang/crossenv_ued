@@ -167,7 +167,7 @@ def plot_layouts(output_dir: Path, filename_stem: str, dpi: int):
     images = [(label, render_layout(rows)) for label, rows in LAYOUTS]
     figure = plt.figure(figsize=(12.0, 5.0), constrained_layout=False)
 
-    def add_row(row_images, y, height, gap=0.004):
+    def add_row(row_images, y, height, gap=0.010):
         figure_aspect = figure.get_figwidth() / figure.get_figheight()
         widths = [
             height * image.shape[1] / image.shape[0] / figure_aspect
@@ -180,10 +180,9 @@ def plot_layouts(output_dir: Path, filename_stem: str, dpi: int):
             ax.axis("off")
             x += width + gap
 
-    # Put the three compact layouts above the two wide layouts.  The summed
-    # aspect ratios of the rows are then similar, keeping the figure balanced.
-    add_row([images[1], images[3], images[4]], y=0.505, height=0.485)
-    add_row([images[0], images[2]], y=0.010, height=0.485)
+    # Place Cramped Room and Asymmetric Advantages above the other layouts.
+    add_row([images[3], images[0]], y=0.515, height=0.475)
+    add_row([images[1], images[2], images[4]], y=0.010, height=0.475)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "pdf"):

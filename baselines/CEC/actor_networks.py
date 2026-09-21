@@ -114,6 +114,13 @@ class ActorCriticRNN(nn.Module):
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
 
+        # No parameters are added by ``sow``.  Evaluation/analysis code can
+        # request the frozen policy representation with
+        # ``mutable=["intermediates"]`` while ordinary evaluation keeps the
+        # original return signature and checkpoint compatibility.
+        if self.is_mutable_collection("intermediates"):
+            self.sow("intermediates", "actor_penultimate", actor_mean)
+
         actor_mean = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
         )(actor_mean)        
@@ -253,6 +260,9 @@ class IDAACActorRNN(nn.Module):
                 name="actor_hidden_3",
             )(actor_mean)
             actor_mean = nn.relu(actor_mean)
+
+        if self.is_mutable_collection("intermediates"):
+            self.sow("intermediates", "actor_penultimate", actor_mean)
 
         logits = nn.Dense(
             self.action_dim,

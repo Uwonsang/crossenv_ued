@@ -97,7 +97,7 @@ def main():
     for ax in list(axes.flat)[len(panels):]:
         ax.axis("off")
     fig.suptitle(args.title, fontsize=args.title_fontsize, fontweight="bold")
-    fig.colorbar(q, ax=list(axes.flat), shrink=.7, label="Relative speed (shared scale)")
+    fig.colorbar(q, ax=list(axes.flat), shrink=.7)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for suffix in ("png", "pdf"):
         fig.savefig(

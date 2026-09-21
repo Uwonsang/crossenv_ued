@@ -302,7 +302,7 @@ def plot_overall(
     ax.tick_params(axis="x", labelsize=24, pad=12)
     ax.tick_params(axis="y", labelsize=24)
     ax.set_ylabel("XP Reward", fontsize=26)
-    ax.set_title("(a) Fixed tasks", fontsize=28, fontweight="bold", pad=16)
+    ax.set_title("(a) 5 Fixed Tasks", fontsize=28, fontweight="bold", pad=16)
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()

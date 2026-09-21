@@ -364,7 +364,7 @@ def plot_overall_line(
 
     ax.set_xticks(x)
     ax.set_xticklabels(["8K", "16K", "32K", "65K"])
-    ax.set_xlabel("Number of parallel training environments")
+    ax.set_xlabel("Batch Size")
     ax.set_ylabel("mean reward (average over maps)")
     ax.grid(alpha=0.35)
     ax.set_axisbelow(True)

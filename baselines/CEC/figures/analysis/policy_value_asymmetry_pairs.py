@@ -159,7 +159,7 @@ def generate_pairs(args):
 
     config = load_config(args.config)
     if config["ENV_KWARGS"].get("partial_obs", False):
-        raise ValueError("Pair matching currently requires full spatial observations")
+        raise ValueError("This analysis requires the model's full 9x9 observation")
     directions = [tuple(map(int, value)) for value in np.asarray(DIR_TO_VEC)]
     pairs, diagnostics = [], {}
     for family_index, family in enumerate(FAMILIES):
@@ -173,7 +173,7 @@ def generate_pairs(args):
                 reset_seed=seed,
                 direction=directions.index((1, 0)),
             )
-            env, state = initial_state(config, record, args.horizon)
+            _, state = initial_state(config, record, args.horizon)
             walls = np.asarray(state.wall_map)
             partner = tuple(np.asarray(state.agent_pos[1]).tolist())
             start = tuple(np.asarray(state.agent_pos[0]).tolist())
@@ -187,18 +187,9 @@ def generate_pairs(args):
             if plan is None or len(first_actions) != 1 or len(plan) > args.horizon:
                 continue
             reachable += 1
-            observation = np.asarray(env.get_obs(state)["agent_0"])
-            if observation.ndim != 3 or observation.shape[:2] != walls.shape:
-                raise ValueError("Expected full H x W x channels observation")
-            radius = args.local_radius
-            padded = np.pad(
-                observation,
-                ((radius, radius), (radius, radius), (0, 0)),
-                constant_values=-1,
-            )
-            x, y = start
-            patch = padded[y:y + 2 * radius + 1, x:x + 2 * radius + 1]
-            key = (start, partner, first_actions[0], patch.tobytes())
+            # Keep the controlled agent configuration and optimal first action
+            # fixed, while allowing the full 9x9 layout observation to differ.
+            key = (start, partner, first_actions[0])
             record.update(plan=plan, map_seed=seed)
             for other in groups.get(key, []):
                 if abs(len(other["plan"]) - len(plan)) >= args.min_step_gap:
@@ -228,9 +219,11 @@ def generate_pairs(args):
         pairs=pairs,
         diagnostics=diagnostics,
         map_seed=args.map_seed,
-        local_radius=args.local_radius,
         min_step_gap=args.min_step_gap,
         config=str(args.config),
+        observation_scope="full 9x9x26 model observation",
+        matching=("same focal/partner positions, direction, and unique oracle "
+                  "first action; different PCG layout variants"),
         intervention="agent 0 holds soup; stationary partner",
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -247,7 +240,6 @@ def main():
     parser.add_argument("--map-seed", type=int, default=1701)
     parser.add_argument("--candidates-per-family", type=int, default=500)
     parser.add_argument("--pairs-per-family", type=int, default=5)
-    parser.add_argument("--local-radius", type=int, default=1)
     parser.add_argument("--min-step-gap", type=int, default=2)
     parser.add_argument("--horizon", type=int, default=400)
     parser.add_argument(
@@ -268,7 +260,7 @@ def main():
         args.candidates_per_family, args.pairs_per_family,
         args.min_step_gap, args.horizon,
         args.dpi,
-    ) < 1 or args.local_radius < 0:
+    ) < 1:
         parser.error("Invalid pair-generation parameters")
     args.output = args.output.expanduser()
     if args.visualization_dir is not None:

@@ -26,11 +26,11 @@ counts for every family. No checkpoint is loaded during preparation. The search
 can find fewer pairs or zero pairs; missing families must be reported. Increasing
 the candidate budget is possible, but do not silently weaken matching criteria.
 
-Within a family, pairs have the same agent positions, fixed orientations, and
-exact 3x3 local observation patch (all channels), and the same unique optimal
-first action for shortest delivery. The default required distance gap is two
-steps. These criteria are independent of model predictions. Candidate states
-are not reused within a family. The full observations can differ.
+Within a family, pairs have the same agent positions, partner position, fixed
+orientation, and the same unique optimal first action for shortest delivery.
+Their full `9x9x26` observations are intentionally different PCG layout
+variants. The default required distance gap is two steps. These criteria are
+independent of model predictions, and candidate states are not reused.
 
 Agent 0 is explicitly given soup; agent 1 stays at its reset position. Empty
 pots, time zero, and zero recurrent history are used. This is a controlled state
@@ -108,9 +108,10 @@ environment transitions and the expected discounted first-delivery reward.
 
 Outputs:
 
-- `paired_metrics.csv`: policy JS divergence, action agreement, value difference,
+- `paired_metrics.csv`: policy JS divergence, oracle-action accuracy, value difference,
   full-horizon Monte Carlo return difference and paired rollout SEM,
-  first-delivery oracle difference, within-network actor/critic cosine distances.
+  first-delivery oracle difference, and within-network actor/critic cosine
+  distances across full-layout observations.
 - `rollout_returns.csv`: individual full-horizon discounted sparse returns.
 - `metadata.json`: settings, manifest, exact pair definitions, and caveats.
 
@@ -131,6 +132,12 @@ This creates `policy_value_asymmetry_summary.pdf/png` and
 averages state pairs within each training seed and uses variation across seeds
 for error bars. With one seed, it draws no uncertainty bar. The pair plot shows
 policy JS divergence against the predicted short-minus-long value difference.
+
+The fourth summary panel measures how strongly actor and critic features change
+between the two full layout observations. Greater cosine distance means stronger
+layout-specific representation sensitivity. It should be interpreted together
+with oracle-action accuracy: equal but incorrect actions are not evidence of a
+useful invariant policy.
 
 Small policy divergence with a reproducible return difference supports local
 policy/value asymmetry under this intervention. It does not prove equality of

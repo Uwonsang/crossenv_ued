@@ -1,7 +1,8 @@
-"""Local policy/value diagnostic on variants of the five existing layout families.
+"""Policy/value environment-fitting diagnostic on five PCG layout families.
 
-Pairs share local observations and a unique shortest-delivery first action,
-but differ in delivery delay. This does not certify identical full-task policies.
+Models receive their original full 9x9 observations. Pairs share controlled
+agent conditions and a unique shortest-delivery first action, but use different
+layout variants and delivery delays.
 """
 from __future__ import annotations
 
@@ -155,6 +156,14 @@ def evaluate(args):
                 pair=pair["pair"], policy_js_nats=(kl(pa)+kl(pb))/2,
                 policy_argmax_same=bool(pa.argmax()==pb.argmax()),
                 oracle_first_action_same=a["oracle_first_action"]==b["oracle_first_action"],
+                short_policy_argmax=int(pa.argmax()),
+                long_policy_argmax=int(pb.argmax()),
+                short_policy_oracle_correct=bool(pa.argmax()==a["oracle_first_action"]),
+                long_policy_oracle_correct=bool(pb.argmax()==b["oracle_first_action"]),
+                both_policy_oracle_correct=bool(
+                    pa.argmax()==a["oracle_first_action"]
+                    and pb.argmax()==b["oracle_first_action"]
+                ),
                 value_delta=a["predicted_value"]-b["predicted_value"],
                 mc_delta=float(delta.mean()), mc_delta_sem=float(delta.std(ddof=1)/np.sqrt(len(delta))),
                 first_delivery_oracle_delta=a["first_delivery_oracle_return"]-b["first_delivery_oracle_return"])
@@ -173,7 +182,8 @@ def evaluate(args):
         gamma=gamma, horizon=args.horizon, rollouts=args.rollouts, rollout_seed=args.rollout_seed,
         checkpoints=manifest, pair_source=str(args.pairs), pair_selection=payload, partner="stationary agent at variant reset position", recurrent_history="zero at initial state",
         caveat="Existing-family PCG variants with injected soup and zero recurrent history. "
-               "Local observation and shortest first-delivery action matching do not imply full-policy equivalence. "
+               "Models receive different full 9x9 layout observations; matching the shortest "
+               "first-delivery action does not imply full-policy equivalence. "
                "First-delivery oracle is not full-episode policy value. Critic training partner/reward may differ. "
                "Do not treat pairs or rollouts as independent training seeds."
     ), indent=2))

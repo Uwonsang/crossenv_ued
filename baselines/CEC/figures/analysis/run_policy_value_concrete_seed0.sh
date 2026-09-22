@@ -12,6 +12,7 @@ families=(
   coord_ring
   counter_circuit
   forced_coord
+  cramped_room
 )
 
 for family in "${families[@]}"; do
@@ -24,4 +25,3 @@ for family in "${families[@]}"; do
     --map-candidates 500 \
     --num-pairs 10
 done
-

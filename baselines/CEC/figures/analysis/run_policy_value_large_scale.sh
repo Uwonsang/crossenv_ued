@@ -12,6 +12,7 @@ families=(
   coord_ring
   counter_circuit
   forced_coord
+  cramped_room
 )
 
 for family in "${families[@]}"; do
@@ -24,4 +25,3 @@ for family in "${families[@]}"; do
     --large-scale \
     --num-pairs 50
 done
-

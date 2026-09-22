@@ -118,7 +118,16 @@ def instantiate(config, record, horizon):
         raise ValueError("No original teammate position distinct from ego")
     teammate_index = teammate_indices[0]
     teammate = original_positions[teammate_index]
-    from_pot = distances(floor - {ego}, [cell for cell in pot_access if cell != ego])
+    # Prefer a route that does not pass through the ego's current cell.  In
+    # Cramped Room, however, a pot commonly has exactly one access cell and the
+    # controlled setup deliberately places ego on it.  Ego moves after adding
+    # the onion, so use the future unblocked floor for route-cost bookkeeping
+    # rather than rejecting an otherwise valid semantic state.
+    from_pot = distances(
+        floor - {ego}, [cell for cell in pot_access if cell != ego]
+    )
+    if teammate not in from_pot:
+        from_pot = distances(floor, pot_access)
     if teammate not in from_pot:
         raise ValueError("Original teammate position is not reachable from the pot")
     pot_to_goal = min(

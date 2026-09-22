@@ -489,25 +489,24 @@ def linear_cka(left, right):
 
 
 def compute_cka_rows(rows):
-    """Compute CKA per checkpoint using all A/B states in this layout."""
+    """Compute per-checkpoint CKA over the fixed, pair-aligned state set."""
     grouped = defaultdict(list)
     for row in rows:
         grouped[(row["model"], row["num_envs"], row["seed"])].append(row)
 
     summaries = []
     for (model, num_envs, seed), group in grouped.items():
-        policy = np.stack([
-            row[f"_policy_rep_{variant}"]
-            for row in group for variant in ("a", "b")
-        ])
-        value = np.stack([
-            row[f"_value_rep_{variant}"]
-            for row in group for variant in ("a", "b")
-        ])
-        returns = np.asarray([
-            row[f"mc_return_{variant}"]
-            for row in group for variant in ("a", "b")
-        ])[:, None]
+        group = sorted(group, key=lambda row: row["pair_id"])
+        policy_a = np.stack([row["_policy_rep_a"] for row in group])
+        policy_b = np.stack([row["_policy_rep_b"] for row in group])
+        value_a = np.stack([row["_value_rep_a"] for row in group])
+        value_b = np.stack([row["_value_rep_b"] for row in group])
+        policy = np.concatenate((policy_a, policy_b), axis=0)
+        value = np.concatenate((value_a, value_b), axis=0)
+        returns = np.asarray(
+            [row["mc_return_a"] for row in group]
+            + [row["mc_return_b"] for row in group]
+        )[:, None]
         summaries.append({
             "model": model,
             "num_envs": num_envs,
@@ -516,6 +515,8 @@ def compute_cka_rows(rows):
             "states": len(policy),
             "policy_rep_dim": policy.shape[1],
             "value_rep_dim": value.shape[1],
+            "policy_a_b_linear_cka": linear_cka(policy_a, policy_b),
+            "value_a_b_linear_cka": linear_cka(value_a, value_b),
             "policy_value_linear_cka": linear_cka(policy, value),
             "policy_return_linear_cka": linear_cka(policy, returns),
             "value_return_linear_cka": linear_cka(value, returns),

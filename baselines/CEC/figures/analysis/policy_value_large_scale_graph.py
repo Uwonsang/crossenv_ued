@@ -193,9 +193,8 @@ def plot_cka(frame: pd.DataFrame, output_dir: Path) -> None:
     layouts = ordered_layouts(frame)
     series_names = ordered_series(frame)
     metrics = (
-        ("policy_value_linear_cka", "Policy–value"),
-        ("policy_return_linear_cka", "Policy–return"),
-        ("value_return_linear_cka", "Value–return"),
+        ("policy_a_b_linear_cka", "Policy A↔B"),
+        ("value_a_b_linear_cka", "Value A↔B"),
     )
     figure, axes = plt.subplots(
         1, len(series_names), figsize=(6.2 * len(series_names), 4.2), squeeze=False
@@ -221,7 +220,7 @@ def plot_cka(frame: pd.DataFrame, output_dir: Path) -> None:
         axis.set_title(series, fontweight="bold")
         axis.grid(axis="y", alpha=.25)
         axis.legend(frameon=False, fontsize=8)
-    figure.suptitle("Representation and return alignment", fontweight="bold")
+    figure.suptitle("Cross-environment representation alignment", fontweight="bold")
     figure.tight_layout()
     figure.savefig(output_dir / "representation_cka.png", dpi=300,
                    bbox_inches="tight")
@@ -307,6 +306,13 @@ def main() -> None:
     missing = sorted(required - set(frame.columns))
     if missing:
         parser.error("Missing metrics columns: " + ", ".join(missing))
+    required_cka = {"policy_a_b_linear_cka", "value_a_b_linear_cka"}
+    missing_cka = sorted(required_cka - set(cka_frame.columns))
+    if missing_cka:
+        parser.error(
+            "Missing CKA columns: " + ", ".join(missing_cka)
+            + ". Re-run policy_value_fixed_pairs_metrics.py with the saved pairs."
+        )
 
     plot_layout_distances(
         frame, output_dir, "cosine",

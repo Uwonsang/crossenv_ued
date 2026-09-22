@@ -158,9 +158,9 @@ def main() -> None:
 
     # Maps are columns (environment A/B), while model results are full-width
     # rows so a model is not visually associated with only one environment.
-    figure = plt.figure(figsize=(16.0, 8.5))
+    figure = plt.figure(figsize=(16.0, 7.4))
     grid = figure.add_gridspec(
-        3, 2, height_ratios=(3.0, .42, .42), hspace=.12, wspace=.10
+        3, 2, height_ratios=(3.0, .30, .30), hspace=.08, wspace=.10
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

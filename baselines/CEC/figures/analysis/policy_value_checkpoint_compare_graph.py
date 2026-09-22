@@ -39,30 +39,31 @@ MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 
 
 def crop_counter_circuit_padding(image: np.ndarray, record: dict) -> np.ndarray:
-    """Remove rows/columns made only of the padded grey wall tiles."""
+    """Crop rendered Counter Circuit rows/columns containing only grey walls."""
     if record.get("family") != "counter_circuit":
         return image
     layout = record["layout"]
     height, width = int(layout["height"]), int(layout["width"])
-    walls = {int(index) for index in layout["wall_idx"]}
-    content = set(range(height * width)) - walls
-    for key in (
-        "agent_idx", "goal_idx", "plate_pile_idx", "onion_pile_idx", "pot_idx",
-    ):
-        content.update(int(index) for index in layout[key])
-    if not content:
-        return image
-
-    # Randomized Counter Circuit layouts can have an outer row or column that
-    # consists entirely of wall tiles.  A fixed 5x8/8x5 crop therefore leaves
-    # grey strips.  Non-wall floor tiles and all semantic objects define the
-    # visible extent; object tiles are retained even though they are also walls.
-    content_rows = [index // width for index in content]
-    content_columns = [index % width for index in content]
-    top, bottom = min(content_rows), max(content_rows) + 1
-    left, right = min(content_columns), max(content_columns) + 1
     tile_height = image.shape[0] // height
     tile_width = image.shape[1] // width
+
+    # The 9x9 padding is rendered as solid light-grey wall tiles.  Detect it
+    # from the final pixels rather than inferring the footprint from wall_idx;
+    # this also handles rotations and randomized object placement correctly.
+    wall_color = image[-1, -1]
+    visible_tiles = np.zeros((height, width), dtype=bool)
+    for row in range(height):
+        for column in range(width):
+            tile = image[
+                row * tile_height:(row + 1) * tile_height,
+                column * tile_width:(column + 1) * tile_width,
+            ]
+            visible_tiles[row, column] = np.any(tile != wall_color)
+    visible_rows, visible_columns = np.nonzero(visible_tiles)
+    if len(visible_rows) == 0:
+        return image
+    top, bottom = int(visible_rows.min()), int(visible_rows.max()) + 1
+    left, right = int(visible_columns.min()), int(visible_columns.max()) + 1
     return image[
         top * tile_height:bottom * tile_height,
         left * tile_width:right * tile_width,
@@ -91,7 +92,7 @@ def draw_behavior(axis, variant: str, rows: dict[str, pd.Series]):
     axis.axis("off")
     return axis.text(
         .5, .5,
-        "   |   ".join(
+        ",  ".join(
             f"{MODEL_LABELS[model]}: {rows[model][f'argmax_{variant.lower()}']}"
             for model in MODEL_ORDER
         ),
@@ -221,10 +222,10 @@ def main() -> None:
 
     # Each map is followed by both models' behavior for that environment.  The
     # representation distances compare A with B, so they occupy a shared panel.
-    paper_size = (10.0, 5.694)
+    paper_size = (12.0, 6.4)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        3, 2, height_ratios=(3.0, .28, .72), hspace=.08, wspace=.10
+        3, 2, height_ratios=(3.2, .36, .92), hspace=.12, wspace=.12
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

@@ -979,7 +979,10 @@ def main():
             writer = csv.DictWriter(file, fieldnames=list(summary[0]))
             writer.writeheader()
             writer.writerows(summary)
-    draw_checkpoint_reports(rows, args.output_dir, state_images)
+    if not args.large_scale:
+        draw_checkpoint_reports(rows, args.output_dir, state_images)
+    else:
+        print("Skipping checkpoint PNG visualizations in large-scale mode")
     print(f"Saved concrete pairs and metrics to {args.output_dir}")
 
 

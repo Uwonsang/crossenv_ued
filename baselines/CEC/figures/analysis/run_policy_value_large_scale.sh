@@ -12,7 +12,6 @@ families=(
   coord_ring
   counter_circuit
   forced_coord
-  cramped_room
 )
 
 for family in "${families[@]}"; do

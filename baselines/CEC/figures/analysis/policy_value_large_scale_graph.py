@@ -14,6 +14,9 @@ import pandas as pd
 from policy_value_fixed_pairs_metrics import save_rsa_figures
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_GENERALIZATION_DIR = REPOSITORY_ROOT / "artifacts" / "generalization_gap"
+
 FAMILY_ORDER = (
     "asymm_advantages",
     "coord_ring",
@@ -28,10 +31,36 @@ FAMILY_LABELS = {
     "forced_coord": "Forced Coordination",
     "cramped_room": "Cramped Room",
 }
+FAMILY_ABBREVIATIONS = {
+    "asymm_advantages": "AA",
+    "counter_circuit": "CC",
+    "coord_ring": "CR",
+    "forced_coord": "FC",
+    "cramped_room": "CRoom",
+}
+PAPER_RC = {
+    "font.family": "DejaVu Sans",
+    "font.size": 24,
+    "axes.titlesize": 28,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 24,
+    "xtick.labelsize": 24,
+    "ytick.labelsize": 24,
+    "figure.titlesize": 28,
+    "legend.fontsize": 24,
+}
 MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 POLICY_COLOR = "#0072B2"
 VALUE_COLOR = "#D55E00"
+
+GENERALIZATION_LAYOUTS = {
+    "asymm_advantages_9": "asymm_advantages",
+    "coord_ring_9": "coord_ring",
+    "counter_circuit_9": "counter_circuit",
+    "forced_coord_9": "forced_coord",
+    "cramped_room_9": "cramped_room",
+}
 
 
 def load_metrics(input_dir: Path) -> pd.DataFrame:
@@ -81,6 +110,22 @@ def load_cka(input_dir: Path) -> pd.DataFrame:
         axis=1,
     )
     return frame
+
+
+def load_rsa(input_dir: Path) -> pd.DataFrame:
+    frames = []
+    for family_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
+        metrics = family_dir / "concrete_example_rsa.csv"
+        if not metrics.is_file():
+            continue
+        frame = pd.read_csv(metrics)
+        frame["layout"] = family_dir.name
+        frames.append(frame)
+    if not frames:
+        raise FileNotFoundError(
+            f"No layout-level concrete_example_rsa.csv files found under {input_dir}"
+        )
+    return pd.concat(frames, ignore_index=True)
 
 
 def plot_saved_rsa(input_dir: Path) -> int:
@@ -135,41 +180,97 @@ def plot_layout_distances(
     value_column: str,
     ylabel: str,
 ) -> None:
+    paper_version = suffix == "zscored_rms"
     layouts = ordered_layouts(frame)
+    if paper_version:
+        requested_order = (
+            "asymm_advantages", "counter_circuit", "coord_ring",
+            "forced_coord", "cramped_room",
+        )
+        present = set(layouts)
+        layouts = [layout for layout in requested_order if layout in present]
     series_names = ordered_series(frame)
-    figure, axes = plt.subplots(
-        1, len(series_names), figsize=(6.2 * len(series_names), 4.2), squeeze=False
+    rc = PAPER_RC if paper_version else {}
+    subplot_width, figure_height = (
+        (10.0, 5.694) if paper_version else (6.2, 4.2)
     )
-    x = np.arange(len(layouts))
-    width = .36
-    for axis, series in zip(axes[0], series_names):
-        policy_mean, policy_sem = mean_sem_by_seed(
-            frame, policy_column, layouts, series
+    with plt.rc_context(rc):
+        figure, axes = plt.subplots(
+            1, len(series_names),
+            figsize=(subplot_width * len(series_names), figure_height),
+            squeeze=False, sharey=paper_version,
         )
-        value_mean, value_sem = mean_sem_by_seed(frame, value_column, layouts, series)
-        axis.bar(
-            x - width / 2, policy_mean, width, yerr=policy_sem, capsize=3,
-            color=POLICY_COLOR, edgecolor="black", linewidth=.5, label="Policy",
+        x = np.arange(len(layouts))
+        width = .36
+        for axis_index, (axis, series) in enumerate(zip(axes[0], series_names)):
+            policy_mean, policy_sem = mean_sem_by_seed(
+                frame, policy_column, layouts, series
+            )
+            value_mean, value_sem = mean_sem_by_seed(
+                frame, value_column, layouts, series
+            )
+            axis.bar(
+                x - width / 2, policy_mean, width, yerr=policy_sem, capsize=3,
+                color=POLICY_COLOR, edgecolor="black", linewidth=.5,
+                label="Policy",
+            )
+            axis.bar(
+                x + width / 2, value_mean, width, yerr=value_sem, capsize=3,
+                color=VALUE_COLOR, edgecolor="black", linewidth=.5,
+                label="Value",
+            )
+            axis.set_xticks(x)
+            axis.set_xticklabels(
+                [
+                    (FAMILY_ABBREVIATIONS if paper_version else FAMILY_LABELS)
+                    .get(layout, layout)
+                    for layout in layouts
+                ],
+                rotation=0 if paper_version else 25,
+                ha="center" if paper_version else "right",
+            )
+            series_title = series.rsplit(" (", 1)[0] if paper_version else series
+            axis.set_title(
+                series_title, fontweight="bold",
+                fontsize=28 if paper_version else None,
+                pad=10 if paper_version else None,
+            )
+            axis.set_ylabel(
+                "Normalized distance"
+                if paper_version and axis_index == 0 else
+                ("" if paper_version else ylabel)
+            )
+            if paper_version:
+                axis.tick_params(axis="y", labelleft=True)
+            axis.grid(axis="y", alpha=.25)
+            if not paper_version:
+                axis.legend(frameon=False)
+        if paper_version:
+            handles, labels = axes[0, 0].get_legend_handles_labels()
+            figure.legend(
+                handles, labels, loc="upper center",
+                bbox_to_anchor=(.5, .99), ncol=2, frameon=False,
+            )
+        else:
+            figure.suptitle(
+                "Policy and value representation distance",
+                fontweight="bold", y=.99,
+            )
+        figure.tight_layout(
+            rect=(0, 0, 1, .86 if paper_version else .93), w_pad=2.0
         )
-        axis.bar(
-            x + width / 2, value_mean, width, yerr=value_sem, capsize=3,
-            color=VALUE_COLOR, edgecolor="black", linewidth=.5, label="Value",
+        extension = "pdf" if paper_version else "png"
+        save_kwargs = {
+            "bbox_inches": "tight",
+            "pad_inches": 0 if paper_version else .1,
+        }
+        if not paper_version:
+            save_kwargs["dpi"] = 300
+        figure.savefig(
+            output_dir / f"representation_distance_{suffix}.{extension}",
+            **save_kwargs,
         )
-        axis.set_xticks(x)
-        axis.set_xticklabels(
-            [FAMILY_LABELS.get(layout, layout) for layout in layouts],
-            rotation=25,
-            ha="right",
-        )
-        axis.set_title(series, fontweight="bold")
-        axis.set_ylabel(ylabel)
-        axis.grid(axis="y", alpha=.25)
-        axis.legend(frameon=False)
-    figure.suptitle("Policy and value representation distance", fontweight="bold")
-    figure.tight_layout()
-    figure.savefig(output_dir / f"representation_distance_{suffix}.png", dpi=300,
-                   bbox_inches="tight")
-    plt.close(figure)
+        plt.close(figure)
 
 
 def correlation(x: np.ndarray, y: np.ndarray) -> float:
@@ -187,6 +288,187 @@ def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
     x_rank = pd.Series(x[valid]).rank(method="average").to_numpy()
     y_rank = pd.Series(y[valid]).rank(method="average").to_numpy()
     return correlation(x_rank, y_rank)
+
+
+def resolve_generalization_csv(requested: Path | None) -> Path | None:
+    """Find the run-level results for the original five Overcooked layouts."""
+    if requested is not None:
+        requested = requested.expanduser()
+        if not requested.is_file():
+            raise FileNotFoundError(f"Generalization CSV does not exist: {requested}")
+        return requested
+    patterns = (
+        "generalization_gap_runs_final_window_*.csv",
+        "generalization_gap_runs_[0-9]*m.csv",  # legacy final-window name
+        "generalization_gap_runs_last_*.csv",
+    )
+    for pattern in patterns:
+        matches = sorted(DEFAULT_GENERALIZATION_DIR.glob(pattern))
+        if matches:
+            return matches[-1]
+    return None
+
+
+def aggregate_representation_statistics(frame: pd.DataFrame) -> pd.DataFrame:
+    """Reduce fixed-pair measurements to one row per checkpoint and layout."""
+    keys = ["model", "num_envs", "seed", "layout"]
+    result = frame.groupby(keys, as_index=False).agg(
+        pairs=("pair_id", "nunique"),
+        policy_environment_sensitivity=(
+            "policy_rep_zscored_rms_distance", "mean"
+        ),
+        value_environment_sensitivity=(
+            "value_rep_zscored_rms_distance", "mean"
+        ),
+    )
+    result["leakage_score"] = (
+        result["policy_environment_sensitivity"]
+        - result["value_environment_sensitivity"]
+    )
+    return result
+
+
+def aggregate_rsa_statistics(rsa_frame: pd.DataFrame) -> pd.DataFrame:
+    """Put cosine and z-scored-RMS RSA summaries on checkpoint rows."""
+    keys = ["model", "num_envs", "seed", "layout"]
+    metrics = [
+        "policy_behavior_rsa", "policy_return_rsa",
+        "value_behavior_rsa", "value_return_rsa",
+        "policy_behavior_minus_return", "value_return_minus_behavior",
+        "rsa_asymmetry_score",
+    ]
+    missing = sorted(set(keys + ["distance_metric", *metrics]) - set(rsa_frame))
+    if missing:
+        raise ValueError("Missing RSA columns: " + ", ".join(missing))
+    wide = rsa_frame.pivot_table(
+        index=keys, columns="distance_metric", values=metrics, aggfunc="mean"
+    )
+    wide.columns = [f"rsa_{distance}_{metric}" for metric, distance in wide.columns]
+    return wide.reset_index()
+
+
+def merge_generalization_results(
+    pair_frame: pd.DataFrame, rsa_frame: pd.DataFrame, generalization_csv: Path
+) -> pd.DataFrame:
+    """Join representation diagnostics to held-out results by run and layout."""
+    representation = aggregate_representation_statistics(pair_frame)
+    rsa = aggregate_rsa_statistics(rsa_frame)
+    keys = ["model", "num_envs", "seed", "layout"]
+    representation = representation.merge(rsa, on=keys, how="left", validate="one_to_one")
+
+    generalization = pd.read_csv(generalization_csv)
+    required = {
+        "model", "num_envs", "seed", "eval_layout", "eval_return_mean",
+        "generalization_gap", "relative_gap",
+    }
+    missing = sorted(required - set(generalization))
+    if missing:
+        raise ValueError("Missing generalization columns: " + ", ".join(missing))
+    generalization = generalization[
+        generalization["eval_layout"].isin(GENERALIZATION_LAYOUTS)
+    ].copy()
+    generalization["layout"] = generalization["eval_layout"].map(
+        GENERALIZATION_LAYOUTS
+    )
+    numeric = ["eval_return_mean", "generalization_gap", "relative_gap"]
+    generalization = generalization.groupby(keys, as_index=False).agg(
+        held_out_runs=("eval_return_mean", "size"),
+        **{column: (column, "mean") for column in numeric},
+    )
+    return representation.merge(
+        generalization, on=keys, how="inner", validate="one_to_one"
+    )
+
+
+def generalization_correlations(merged: pd.DataFrame) -> pd.DataFrame:
+    """Compute raw Spearman associations at useful, explicit scopes."""
+    metric_columns = [
+        "policy_environment_sensitivity", "value_environment_sensitivity",
+        "leakage_score",
+        *sorted(column for column in merged if column.startswith("rsa_")),
+    ]
+    targets = ["eval_return_mean", "generalization_gap", "relative_gap"]
+    grouping_specs = (
+        ("overall", []),
+        ("model", ["model"]),
+        ("model_layout", ["model", "layout"]),
+        ("model_num_envs", ["model", "num_envs"]),
+    )
+    rows = []
+    for scope, group_columns in grouping_specs:
+        grouped = [((), merged)] if not group_columns else merged.groupby(
+            group_columns, sort=False, dropna=False
+        )
+        for group_key, subset in grouped:
+            if group_columns and not isinstance(group_key, tuple):
+                group_key = (group_key,)
+            labels = dict(zip(group_columns, group_key)) if group_columns else {}
+            for metric in metric_columns:
+                for target in targets:
+                    valid = subset[[metric, target]].replace(
+                        [np.inf, -np.inf], np.nan
+                    ).dropna()
+                    rows.append({
+                        "scope": scope,
+                        "model": labels.get("model", "all"),
+                        "num_envs": labels.get("num_envs", "all"),
+                        "layout": labels.get("layout", "all"),
+                        "metric": metric,
+                        "target": target,
+                        "n": len(valid),
+                        "spearman_rho": spearman_correlation(
+                            valid[metric].to_numpy(dtype=float),
+                            valid[target].to_numpy(dtype=float),
+                        ),
+                    })
+    return pd.DataFrame(rows)
+
+
+def plot_generalization_relationship(
+    merged: pd.DataFrame, metric: str, metric_label: str, output: Path
+) -> None:
+    """Plot checkpoint/layout diagnostics against held-out performance."""
+    models = [model for model in ("CEC", "CEC_IDAAC") if model in set(merged["model"])]
+    if not models or metric not in merged:
+        return
+    targets = (
+        ("eval_return_mean", "Held-out return"),
+        ("generalization_gap", "Generalization gap"),
+    )
+    figure, axes = plt.subplots(
+        len(targets), len(models), figsize=(6.0 * len(models), 8.2),
+        squeeze=False, sharex="col",
+    )
+    for column, model in enumerate(models):
+        subset = merged[merged["model"] == model]
+        for row, (target, target_label) in enumerate(targets):
+            axis = axes[row, column]
+            valid = subset[[metric, target, "layout"]].dropna()
+            for layout, points in valid.groupby("layout", sort=False):
+                axis.scatter(
+                    points[metric], points[target], s=42, alpha=.72,
+                    label=FAMILY_ABBREVIATIONS.get(layout, layout),
+                )
+            if len(valid) >= 2 and valid[metric].nunique() > 1:
+                slope, intercept = np.polyfit(valid[metric], valid[target], 1)
+                x_line = np.linspace(valid[metric].min(), valid[metric].max(), 100)
+                axis.plot(x_line, slope * x_line + intercept, color="black", linewidth=1)
+            rho = spearman_correlation(
+                valid[metric].to_numpy(dtype=float),
+                valid[target].to_numpy(dtype=float),
+            )
+            axis.text(.03, .97, f"Spearman $\\rho$={rho:.2f}\nn={len(valid)}",
+                      transform=axis.transAxes, ha="left", va="top")
+            axis.set_title(MODEL_LABELS.get(model, model), fontweight="bold")
+            axis.set_ylabel(target_label)
+            axis.grid(alpha=.25)
+            if row == len(targets) - 1:
+                axis.set_xlabel(metric_label)
+            if row == 0 and column == len(models) - 1:
+                axis.legend(frameon=False, title="Layout", ncol=2, fontsize=9)
+    figure.tight_layout()
+    figure.savefig(output, bbox_inches="tight")
+    plt.close(figure)
 
 
 def retain_common_pairs(frame: pd.DataFrame) -> pd.DataFrame:
@@ -505,6 +787,13 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
+        "--generalization-csv", type=Path,
+        help=(
+            "Run-level generalization_gap CSV for the original five Overcooked "
+            "layouts. If omitted, discover it under artifacts/generalization_gap."
+        ),
+    )
+    parser.add_argument(
         "--bootstrap-samples", type=int, default=10000,
         help="Seed-bootstrap samples for 95%% correlation confidence intervals",
     )
@@ -583,9 +872,60 @@ def main() -> None:
     plot_cka(cka_frame, output_dir)
     plot_filter_rates(frame, output_dir)
     try:
+        rsa_frame = load_rsa(input_dir)
         rsa_layout_count = plot_saved_rsa(input_dir)
     except FileNotFoundError as error:
         parser.error(str(error))
+
+    try:
+        generalization_csv = resolve_generalization_csv(args.generalization_csv)
+    except FileNotFoundError as error:
+        parser.error(str(error))
+    if generalization_csv is None:
+        print(
+            "No generalization-gap CSV found; skipping held-out prediction analysis. "
+            "Pass --generalization-csv to enable it."
+        )
+    else:
+        try:
+            merged = merge_generalization_results(
+                common_pair_frame, rsa_frame, generalization_csv
+            )
+        except ValueError as error:
+            parser.error(str(error))
+        if merged.empty:
+            parser.error(
+                "No rows matched between fixed-pair metrics and held-out results "
+                "on model / num_envs / seed / layout."
+            )
+        correlations = generalization_correlations(merged)
+        merged.to_csv(
+            output_dir / "representation_generalization_merged.csv", index=False
+        )
+        correlations.to_csv(
+            output_dir / "representation_generalization_correlations.csv", index=False
+        )
+        plot_generalization_relationship(
+            merged, "leakage_score", r"Leakage score $d_\pi-d_V$",
+            output_dir / "leakage_vs_generalization.pdf",
+        )
+        for distance in ("cosine", "zscored_rms"):
+            metric = f"rsa_{distance}_rsa_asymmetry_score"
+            plot_generalization_relationship(
+                merged, metric, f"RSA asymmetry ({distance.replace('_', ' ')})",
+                output_dir / f"rsa_asymmetry_{distance}_vs_generalization.pdf",
+            )
+        represented_layouts = set(merged["layout"])
+        missing_layouts = set(GENERALIZATION_LAYOUTS.values()) - represented_layouts
+        print(
+            f"Matched {len(merged)} representation/held-out rows from "
+            f"{generalization_csv}"
+        )
+        if missing_layouts:
+            print(
+                "No matched representation rows for: "
+                + ", ".join(sorted(missing_layouts))
+            )
     print(f"Loaded {len(frame)} evaluations from {input_dir}")
     print(f"Regenerated RSA figures for {rsa_layout_count} layouts")
     print(f"Saved large-scale PNG figures to {output_dir}")

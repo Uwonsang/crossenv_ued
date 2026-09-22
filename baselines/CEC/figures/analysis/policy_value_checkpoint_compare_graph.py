@@ -16,6 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.offsetbox import AnchoredOffsetbox, HPacker, TextArea
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
@@ -85,6 +86,52 @@ def crop_counter_circuit_view(image: np.ndarray, record: dict) -> np.ndarray:
     ]
 
 
+def trim_pair_to_common_content(
+    images: list[np.ndarray], records: list[dict]
+) -> list[np.ndarray]:
+    """Apply one shared crop and equal horizontal padding to both maps."""
+    if len(images) != 2 or not all(
+        record.get("family") == "counter_circuit" for record in records
+    ):
+        return images
+    if images[0].shape != images[1].shape:
+        return images
+
+    bounds = []
+    wall_colors = []
+    for image in images:
+        wall_color = image[-1, -1]
+        wall_colors.append(wall_color)
+        content = np.any(image != wall_color, axis=-1)
+        rows, columns = np.nonzero(content)
+        if len(rows) == 0:
+            return images
+        bounds.append((
+            int(rows.min()), int(rows.max()) + 1,
+            int(columns.min()), int(columns.max()) + 1,
+        ))
+    top = min(bound[0] for bound in bounds)
+    bottom = max(bound[1] for bound in bounds)
+    left = min(bound[2] for bound in bounds)
+    right = max(bound[3] for bound in bounds)
+    horizontal_padding = 8
+    padded = []
+    for image, wall_color in zip(images, wall_colors):
+        cropped = image[top:bottom, left:right]
+        canvas = np.empty(
+            (
+                cropped.shape[0],
+                cropped.shape[1] + 2 * horizontal_padding,
+                cropped.shape[2],
+            ),
+            dtype=cropped.dtype,
+        )
+        canvas[...] = wall_color
+        canvas[:, horizontal_padding:-horizontal_padding] = cropped
+        padded.append(canvas)
+    return padded
+
+
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
     """Rebuild the state and render JaxMARL's centered 7x7 map view."""
     from jaxmarl.viz.overcooked_jitted_visualizer import render_state as render_map
@@ -105,24 +152,36 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
 
 
 def draw_behavior(axis, variant: str, rows: dict[str, pd.Series]):
-    """Show both models' decisions directly below one environment."""
+    """Show both models' decisions on one centered horizontal line."""
     axis.axis("off")
     axis.set_xlim(0, 1)
     axis.set_ylim(0, 1)
-    artists = []
-    for y, model in zip((.68, .22), MODEL_ORDER):
-        label = MODEL_LABELS[model]
-        action = rows[model][f"argmax_{variant.lower()}"]
-        artists.append(axis.text(
-            .48, y, f"{label}:",
-            ha="right", va="center", fontweight="bold",
-            color=MODEL_COLORS[model],
+    action_column = f"argmax_{variant.lower()}"
+    parts = []
+    for index, model in enumerate(MODEL_ORDER):
+        if index:
+            parts.append(TextArea(",  ", textprops={"fontsize": 16}))
+        parts.append(TextArea(
+            f"{MODEL_LABELS[model]}:",
+            textprops={
+                "fontsize": 16,
+                "fontweight": "bold",
+                "color": MODEL_COLORS[model],
+                "fontfamily": "DejaVu Sans",
+            },
         ))
-        artists.append(axis.text(
-            .50, y, str(action),
-            ha="left", va="center", color="black",
+        parts.append(TextArea(
+            f" {rows[model][action_column]}",
+            textprops={"fontsize": 16, "fontfamily": "DejaVu Sans"},
         ))
-    return artists
+    packed = HPacker(children=parts, align="center", pad=0, sep=0)
+    artist = AnchoredOffsetbox(
+        loc="center", child=packed, frameon=False,
+        bbox_to_anchor=(.5, .5), bbox_transform=axis.transAxes,
+        borderpad=0,
+    )
+    axis.add_artist(artist)
+    return [artist]
 
 
 def fit_summary_width(figure, artists, base_size=(10.0, 5.694)) -> None:
@@ -198,15 +257,16 @@ def main() -> None:
         parser.error(f"Expected two states, found {len(states)}")
     config = load_config(args.config)
     state_images = [render_state(config, state, args.horizon) for state in states]
+    state_images = trim_pair_to_common_content(state_images, states)
 
     # Each map is followed by two model-colored behavior lines.
     # Match the canvas width to the cropped map aspect ratios to avoid the
     # internal whitespace that imshow adds while preserving pixel geometry.
     aspect_sum = sum(image.shape[1] / image.shape[0] for image in state_images)
-    paper_size = (max(7.5, 3.15 * aspect_sum + .2), 4.4)
+    paper_size = (max(7.5, 3.15 * aspect_sum + .2), 3.8)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(3.2, .65), hspace=.03, wspace=.02
+        2, 2, height_ratios=(3.2, .30), hspace=.01, wspace=.04
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

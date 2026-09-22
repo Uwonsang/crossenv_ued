@@ -38,45 +38,14 @@ MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 
 
-def crop_counter_circuit_padding(image: np.ndarray, record: dict) -> np.ndarray:
-    """Crop rendered Counter Circuit rows/columns containing only grey walls."""
-    if record.get("family") != "counter_circuit":
-        return image
-    layout = record["layout"]
-    height, width = int(layout["height"]), int(layout["width"])
-    tile_height = image.shape[0] // height
-    tile_width = image.shape[1] // width
-
-    # The 9x9 padding is rendered as solid light-grey wall tiles.  Detect it
-    # from the final pixels rather than inferring the footprint from wall_idx;
-    # this also handles rotations and randomized object placement correctly.
-    wall_color = image[-1, -1]
-    visible_tiles = np.zeros((height, width), dtype=bool)
-    for row in range(height):
-        for column in range(width):
-            tile = image[
-                row * tile_height:(row + 1) * tile_height,
-                column * tile_width:(column + 1) * tile_width,
-            ]
-            visible_tiles[row, column] = np.any(tile != wall_color)
-    visible_rows, visible_columns = np.nonzero(visible_tiles)
-    if len(visible_rows) == 0:
-        return image
-    top, bottom = int(visible_rows.min()), int(visible_rows.max()) + 1
-    left, right = int(visible_columns.min()), int(visible_columns.max()) + 1
-    return image[
-        top * tile_height:bottom * tile_height,
-        left * tile_width:right * tile_width,
-    ]
-
-
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
-    """Rebuild the controlled state and render it with JaxMARL's renderer."""
-    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
+    """Rebuild the state and render JaxMARL's centered 7x7 map view."""
+    from jaxmarl.viz.overcooked_jitted_visualizer import render_state as render_map
 
     _, state, _ = instantiate(config, record, horizon)
-    image = np.asarray(render_fn(state))
-    return crop_counter_circuit_padding(image, record)
+    return np.asarray(render_map(
+        state, highlight=False, agent_view_size=6,
+    ))
 
 
 def draw_state(axis, record: dict, image: np.ndarray) -> None:

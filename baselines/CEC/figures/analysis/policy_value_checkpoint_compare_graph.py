@@ -35,7 +35,7 @@ from policy_value_concrete_example import ROOT, instantiate, load_config
 
 MODEL_ORDER = ("CEC", "CEC_IDAAC")
 MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
-MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
+MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#56B4E9"}
 
 
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
@@ -59,34 +59,20 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
 def draw_behavior(axis, variant: str, rows: dict[str, pd.Series]):
     """Show both models' decisions directly below one environment."""
     axis.axis("off")
-    return axis.text(
-        .5, .5,
-        ",  ".join(
-            f"{MODEL_LABELS[model]}: {rows[model][f'argmax_{variant.lower()}']}"
-            for model in MODEL_ORDER
-        ),
-        ha="center", va="center",
-    )
-
-
-def draw_representation_summary(axis, rows: dict[str, pd.Series]):
-    """Place representation distances in a separate full-width panel."""
-    axis.axis("off")
     axis.set_xlim(0, 1)
     axis.set_ylim(0, 1)
-    axis.text(
-        .5, .82, "Representation distance",
-        ha="center", va="center", fontweight="bold",
-    )
     artists = []
-    for y, model in zip((.49, .18), MODEL_ORDER):
-        row = rows[model]
+    for y, model in zip((.68, .22), MODEL_ORDER):
+        label = MODEL_LABELS[model]
+        action = rows[model][f"argmax_{variant.lower()}"]
         artists.append(axis.text(
-            .5, y,
-            rf"{MODEL_LABELS[model]}: $d_\pi$ = "
-            f"{row['policy_rep_zscored_rms_distance']:.3f},   "
-            rf"$d_V$ = {row['value_rep_zscored_rms_distance']:.3f}",
-            ha="center", va="center",
+            .48, y, f"{label}:",
+            ha="right", va="center", fontweight="bold",
+            color=MODEL_COLORS[model],
+        ))
+        artists.append(axis.text(
+            .50, y, str(action),
+            ha="left", va="center", color="black",
         ))
     return artists
 
@@ -141,29 +127,6 @@ def load_metrics(
     return rows
 
 
-def ensure_zscored_rms(rows: dict[str, pd.Series], config: dict) -> None:
-    """Support older CSVs that contain z-scored L2 but not RMS distance."""
-    default_dims = {
-        "policy": int(config["GRU_HIDDEN_DIM"]) // 4,
-        "value": int(config["FC_DIM_SIZE"]) // 2,
-    }
-    for row in rows.values():
-        for prefix in ("policy", "value"):
-            rms_column = f"{prefix}_rep_zscored_rms_distance"
-            if rms_column in row.index and pd.notna(row[rms_column]):
-                continue
-            dim_column = f"{prefix}_rep_dim"
-            dimension = (
-                int(row[dim_column])
-                if dim_column in row.index and pd.notna(row[dim_column])
-                else default_dims[prefix]
-            )
-            row[rms_column] = (
-                row[f"{prefix}_rep_zscored_euclidean_distance"]
-                / np.sqrt(dimension)
-            )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-dir", type=Path, required=True)
@@ -186,24 +149,22 @@ def main() -> None:
     if len(states) != 2:
         parser.error(f"Expected two states, found {len(states)}")
     config = load_config(args.config)
-    ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    # Each map is followed by both models' behavior for that environment.  The
-    # representation distances compare A with B, so they occupy a shared panel.
-    paper_size = (12.0, 6.4)
+    # Each map is followed by two model-colored behavior lines.
+    paper_size = (12.0, 5.3)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        3, 2, height_ratios=(3.2, .36, .92), hspace=.12, wspace=.12
+        2, 2, height_ratios=(3.2, .65), hspace=.08, wspace=.12
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
-    summary_artists = [
-        draw_behavior(figure.add_subplot(grid[1, 0]), "A", rows),
-        draw_behavior(figure.add_subplot(grid[1, 1]), "B", rows),
-    ]
-    summary_artists.extend(draw_representation_summary(
-        figure.add_subplot(grid[2, :]), rows
+    summary_artists = []
+    summary_artists.extend(draw_behavior(
+        figure.add_subplot(grid[1, 0]), "A", rows
+    ))
+    summary_artists.extend(draw_behavior(
+        figure.add_subplot(grid[1, 1]), "B", rows
     ))
 
     figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)

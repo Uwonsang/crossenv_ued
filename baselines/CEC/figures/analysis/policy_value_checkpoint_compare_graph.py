@@ -38,14 +38,44 @@ MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#56B4E9"}
 
 
+def crop_counter_circuit_footprint(image: np.ndarray, record: dict) -> np.ndarray:
+    """Crop the padded 9x9 render to its complete 5x8/8x5 footprint."""
+    if record.get("family") != "counter_circuit":
+        return image
+    layout = record["layout"]
+    height, width = int(layout["height"]), int(layout["width"])
+    walls = {int(index) for index in layout["wall_idx"]}
+    content = set(range(height * width)) - walls
+    for key in (
+        "agent_idx", "goal_idx", "plate_pile_idx", "onion_pile_idx", "pot_idx",
+    ):
+        content.update(int(index) for index in layout[key])
+
+    # make_counter_circuit_9x9 inserts the rotated footprint at the upper-left.
+    # Floor/object extent identifies whether the 5x8 source was rotated by 90°.
+    max_row = max(index // width for index in content)
+    max_column = max(index % width for index in content)
+    crop_height, crop_width = (8, 5) if max_row >= 5 and max_column < 5 else (5, 8)
+    if any(
+        index // width >= crop_height or index % width >= crop_width
+        for index in content
+    ):
+        return image
+    tile_height = image.shape[0] // height
+    tile_width = image.shape[1] // width
+    return image[:crop_height * tile_height, :crop_width * tile_width]
+
+
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
-    """Rebuild the state and render JaxMARL's centered 7x7 map view."""
+    """Rebuild the state and render its complete layout footprint."""
     from jaxmarl.viz.overcooked_jitted_visualizer import render_state as render_map
 
     _, state, _ = instantiate(config, record, horizon)
-    return np.asarray(render_map(
-        state, highlight=False, agent_view_size=6,
+    agent_view_size = 5 if record.get("family") == "counter_circuit" else 6
+    image = np.asarray(render_map(
+        state, highlight=False, agent_view_size=agent_view_size,
     ))
+    return crop_counter_circuit_footprint(image, record)
 
 
 def draw_state(axis, record: dict, image: np.ndarray) -> None:

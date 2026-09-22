@@ -32,7 +32,7 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
     axis.imshow(image)
     axis.axis("off")
     axis.set_title(
-        f"Environment {record['variant']}\nRoute cost = {record['route_cost']}",
+        f"Environment {record['variant']}",
         fontsize=13, fontweight="bold",
     )
 
@@ -45,15 +45,10 @@ def metric_text(row: pd.Series) -> str:
     return (
         f"Behavior:  A: {action_a} ({probability_a:.3f})   |   "
         f"B: {action_b} ({probability_b:.3f})\n"
-        f"Predicted value:  A: {row['predicted_value_a']:.2f}   |   "
-        f"B: {row['predicted_value_b']:.2f}   |   "
-        f"ΔV(A−B): {row['predicted_value_delta_a_minus_b']:.2f}\n"
-        f"MC return:  A: {row['mc_return_a']:.2f}   |   "
-        f"B: {row['mc_return_b']:.2f}   |   "
-        f"ΔG(A−B): {row['mc_return_delta_a_minus_b']:.2f} "
-        f"± {row['mc_return_delta_sem']:.2f}\n"
-        f"Cosine distance:  policy: {row['policy_rep_cosine_distance']:.4f}   |   "
-        f"value: {row['value_rep_cosine_distance']:.4f}\n"
+        rf"$\hat{{V}}_1(s_0^A)={row['predicted_value_a']:.2f}$"
+        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$"
+        rf"   |   $\Delta\hat{{V}}_1(A-B)="
+        rf"{row['predicted_value_delta_a_minus_b']:.2f}$\n"
         f"Z-scored RMS:  policy: "
         f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
         f"value: {row['value_rep_zscored_rms_distance']:.3f}"
@@ -160,9 +155,9 @@ def main() -> None:
     ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    figure = plt.figure(figsize=(16, 10.0))
+    figure = plt.figure(figsize=(16, 9.0))
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(2.4, .85), hspace=.18, wspace=.12
+        2, 2, height_ratios=(3.0, .62), hspace=.12, wspace=.12
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

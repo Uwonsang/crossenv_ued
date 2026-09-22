@@ -33,12 +33,43 @@ MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 
 
+def crop_counter_circuit_padding(image: np.ndarray, record: dict) -> np.ndarray:
+    """Remove the 9x9 padding while preserving the map's actual orientation."""
+    if record.get("family") != "counter_circuit":
+        return image
+    layout = record["layout"]
+    height, width = int(layout["height"]), int(layout["width"])
+    walls = {int(index) for index in layout["wall_idx"]}
+    content = set(range(height * width)) - walls
+    for key in (
+        "agent_idx", "goal_idx", "plate_pile_idx", "onion_pile_idx", "pot_idx",
+    ):
+        content.update(int(index) for index in layout[key])
+    if not content:
+        return image
+
+    # The generated Counter Circuit footprint is 5x8, or 8x5 after rotation,
+    # and make_9x9_layout places it at the upper-left of the 9x9 canvas.
+    candidates = ((5, 8), (8, 5))
+    crop_height, crop_width = min(
+        candidates,
+        key=lambda shape: sum(
+            index // width >= shape[0] or index % width >= shape[1]
+            for index in content
+        ),
+    )
+    tile_height = image.shape[0] // height
+    tile_width = image.shape[1] // width
+    return image[:crop_height * tile_height, :crop_width * tile_width]
+
+
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
     """Rebuild the controlled state and render it with JaxMARL's renderer."""
     from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
 
     _, state, _ = instantiate(config, record, horizon)
-    return np.asarray(render_fn(state))
+    image = np.asarray(render_fn(state))
+    return crop_counter_circuit_padding(image, record)
 
 
 def draw_state(axis, record: dict, image: np.ndarray) -> None:
@@ -54,15 +85,15 @@ def metric_text(row: pd.Series) -> str:
     action_b = str(row["argmax_b"])
     return (
         f"A: {action_a}   |   B: {action_b}"
-        rf"   |   Z-RMS: $h_\pi$="
+        rf"   |   Rep. distance: $d_\pi$ = "
         f"{row['policy_rep_zscored_rms_distance']:.3f},  "
-        rf"$h_V$={row['value_rep_zscored_rms_distance']:.3f}"
+        rf"$d_V$ = {row['value_rep_zscored_rms_distance']:.3f}"
     )
 
 
-def draw_summary(axis, row: pd.Series, model: str) -> None:
+def draw_summary(axis, row: pd.Series, model: str):
     axis.axis("off")
-    axis.text(
+    return axis.text(
         .5, .5, f"{MODEL_LABELS[model]}   |   {metric_text(row)}",
         ha="center", va="center",
         bbox=dict(
@@ -71,6 +102,21 @@ def draw_summary(axis, row: pd.Series, model: str) -> None:
             edgecolor=MODEL_COLORS[model], linewidth=1.6,
         ),
     )
+
+
+def fit_summary_width(figure, artists, base_size=(10.0, 5.694)) -> None:
+    """Grow the paper figure only when a one-line summary would be clipped."""
+    figure.canvas.draw()
+    renderer = figure.canvas.get_renderer()
+    widest = max(
+        artist.get_bbox_patch().get_window_extent(renderer).width
+        for artist in artists
+    )
+    available = figure.bbox.width * .94
+    if widest <= available:
+        return
+    scale = 1.03 * widest / available
+    figure.set_size_inches(base_size[0] * scale, base_size[1] * scale)
 
 
 def load_pair(analysis_dir: Path, pair_id: int) -> list[dict]:
@@ -158,16 +204,21 @@ def main() -> None:
 
     # Maps are columns (environment A/B), while model results are full-width
     # rows so a model is not visually associated with only one environment.
-    figure = plt.figure(figsize=(16.0, 7.4))
+    paper_size = (10.0, 5.694)
+    figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
         3, 2, height_ratios=(3.0, .30, .30), hspace=.08, wspace=.10
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
+    summary_artists = []
     for row_index, model in enumerate(MODEL_ORDER, start=1):
-        draw_summary(figure.add_subplot(grid[row_index, :]), rows[model], model)
+        summary_artists.append(draw_summary(
+            figure.add_subplot(grid[row_index, :]), rows[model], model
+        ))
 
     figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
+    fit_summary_width(figure, summary_artists, paper_size)
     output = args.output or (
         args.analysis_dir / "comparison_figures" /
         f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_paper.pdf"

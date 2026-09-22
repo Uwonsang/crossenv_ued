@@ -9,69 +9,28 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle, Rectangle
 import numpy as np
 import pandas as pd
+
+from policy_value_concrete_example import ROOT, instantiate, load_config
 
 
 ACTIONS = ("North", "South", "East", "West", "Stay", "Interact")
 MODEL_ORDER = ("CEC", "CEC_IDAAC")
 MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
-ENV_COLORS = {"A": "#56B4E9", "B": "#0072B2"}
 
 
-def positions(layout: dict, key: str) -> set[tuple[int, int]]:
-    width = int(layout["width"])
-    return {(int(index) % width, int(index) // width) for index in layout[key]}
+def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
+    """Rebuild the controlled state and render it with JaxMARL's renderer."""
+    from jaxmarl.viz.overcooked_jitted_visualizer import render_fn
+
+    _, state, _ = instantiate(config, record, horizon)
+    return np.asarray(render_fn(state))
 
 
-def draw_state(axis, record: dict) -> None:
-    layout = record["layout"]
-    width, height = int(layout["width"]), int(layout["height"])
-    walls = positions(layout, "wall_idx")
-    for y in range(height):
-        for x in range(width):
-            axis.add_patch(Rectangle(
-                (x, y), 1, 1,
-                facecolor="#707070" if (x, y) in walls else "#f7f7f7",
-                edgecolor="#4a4a4a", linewidth=.45,
-            ))
-    for key, color, label in (
-        ("goal_idx", "#20df36", "Serve"),
-        ("onion_pile_idx", "#ffe600", "Onion"),
-        ("plate_pile_idx", "white", "Plate"),
-        ("pot_idx", "#1b1b1b", "Pot\n2/3"),
-    ):
-        for x, y in positions(layout, key):
-            axis.add_patch(Rectangle(
-                (x + .08, y + .08), .84, .84, facecolor=color,
-                edgecolor="black", linewidth=.6,
-            ))
-            axis.text(
-                x + .5, y + .5, label, ha="center", va="center", fontsize=7,
-                color="white" if key == "pot_idx" else "black",
-            )
-    for position, color, label in (
-        (record["ego"], "#d62728", "Ego\nOnion"),
-        (record["teammate"], "#2455d6", "Mate"),
-    ):
-        x, y = position
-        axis.add_patch(Circle(
-            (x + .5, y + .5), .35, facecolor=color,
-            edgecolor="black", linewidth=.8, zorder=5,
-        ))
-        axis.text(
-            x + .5, y + .5, label, ha="center", va="center", fontsize=7,
-            color="white", fontweight="bold", zorder=6,
-        )
-    ego_x, ego_y = record["ego"]
-    pot_x, pot_y = record["pot"]
-    axis.annotate(
-        "", xy=(pot_x + .5, pot_y + .5), xytext=(ego_x + .5, ego_y + .5),
-        arrowprops=dict(arrowstyle="->", color="#d62728", lw=2),
-    )
-    axis.set(xlim=(0, width), ylim=(height, 0), aspect="equal")
+def draw_state(axis, record: dict, image: np.ndarray) -> None:
+    axis.imshow(image)
     axis.axis("off")
     axis.set_title(
         f"Environment {record['variant']} · map seed {record['map_seed']}\n"
@@ -80,45 +39,44 @@ def draw_state(axis, record: dict) -> None:
     )
 
 
-def draw_policy(axis, row: pd.Series, model: str) -> None:
-    x = np.arange(len(ACTIONS))
-    width = .38
-    for offset, variant in ((-.5, "a"), (.5, "b")):
-        probabilities = [row[f"prob_{action.lower()}_{variant}"] for action in ACTIONS]
-        axis.bar(
-            x + offset * width, probabilities, width,
-            color=ENV_COLORS[variant.upper()], label=f"Environment {variant.upper()}",
-            edgecolor="black", linewidth=.4,
-        )
-    axis.set_xticks(x)
-    axis.set_xticklabels(ACTIONS, rotation=30, ha="right")
-    axis.set_ylim(0, 1.05)
-    axis.set_ylabel("Action probability")
-    axis.set_title(f"{MODEL_LABELS[model]} policy", fontweight="bold",
-                   color=MODEL_COLORS[model])
-    axis.grid(axis="y", alpha=.25)
-    axis.legend(frameon=False, fontsize=8)
-
-
-def draw_value(axis, row: pd.Series, model: str) -> None:
-    x = np.arange(2)
-    width = .38
-    axis.bar(
-        x - width / 2, [row["predicted_value_a"], row["predicted_value_b"]],
-        width, label="Predicted value", color="#E69F00",
-        edgecolor="black", linewidth=.4,
+def draw_numeric_table(axis, row: pd.Series, model: str) -> None:
+    axis.axis("off")
+    column_labels = ["Env", "N", "S", "E", "W", "Stay", "Interact", "V", "MC"]
+    cell_text = []
+    for variant in ("a", "b"):
+        values = [row[f"prob_{action.lower()}_{variant}"] for action in ACTIONS]
+        values.extend((row[f"predicted_value_{variant}"], row[f"mc_return_{variant}"]))
+        cell_text.append([
+            variant.upper(),
+            *(f"{value:.3f}" for value in values[:6]),
+            f"{values[6]:.2f}",
+            f"{values[7]:.2f}",
+        ])
+    table = axis.table(
+        cellText=cell_text,
+        colLabels=column_labels,
+        cellLoc="center", loc="center",
     )
-    axis.bar(
-        x + width / 2, [row["mc_return_a"], row["mc_return_b"]],
-        width, label="MC return", color="#117733",
-        edgecolor="black", linewidth=.4,
+    table.auto_set_font_size(False)
+    table.set_fontsize(9.5)
+    table.scale(1, 1.75)
+    for column in range(len(column_labels)):
+        table[(0, column)].set_facecolor("#E8E8E8")
+        table[(0, column)].set_text_props(fontweight="bold")
+    for row_index, variant in enumerate(("a", "b"), start=1):
+        probabilities = np.asarray([
+            row[f"prob_{action.lower()}_{variant}"] for action in ACTIONS
+        ])
+        best_column = 1 + int(probabilities.argmax())
+        table[(row_index, best_column)].set_facecolor("#FFF2A8")
+        table[(row_index, best_column)].set_text_props(fontweight="bold")
+        table[(row_index, 0)].set_text_props(fontweight="bold")
+        table[(row_index, 7)].set_facecolor("#FDE8B0")
+        table[(row_index, 8)].set_facecolor("#DDF1E2")
+    axis.set_title(
+        f"{MODEL_LABELS[model]}: action probabilities and values",
+        fontweight="bold", color=MODEL_COLORS[model], pad=12,
     )
-    axis.set_xticks(x)
-    axis.set_xticklabels(("Environment A", "Environment B"))
-    axis.set_title(f"{MODEL_LABELS[model]} value", fontweight="bold",
-                   color=MODEL_COLORS[model])
-    axis.grid(axis="y", alpha=.25)
-    axis.legend(frameon=False, fontsize=8)
 
 
 def metric_text(row: pd.Series) -> str:
@@ -196,6 +154,11 @@ def main() -> None:
     parser.add_argument("--pair-id", type=int, required=True)
     parser.add_argument("--num-envs", type=int, default=64)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--horizon", type=int, default=200)
+    parser.add_argument(
+        "--config", type=Path,
+        default=ROOT / "baselines/CEC_UED/config/ippo_overcooked_CEC_gradient.yaml",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
 
@@ -206,18 +169,18 @@ def main() -> None:
         parser.error(str(error))
     if len(states) != 2:
         parser.error(f"Expected two states, found {len(states)}")
+    config = load_config(args.config)
+    state_images = [render_state(config, state, args.horizon) for state in states]
 
-    figure = plt.figure(figsize=(19, 10.5))
+    figure = plt.figure(figsize=(17, 9.2))
     grid = figure.add_gridspec(
-        3, 4, height_ratios=(1.55, 1.0, .72), hspace=.42, wspace=.32
+        3, 2, height_ratios=(1.65, .65, .72), hspace=.34, wspace=.18
     )
-    draw_state(figure.add_subplot(grid[0, 0:2]), states[0])
-    draw_state(figure.add_subplot(grid[0, 2:4]), states[1])
+    draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
+    draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
     for column, model in enumerate(MODEL_ORDER):
-        offset = column * 2
-        draw_policy(figure.add_subplot(grid[1, offset]), rows[model], model)
-        draw_value(figure.add_subplot(grid[1, offset + 1]), rows[model], model)
-        draw_summary(figure.add_subplot(grid[2, offset:offset + 2]), rows[model], model)
+        draw_numeric_table(figure.add_subplot(grid[1, column]), rows[model], model)
+        draw_summary(figure.add_subplot(grid[2, column]), rows[model], model)
 
     family = states[0].get("family", "unknown").replace("_", " ").title()
     figure.suptitle(

@@ -47,16 +47,16 @@ def metric_text(row: pd.Series) -> str:
     action_b = str(row["argmax_b"])
     probability_a = row[f"prob_{action_a.lower()}_a"]
     probability_b = row[f"prob_{action_b.lower()}_b"]
-    return (
+    lines = (
         f"Behavior:  A: {action_a} ({probability_a:.3f})   |   "
-        f"B: {action_b} ({probability_b:.3f})\n"
+        f"B: {action_b} ({probability_b:.3f})",
         rf"$\hat{{V}}_1(s_0^A)={row['predicted_value_a']:.2f}$"
-        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$"
-        "\n"
+        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$",
         f"Z-scored RMS:  policy: "
         f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
-        f"value: {row['value_rep_zscored_rms_distance']:.3f}"
+        f"value: {row['value_rep_zscored_rms_distance']:.3f}",
     )
+    return "\n".join(lines)
 
 
 def draw_summary(axis, row: pd.Series, model: str) -> None:
@@ -66,7 +66,7 @@ def draw_summary(axis, row: pd.Series, model: str) -> None:
         color=MODEL_COLORS[model], pad=8,
     )
     axis.text(
-        .06, .5, metric_text(row), ha="left", va="center", fontsize=10.5,
+        .5, .5, metric_text(row), ha="center", va="center", fontsize=10.5,
         linespacing=1.55,
         bbox=dict(
             boxstyle="round,pad=.7",

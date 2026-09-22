@@ -43,22 +43,20 @@ def metric_text(row: pd.Series) -> str:
     probability_a = row[f"prob_{action_a.lower()}_a"]
     probability_b = row[f"prob_{action_b.lower()}_b"]
     return (
-        f"Behavior   A: {action_a} ({probability_a:.3f})   ·   "
+        f"Behavior:  A: {action_a} ({probability_a:.3f})   |   "
         f"B: {action_b} ({probability_b:.3f})\n"
-        f"Predicted value   A: {row['predicted_value_a']:.2f}   ·   "
-        f"B: {row['predicted_value_b']:.2f}   ·   "
+        f"Predicted value:  A: {row['predicted_value_a']:.2f}   |   "
+        f"B: {row['predicted_value_b']:.2f}   |   "
         f"ΔV(A−B): {row['predicted_value_delta_a_minus_b']:.2f}\n"
-        f"MC return   A: {row['mc_return_a']:.2f}   ·   "
-        f"B: {row['mc_return_b']:.2f}   ·   "
+        f"MC return:  A: {row['mc_return_a']:.2f}   |   "
+        f"B: {row['mc_return_b']:.2f}   |   "
         f"ΔG(A−B): {row['mc_return_delta_a_minus_b']:.2f} "
         f"± {row['mc_return_delta_sem']:.2f}\n"
-        f"Policy JS: {row['policy_js_nats']:.4f}\n"
-        f"Representation cosine policy/value: "
-        f"{row['policy_rep_cosine_distance']:.4f} / "
-        f"{row['value_rep_cosine_distance']:.4f}   ·   "
-        f"z-scored L2 policy/value: "
-        f"{row['policy_rep_zscored_euclidean_distance']:.3f} / "
-        f"{row['value_rep_zscored_euclidean_distance']:.3f}"
+        f"Cosine distance:  policy: {row['policy_rep_cosine_distance']:.4f}   |   "
+        f"value: {row['value_rep_cosine_distance']:.4f}\n"
+        f"Z-scored L2:  policy: "
+        f"{row['policy_rep_zscored_euclidean_distance']:.3f}   |   "
+        f"value: {row['value_rep_zscored_euclidean_distance']:.3f}"
     )
 
 
@@ -69,8 +67,8 @@ def draw_summary(axis, row: pd.Series, model: str) -> None:
         color=MODEL_COLORS[model], pad=8,
     )
     axis.text(
-        .5, .5, metric_text(row), ha="center", va="center", fontsize=11,
-        linespacing=1.5,
+        .06, .5, metric_text(row), ha="left", va="center", fontsize=10.5,
+        linespacing=1.55,
         bbox=dict(
             boxstyle="round,pad=.7",
             facecolor="#F6F6F6",
@@ -138,9 +136,9 @@ def main() -> None:
     config = load_config(args.config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    figure = plt.figure(figsize=(15, 8.0))
+    figure = plt.figure(figsize=(16, 10.0))
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(1.55, .85), hspace=.30, wspace=.16
+        2, 2, height_ratios=(2.4, .85), hspace=.18, wspace=.12
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

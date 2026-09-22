@@ -19,14 +19,14 @@ import pandas as pd
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
-    "font.size": 24,
-    "axes.titlesize": 28,
+    "font.size": 16,
+    "axes.titlesize": 20,
     "axes.titleweight": "bold",
-    "axes.labelsize": 24,
-    "xtick.labelsize": 24,
-    "ytick.labelsize": 24,
-    "figure.titlesize": 28,
-    "legend.fontsize": 24,
+    "axes.labelsize": 16,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "figure.titlesize": 20,
+    "legend.fontsize": 16,
     "mathtext.fontset": "dejavusans",
 })
 
@@ -38,44 +38,62 @@ MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#56B4E9"}
 
 
-def crop_counter_circuit_footprint(image: np.ndarray, record: dict) -> np.ndarray:
-    """Crop the padded 9x9 render to its complete 5x8/8x5 footprint."""
+def crop_counter_circuit_view(image: np.ndarray, record: dict) -> np.ndarray:
+    """Crop a rendered 7x7 view to 5x7 or 7x5 without losing visible tiles."""
     if record.get("family") != "counter_circuit":
         return image
-    layout = record["layout"]
-    height, width = int(layout["height"]), int(layout["width"])
-    walls = {int(index) for index in layout["wall_idx"]}
-    content = set(range(height * width)) - walls
-    for key in (
-        "agent_idx", "goal_idx", "plate_pile_idx", "onion_pile_idx", "pot_idx",
-    ):
-        content.update(int(index) for index in layout[key])
-
-    # make_counter_circuit_9x9 inserts the rotated footprint at the upper-left.
-    # Floor/object extent identifies whether the 5x8 source was rotated by 90°.
-    max_row = max(index // width for index in content)
-    max_column = max(index % width for index in content)
-    crop_height, crop_width = (8, 5) if max_row >= 5 and max_column < 5 else (5, 8)
-    if any(
-        index // width >= crop_height or index % width >= crop_width
-        for index in content
-    ):
+    grid_size = 7
+    tile_height = image.shape[0] // grid_size
+    tile_width = image.shape[1] // grid_size
+    wall_color = image[-1, -1]
+    visible = np.zeros((grid_size, grid_size), dtype=bool)
+    for row in range(grid_size):
+        for column in range(grid_size):
+            tile = image[
+                row * tile_height:(row + 1) * tile_height,
+                column * tile_width:(column + 1) * tile_width,
+            ]
+            visible[row, column] = np.any(tile != wall_color)
+    visible_rows, visible_columns = np.nonzero(visible)
+    if len(visible_rows) == 0:
         return image
-    tile_height = image.shape[0] // height
-    tile_width = image.shape[1] // width
-    return image[:crop_height * tile_height, :crop_width * tile_width]
+
+    row_span = int(visible_rows.max() - visible_rows.min() + 1)
+    column_span = int(visible_columns.max() - visible_columns.min() + 1)
+    if row_span <= 5 and column_span >= row_span:
+        crop_height, crop_width = 5, 7
+    elif column_span <= 5:
+        crop_height, crop_width = 7, 5
+    else:
+        return image
+
+    def crop_start(minimum: int, maximum: int, size: int) -> int:
+        start = min(minimum, grid_size - size)
+        return max(0, min(start, maximum - size + 1))
+
+    top = crop_start(int(visible_rows.min()), int(visible_rows.max()), crop_height)
+    left = crop_start(
+        int(visible_columns.min()), int(visible_columns.max()), crop_width
+    )
+    if np.any(visible[:top]) or np.any(visible[top + crop_height:]):
+        return image
+    if np.any(visible[:, :left]) or np.any(visible[:, left + crop_width:]):
+        return image
+    return image[
+        top * tile_height:(top + crop_height) * tile_height,
+        left * tile_width:(left + crop_width) * tile_width,
+    ]
 
 
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
-    """Rebuild the state and render its complete layout footprint."""
+    """Rebuild the state and render JaxMARL's centered 7x7 map view."""
     from jaxmarl.viz.overcooked_jitted_visualizer import render_state as render_map
 
     _, state, _ = instantiate(config, record, horizon)
-    agent_view_size = 5 if record.get("family") == "counter_circuit" else 6
     image = np.asarray(render_map(
-        state, highlight=False, agent_view_size=agent_view_size,
+        state, highlight=False, agent_view_size=6,
     ))
-    return crop_counter_circuit_footprint(image, record)
+    return crop_counter_circuit_view(image, record)
 
 
 def draw_state(axis, record: dict, image: np.ndarray) -> None:
@@ -182,13 +200,13 @@ def main() -> None:
     state_images = [render_state(config, state, args.horizon) for state in states]
 
     # Each map is followed by two model-colored behavior lines.
-    # A near-square column keeps the two 7x7 maps close together.  With a
-    # 12-inch-wide figure, imshow preserves its square aspect and leaves large
-    # horizontal gaps inside each subplot regardless of GridSpec.wspace.
-    paper_size = (9.0, 5.3)
+    # Match the canvas width to the cropped map aspect ratios to avoid the
+    # internal whitespace that imshow adds while preserving pixel geometry.
+    aspect_sum = sum(image.shape[1] / image.shape[0] for image in state_images)
+    paper_size = (max(7.5, 3.15 * aspect_sum + .2), 4.4)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(3.2, .65), hspace=.08, wspace=.02
+        2, 2, height_ratios=(3.2, .65), hspace=.03, wspace=.02
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
@@ -200,14 +218,14 @@ def main() -> None:
         figure.add_subplot(grid[1, 1]), "B", rows
     ))
 
-    figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
+    figure.subplots_adjust(top=.95, bottom=.02, left=.005, right=.995)
     fit_summary_width(figure, summary_artists, paper_size)
     output = args.output or (
         args.analysis_dir / "comparison_figures" /
         f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_paper.pdf"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output, bbox_inches="tight")
+    figure.savefig(output, bbox_inches="tight", pad_inches=.01)
     plt.close(figure)
     print(f"Saved data-driven comparison figure to {output}")
 

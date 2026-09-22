@@ -165,7 +165,9 @@ def main() -> None:
     ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    figure = plt.figure(figsize=(10.0, 5.694))
+    # Keep the requested aspect ratio while giving two 24 pt summary panels
+    # enough horizontal room to remain fully separate.
+    figure = plt.figure(figsize=(16.0, 9.11))
     grid = figure.add_gridspec(
         2, 2, height_ratios=(2.45, 1.15), hspace=.10, wspace=.10
     )

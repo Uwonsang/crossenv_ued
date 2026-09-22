@@ -27,6 +27,7 @@ FAMILY_LABELS = {
     "cramped_room": "Cramped Room",
 }
 MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
+MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 POLICY_COLOR = "#0072B2"
 VALUE_COLOR = "#D55E00"
 
@@ -157,6 +158,210 @@ def correlation(x: np.ndarray, y: np.ndarray) -> float:
     return float(np.corrcoef(x[valid], y[valid])[0, 1])
 
 
+def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
+    """Rank correlation with average ranks for tied observations."""
+    valid = np.isfinite(x) & np.isfinite(y)
+    if valid.sum() < 3:
+        return float("nan")
+    x_rank = pd.Series(x[valid]).rank(method="average").to_numpy()
+    y_rank = pd.Series(y[valid]).rank(method="average").to_numpy()
+    return correlation(x_rank, y_rank)
+
+
+def retain_common_pairs(frame: pd.DataFrame) -> pd.DataFrame:
+    """Use the same pair IDs for every checkpoint within each layout."""
+    retained = []
+    for layout, layout_frame in frame.groupby("layout", sort=False):
+        pair_sets = [
+            set(group["pair_id"].astype(int))
+            for _, group in layout_frame.groupby(["series", "seed"], sort=False)
+        ]
+        common = set.intersection(*pair_sets) if pair_sets else set()
+        if not common:
+            raise ValueError(f"No pair is shared by every checkpoint for {layout}")
+        retained.append(layout_frame[layout_frame["pair_id"].isin(common)])
+    return pd.concat(retained, ignore_index=True)
+
+
+def seed_layout_correlations(frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute Spearman correlations with checkpoint seeds as replicates."""
+    rows = []
+    group_columns = ["series", "model", "num_envs", "layout", "seed"]
+    for keys, subset in frame.groupby(group_columns, sort=False):
+        series, model, num_envs, layout, seed = keys
+        x = subset["mc_return_delta_a_minus_b"].abs().to_numpy()
+        policy = subset["policy_rep_zscored_rms_distance"].to_numpy()
+        value = subset["value_rep_zscored_rms_distance"].to_numpy()
+        policy_rho = spearman_correlation(x, policy)
+        value_rho = spearman_correlation(x, value)
+        rows.append({
+            "series": series,
+            "model": model,
+            "num_envs": int(num_envs),
+            "layout": layout,
+            "seed": int(seed),
+            "pairs": len(subset),
+            "policy_spearman_rho": policy_rho,
+            "value_spearman_rho": value_rho,
+            "value_minus_policy_rho": value_rho - policy_rho,
+        })
+    result = pd.DataFrame(rows)
+    # Each layout contributes equally to the across-layout result for a seed.
+    overall = result.groupby(
+        ["series", "model", "num_envs", "seed"], as_index=False
+    ).agg({
+        "pairs": "sum",
+        "policy_spearman_rho": "mean",
+        "value_spearman_rho": "mean",
+        "value_minus_policy_rho": "mean",
+    })
+    overall["layout"] = "overall"
+    return pd.concat([result, overall[result.columns]], ignore_index=True)
+
+
+def bootstrap_mean_ci(
+    values: np.ndarray, samples: int, seed: int
+) -> tuple[float, float, float]:
+    values = values[np.isfinite(values)]
+    if not len(values):
+        return float("nan"), float("nan"), float("nan")
+    mean = float(values.mean())
+    if len(values) == 1:
+        return mean, float("nan"), float("nan")
+    rng = np.random.default_rng(seed)
+    indices = rng.integers(0, len(values), size=(samples, len(values)))
+    bootstrap_means = values[indices].mean(axis=1)
+    low, high = np.quantile(bootstrap_means, [.025, .975])
+    return mean, float(low), float(high)
+
+
+def summarize_seed_correlations(
+    correlations: pd.DataFrame, bootstrap_samples: int
+) -> pd.DataFrame:
+    metrics = (
+        "policy_spearman_rho",
+        "value_spearman_rho",
+        "value_minus_policy_rho",
+    )
+    rows = []
+    for group_index, (keys, subset) in enumerate(correlations.groupby(
+        ["series", "model", "num_envs", "layout"], sort=False
+    )):
+        series, model, num_envs, layout = keys
+        row = {
+            "series": series,
+            "model": model,
+            "num_envs": int(num_envs),
+            "layout": layout,
+            "seeds": int(subset["seed"].nunique()),
+            "mean_pairs_per_seed": float(subset["pairs"].mean()),
+        }
+        for metric_index, metric in enumerate(metrics):
+            mean, low, high = bootstrap_mean_ci(
+                subset[metric].to_numpy(dtype=float), bootstrap_samples,
+                seed=1701 + group_index * len(metrics) + metric_index,
+            )
+            row[f"{metric}_mean"] = mean
+            row[f"{metric}_ci_low"] = low
+            row[f"{metric}_ci_high"] = high
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def asymmetric_errors(summary: pd.DataFrame, metric: str) -> np.ndarray:
+    mean = summary[f"{metric}_mean"].to_numpy(dtype=float)
+    low = summary[f"{metric}_ci_low"].to_numpy(dtype=float)
+    high = summary[f"{metric}_ci_high"].to_numpy(dtype=float)
+    return np.vstack((np.maximum(0, mean - low), np.maximum(0, high - mean)))
+
+
+def plot_seed_layout_correlations(
+    summary: pd.DataFrame, frame: pd.DataFrame, output_dir: Path
+) -> None:
+    layouts = ordered_layouts(frame) + ["overall"]
+    series_names = ordered_series(frame)
+    figure, axes = plt.subplots(
+        1, len(series_names), figsize=(6.2 * len(series_names), 4.4), squeeze=False
+    )
+    x = np.arange(len(layouts))
+    width = .36
+    for axis, series in zip(axes[0], series_names):
+        subset = summary[summary["series"] == series].set_index("layout").reindex(layouts)
+        for positions, metric, label, color in (
+            (x - width / 2, "policy_spearman_rho", "Policy", POLICY_COLOR),
+            (x + width / 2, "value_spearman_rho", "Value", VALUE_COLOR),
+        ):
+            axis.bar(
+                positions, subset[f"{metric}_mean"], width=width,
+                yerr=asymmetric_errors(subset, metric), capsize=3,
+                color=color, edgecolor="black", linewidth=.5, label=label,
+            )
+        overall_gap = subset.loc["overall", "value_minus_policy_rho_mean"]
+        axis.set_title(
+            f"{series}\noverall $\\Delta\\rho={overall_gap:.2f}$",
+            fontweight="bold",
+        )
+        axis.set_xticks(x)
+        axis.set_xticklabels(
+            [
+                FAMILY_LABELS.get(
+                    layout, "Overall" if layout == "overall" else layout
+                )
+                for layout in layouts
+            ],
+            rotation=25, ha="right",
+        )
+        axis.set_ylim(-1.05, 1.05)
+        axis.axhline(0, color="black", linewidth=.7)
+        axis.set_ylabel("Spearman correlation with $|\\Delta G_{MC}|$")
+        axis.grid(axis="y", alpha=.25)
+        axis.legend(frameon=False)
+    figure.suptitle(
+        "Seed-level return sensitivity of policy and value representations",
+        fontweight="bold",
+    )
+    figure.tight_layout()
+    figure.savefig(
+        output_dir / "return_correlation_by_seed_layout.png", dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close(figure)
+
+    figure, axis = plt.subplots(figsize=(7.2, 4.3))
+    width = .8 / len(series_names)
+    for offset, series in enumerate(series_names):
+        subset = summary[summary["series"] == series].set_index("layout").reindex(layouts)
+        metric = "value_minus_policy_rho"
+        positions = x + (offset - (len(series_names) - 1) / 2) * width
+        model = subset["model"].dropna().iloc[0]
+        axis.bar(
+            positions, subset[f"{metric}_mean"], width=width,
+            yerr=asymmetric_errors(subset, metric), capsize=3,
+            label=series, edgecolor="black", linewidth=.5,
+            color=MODEL_COLORS.get(model, ".5"),
+        )
+    axis.axhline(0, color="black", linewidth=.8)
+    axis.set_xticks(x)
+    axis.set_xticklabels(
+        [
+            FAMILY_LABELS.get(
+                layout, "Overall" if layout == "overall" else layout
+            )
+            for layout in layouts
+        ],
+        rotation=25, ha="right",
+    )
+    axis.set_ylabel(r"Return-sensitivity gap $\rho_V-\rho_\pi$")
+    axis.set_title("Policy–value return-sensitivity separation", fontweight="bold")
+    axis.grid(axis="y", alpha=.25)
+    axis.legend(frameon=False)
+    figure.tight_layout()
+    figure.savefig(
+        output_dir / "return_correlation_gap.png", dpi=300, bbox_inches="tight"
+    )
+    plt.close(figure)
+
+
 def plot_return_scatter(frame: pd.DataFrame, output_dir: Path) -> None:
     series_names = ordered_series(frame)
     figure, axes = plt.subplots(
@@ -278,7 +483,13 @@ def main() -> None:
     parser.add_argument("--model-root", type=Path, required=True)
     parser.add_argument("--input-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--bootstrap-samples", type=int, default=10000,
+        help="Seed-bootstrap samples for 95%% correlation confidence intervals",
+    )
     args = parser.parse_args()
+    if args.bootstrap_samples < 1:
+        parser.error("--bootstrap-samples must be positive")
 
     input_dir = args.input_dir or (
         args.model_root.expanduser() / "analysis" / "policy_value_large_scale"
@@ -294,7 +505,7 @@ def main() -> None:
     except FileNotFoundError as error:
         parser.error(str(error))
     required = {
-        "model", "num_envs", "seed", "mc_return_delta_a_minus_b",
+        "model", "num_envs", "seed", "pair_id", "mc_return_delta_a_minus_b",
         "policy_rep_cosine_distance", "value_rep_cosine_distance",
         "policy_rep_raw_euclidean_distance", "value_rep_raw_euclidean_distance",
         "policy_rep_zscored_euclidean_distance",
@@ -336,6 +547,18 @@ def main() -> None:
         "Z-scored RMS distance",
     )
     plot_return_scatter(frame, output_dir)
+    common_pair_frame = retain_common_pairs(frame)
+    seed_correlations = seed_layout_correlations(common_pair_frame)
+    correlation_summary = summarize_seed_correlations(
+        seed_correlations, args.bootstrap_samples
+    )
+    seed_correlations.to_csv(
+        output_dir / "return_correlations_by_seed_layout.csv", index=False
+    )
+    correlation_summary.to_csv(
+        output_dir / "return_correlations_summary.csv", index=False
+    )
+    plot_seed_layout_correlations(correlation_summary, common_pair_frame, output_dir)
     plot_cka(cka_frame, output_dir)
     plot_filter_rates(frame, output_dir)
     print(f"Loaded {len(frame)} evaluations from {input_dir}")

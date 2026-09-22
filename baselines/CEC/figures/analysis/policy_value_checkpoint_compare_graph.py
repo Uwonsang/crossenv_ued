@@ -54,9 +54,9 @@ def metric_text(row: pd.Series) -> str:
         f"± {row['mc_return_delta_sem']:.2f}\n"
         f"Cosine distance:  policy: {row['policy_rep_cosine_distance']:.4f}   |   "
         f"value: {row['value_rep_cosine_distance']:.4f}\n"
-        f"Z-scored L2:  policy: "
-        f"{row['policy_rep_zscored_euclidean_distance']:.3f}   |   "
-        f"value: {row['value_rep_zscored_euclidean_distance']:.3f}"
+        f"Z-scored RMS:  policy: "
+        f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
+        f"value: {row['value_rep_zscored_rms_distance']:.3f}"
     )
 
 
@@ -112,6 +112,29 @@ def load_metrics(
     return rows
 
 
+def ensure_zscored_rms(rows: dict[str, pd.Series], config: dict) -> None:
+    """Support older CSVs that contain z-scored L2 but not RMS distance."""
+    default_dims = {
+        "policy": int(config["GRU_HIDDEN_DIM"]) // 4,
+        "value": int(config["FC_DIM_SIZE"]) // 2,
+    }
+    for row in rows.values():
+        for prefix in ("policy", "value"):
+            rms_column = f"{prefix}_rep_zscored_rms_distance"
+            if rms_column in row.index and pd.notna(row[rms_column]):
+                continue
+            dim_column = f"{prefix}_rep_dim"
+            dimension = (
+                int(row[dim_column])
+                if dim_column in row.index and pd.notna(row[dim_column])
+                else default_dims[prefix]
+            )
+            row[rms_column] = (
+                row[f"{prefix}_rep_zscored_euclidean_distance"]
+                / np.sqrt(dimension)
+            )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-dir", type=Path, required=True)
@@ -134,6 +157,7 @@ def main() -> None:
     if len(states) != 2:
         parser.error(f"Expected two states, found {len(states)}")
     config = load_config(args.config)
+    ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
     figure = plt.figure(figsize=(16, 10.0))

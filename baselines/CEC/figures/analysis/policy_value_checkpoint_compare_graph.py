@@ -14,6 +14,14 @@ import pandas as pd
 
 plt.rcParams.update({
     "font.family": "DejaVu Sans",
+    "font.size": 24,
+    "axes.titlesize": 28,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 24,
+    "xtick.labelsize": 24,
+    "ytick.labelsize": 24,
+    "figure.titlesize": 28,
+    "legend.fontsize": 24,
     "mathtext.fontset": "dejavusans",
 })
 
@@ -38,7 +46,6 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
     axis.axis("off")
     axis.set_title(
         f"Environment {record['variant']}",
-        fontsize=13, fontweight="bold",
     )
 
 
@@ -48,13 +55,13 @@ def metric_text(row: pd.Series) -> str:
     probability_a = row[f"prob_{action_a.lower()}_a"]
     probability_b = row[f"prob_{action_b.lower()}_b"]
     lines = (
-        f"Behavior:  A: {action_a} ({probability_a:.3f})   |   "
+        f"A: {action_a} ({probability_a:.3f})   |   "
         f"B: {action_b} ({probability_b:.3f})",
         rf"$\hat{{V}}_1(s_0^A)={row['predicted_value_a']:.2f}$"
         rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$",
-        f"Z-scored RMS:  policy: "
+        rf"Z-scored RMS:  $h_\pi$="
         f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
-        f"value: {row['value_rep_zscored_rms_distance']:.3f}",
+        rf"$h_V$={row['value_rep_zscored_rms_distance']:.3f}",
     )
     return "\n".join(lines)
 
@@ -62,14 +69,13 @@ def metric_text(row: pd.Series) -> str:
 def draw_summary(axis, row: pd.Series, model: str) -> None:
     axis.axis("off")
     axis.set_title(
-        MODEL_LABELS[model], fontweight="bold", fontsize=16,
-        color=MODEL_COLORS[model], pad=8,
+        MODEL_LABELS[model], color=MODEL_COLORS[model], pad=5,
     )
     axis.text(
-        .5, .5, metric_text(row), ha="center", va="center", fontsize=10.5,
-        linespacing=1.55,
+        .5, .5, metric_text(row), ha="center", va="center",
+        linespacing=1.25,
         bbox=dict(
-            boxstyle="round,pad=.7",
+            boxstyle="round,pad=.35",
             facecolor="#F6F6F6",
             edgecolor=MODEL_COLORS[model], linewidth=1.6,
         ),
@@ -159,9 +165,9 @@ def main() -> None:
     ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    figure = plt.figure(figsize=(16, 9.0))
+    figure = plt.figure(figsize=(10.0, 5.694))
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(3.0, .62), hspace=.12, wspace=.12
+        2, 2, height_ratios=(2.45, 1.15), hspace=.10, wspace=.10
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
@@ -171,10 +177,10 @@ def main() -> None:
     figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
     output = args.output or (
         args.analysis_dir / "comparison_figures" /
-        f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_compact.png"
+        f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_compact.pdf"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    figure.savefig(output, dpi=220, bbox_inches="tight")
+    figure.savefig(output, bbox_inches="tight")
     plt.close(figure)
     print(f"Saved data-driven comparison figure to {output}")
 

@@ -472,6 +472,57 @@ def euclidean_distance(left, right):
     return float(np.linalg.norm(left - right))
 
 
+def rms_euclidean_distance(left, right):
+    """Euclidean distance normalized by the square root of feature count."""
+    return euclidean_distance(left, right) / np.sqrt(left.size)
+
+
+def linear_cka(left, right):
+    """Linear centered-kernel alignment for two sample-aligned matrices."""
+    left = left - left.mean(axis=0, keepdims=True)
+    right = right - right.mean(axis=0, keepdims=True)
+    cross = np.linalg.norm(left.T @ right, ord="fro") ** 2
+    left_norm = np.linalg.norm(left.T @ left, ord="fro")
+    right_norm = np.linalg.norm(right.T @ right, ord="fro")
+    denominator = left_norm * right_norm
+    return float(cross / denominator) if denominator > 0 else float("nan")
+
+
+def compute_cka_rows(rows):
+    """Compute CKA per checkpoint using all A/B states in this layout."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["model"], row["num_envs"], row["seed"])].append(row)
+
+    summaries = []
+    for (model, num_envs, seed), group in grouped.items():
+        policy = np.stack([
+            row[f"_policy_rep_{variant}"]
+            for row in group for variant in ("a", "b")
+        ])
+        value = np.stack([
+            row[f"_value_rep_{variant}"]
+            for row in group for variant in ("a", "b")
+        ])
+        returns = np.asarray([
+            row[f"mc_return_{variant}"]
+            for row in group for variant in ("a", "b")
+        ])[:, None]
+        summaries.append({
+            "model": model,
+            "num_envs": num_envs,
+            "seed": seed,
+            "pairs": len(group),
+            "states": len(policy),
+            "policy_rep_dim": policy.shape[1],
+            "value_rep_dim": value.shape[1],
+            "policy_value_linear_cka": linear_cka(policy, value),
+            "policy_return_linear_cka": linear_cka(policy, returns),
+            "value_return_linear_cka": linear_cka(value, returns),
+        })
+    return summaries
+
+
 def add_dataset_normalized_distances(rows):
     """Add per-checkpoint z-scored distances and remove temporary features."""
     grouped = defaultdict(list)
@@ -492,6 +543,9 @@ def add_dataset_normalized_distances(rows):
                 normalized_b = (row[f"_{prefix}_rep_b"] - mean) / safe_std
                 row[f"{prefix}_rep_zscored_euclidean_distance"] = (
                     euclidean_distance(normalized_a, normalized_b)
+                )
+                row[f"{prefix}_rep_zscored_rms_distance"] = (
+                    rms_euclidean_distance(normalized_a, normalized_b)
                 )
 
     for row in rows:
@@ -568,9 +622,9 @@ def draw_checkpoint_reports(rows, output_dir, state_images):
             f"Rep raw L2 (policy/value): "
             f"{row['policy_rep_raw_euclidean_distance']:.4f} / "
             f"{row['value_rep_raw_euclidean_distance']:.4f}   |   "
-            f"z-scored L2: "
-            f"{row['policy_rep_zscored_euclidean_distance']:.4f} / "
-            f"{row['value_rep_zscored_euclidean_distance']:.4f}\n"
+            f"z-scored RMS (policy/value): "
+            f"{row['policy_rep_zscored_rms_distance']:.4f} / "
+            f"{row['value_rep_zscored_rms_distance']:.4f}\n"
             f"Automatic filter: {status}"
         )
         text_axis.text(
@@ -703,6 +757,14 @@ def evaluate_checkpoint(
         "value_rep_raw_euclidean_distance": euclidean_distance(
             a["value_rep"], b["value_rep"]
         ),
+        "policy_rep_raw_rms_distance": rms_euclidean_distance(
+            a["policy_rep"], b["policy_rep"]
+        ),
+        "value_rep_raw_rms_distance": rms_euclidean_distance(
+            a["value_rep"], b["value_rep"]
+        ),
+        "policy_rep_dim": int(a["policy_rep"].size),
+        "value_rep_dim": int(a["value_rep"].size),
         "_policy_rep_a": a["policy_rep"],
         "_policy_rep_b": b["policy_rep"],
         "_value_rep_a": a["value_rep"],
@@ -834,6 +896,7 @@ def main():
             )
     if not rows:
         raise RuntimeError("No usable checkpoint was found")
+    cka_rows = compute_cka_rows(rows)
     add_dataset_normalized_distances(rows)
     with (args.output_dir / "concrete_example_metrics.csv").open(
         "w", newline="", encoding="utf-8"
@@ -841,6 +904,12 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
+    with (args.output_dir / "concrete_example_cka.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(cka_rows[0]))
+        writer.writeheader()
+        writer.writerows(cka_rows)
     model_filtered = [row for row in rows if row["passes_concrete_example"]]
     with (args.output_dir / "concrete_example_model_filtered.csv").open(
         "w", newline="", encoding="utf-8"
@@ -916,6 +985,12 @@ def main():
             "mean_value_rep_zscored_euclidean_distance": np.mean([
                 row["value_rep_zscored_euclidean_distance"] for row in group
             ]),
+            "mean_policy_rep_zscored_rms_distance": np.mean([
+                row["policy_rep_zscored_rms_distance"] for row in group
+            ]),
+            "mean_value_rep_zscored_rms_distance": np.mean([
+                row["value_rep_zscored_rms_distance"] for row in group
+            ]),
         })
     with (args.output_dir / "concrete_example_pair_summary.csv").open(
         "w", newline="", encoding="utf-8"
@@ -970,6 +1045,12 @@ def main():
             ]),
             "mean_value_rep_zscored_euclidean_distance": np.mean([
                 row["value_rep_zscored_euclidean_distance"] for row in group
+            ]),
+            "mean_policy_rep_zscored_rms_distance": np.mean([
+                row["policy_rep_zscored_rms_distance"] for row in group
+            ]),
+            "mean_value_rep_zscored_rms_distance": np.mean([
+                row["value_rep_zscored_rms_distance"] for row in group
             ]),
         })
     if summary:

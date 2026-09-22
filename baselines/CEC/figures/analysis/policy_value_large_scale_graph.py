@@ -55,6 +55,31 @@ def load_metrics(input_dir: Path) -> pd.DataFrame:
     return frame
 
 
+def load_cka(input_dir: Path) -> pd.DataFrame:
+    frames = []
+    for family_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
+        metrics = family_dir / "concrete_example_cka.csv"
+        if not metrics.is_file():
+            continue
+        frame = pd.read_csv(metrics)
+        frame["layout"] = family_dir.name
+        frames.append(frame)
+    if not frames:
+        raise FileNotFoundError(
+            "No concrete_example_cka.csv files were found. Re-run the large-scale "
+            "analysis with the updated policy_value_concrete_example.py first."
+        )
+    frame = pd.concat(frames, ignore_index=True)
+    frame["series"] = frame.apply(
+        lambda row: (
+            f"{MODEL_LABELS.get(row['model'], row['model'])} "
+            f"({int(row['num_envs'])})"
+        ),
+        axis=1,
+    )
+    return frame
+
+
 def ordered_layouts(frame: pd.DataFrame) -> list[str]:
     present = set(frame["layout"])
     return [name for name in FAMILY_ORDER if name in present] + sorted(
@@ -140,8 +165,8 @@ def plot_return_scatter(frame: pd.DataFrame, output_dir: Path) -> None:
     for axis, series in zip(axes[0], series_names):
         subset = frame[frame["series"] == series]
         x = subset["mc_return_delta_a_minus_b"].abs().to_numpy()
-        policy = subset["policy_rep_zscored_euclidean_distance"].to_numpy()
-        value = subset["value_rep_zscored_euclidean_distance"].to_numpy()
+        policy = subset["policy_rep_zscored_rms_distance"].to_numpy()
+        value = subset["value_rep_zscored_rms_distance"].to_numpy()
         axis.scatter(x, policy, s=18, alpha=.35, color=POLICY_COLOR, label="Policy")
         axis.scatter(x, value, s=18, alpha=.35, color=VALUE_COLOR, label="Value")
         axis.text(
@@ -153,13 +178,52 @@ def plot_return_scatter(frame: pd.DataFrame, output_dir: Path) -> None:
         )
         axis.set_title(series, fontweight="bold")
         axis.set_xlabel("Absolute MC return difference")
-        axis.set_ylabel("Z-scored representation L2 distance")
+        axis.set_ylabel("Z-scored representation RMS distance")
         axis.grid(alpha=.25)
         axis.legend(frameon=False)
     figure.suptitle("Representation distance versus future-return difference",
                     fontweight="bold")
     figure.tight_layout()
     figure.savefig(output_dir / "representation_vs_return.png", dpi=300,
+                   bbox_inches="tight")
+    plt.close(figure)
+
+
+def plot_cka(frame: pd.DataFrame, output_dir: Path) -> None:
+    layouts = ordered_layouts(frame)
+    series_names = ordered_series(frame)
+    metrics = (
+        ("policy_value_linear_cka", "Policy–value"),
+        ("policy_return_linear_cka", "Policy–return"),
+        ("value_return_linear_cka", "Value–return"),
+    )
+    figure, axes = plt.subplots(
+        1, len(series_names), figsize=(6.2 * len(series_names), 4.2), squeeze=False
+    )
+    x = np.arange(len(layouts))
+    width = .8 / len(metrics)
+    for axis, series in zip(axes[0], series_names):
+        for offset, (column, label) in enumerate(metrics):
+            mean, sem = mean_sem_by_seed(frame, column, layouts, series)
+            positions = x + (offset - (len(metrics) - 1) / 2) * width
+            axis.bar(
+                positions, mean, width=width, yerr=sem, capsize=3,
+                label=label, edgecolor="black", linewidth=.4,
+            )
+        axis.set_xticks(x)
+        axis.set_xticklabels(
+            [FAMILY_LABELS.get(layout, layout) for layout in layouts],
+            rotation=25,
+            ha="right",
+        )
+        axis.set_ylim(0, 1.05)
+        axis.set_ylabel("Linear CKA")
+        axis.set_title(series, fontweight="bold")
+        axis.grid(axis="y", alpha=.25)
+        axis.legend(frameon=False, fontsize=8)
+    figure.suptitle("Representation and return alignment", fontweight="bold")
+    figure.tight_layout()
+    figure.savefig(output_dir / "representation_cka.png", dpi=300,
                    bbox_inches="tight")
     plt.close(figure)
 
@@ -226,12 +290,17 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame = load_metrics(input_dir)
+    try:
+        cka_frame = load_cka(input_dir)
+    except FileNotFoundError as error:
+        parser.error(str(error))
     required = {
         "model", "num_envs", "seed", "mc_return_delta_a_minus_b",
         "policy_rep_cosine_distance", "value_rep_cosine_distance",
         "policy_rep_raw_euclidean_distance", "value_rep_raw_euclidean_distance",
         "policy_rep_zscored_euclidean_distance",
         "value_rep_zscored_euclidean_distance", "passes_policy_equivalence",
+        "policy_rep_zscored_rms_distance", "value_rep_zscored_rms_distance",
         "passes_intended_interaction", "passes_return_distinction",
         "passes_concrete_example",
     }
@@ -255,7 +324,13 @@ def main() -> None:
         "value_rep_zscored_euclidean_distance",
         "Z-scored Euclidean distance",
     )
+    plot_layout_distances(
+        frame, output_dir, "zscored_rms",
+        "policy_rep_zscored_rms_distance", "value_rep_zscored_rms_distance",
+        "Z-scored RMS distance",
+    )
     plot_return_scatter(frame, output_dir)
+    plot_cka(cka_frame, output_dir)
     plot_filter_rates(frame, output_dir)
     print(f"Loaded {len(frame)} evaluations from {input_dir}")
     print(f"Saved large-scale PNG figures to {output_dir}")

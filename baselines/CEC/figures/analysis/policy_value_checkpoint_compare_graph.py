@@ -3,7 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+# This script only rebuilds states for visualization.  Keeping JAX on CPU avoids
+# a GPU/XLA shutdown crash that can otherwise occur after the PDF is saved.
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import matplotlib
 
@@ -34,7 +39,7 @@ MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
 
 
 def crop_counter_circuit_padding(image: np.ndarray, record: dict) -> np.ndarray:
-    """Remove the 9x9 padding while preserving the map's actual orientation."""
+    """Remove rows/columns made only of the padded grey wall tiles."""
     if record.get("family") != "counter_circuit":
         return image
     layout = record["layout"]
@@ -48,19 +53,20 @@ def crop_counter_circuit_padding(image: np.ndarray, record: dict) -> np.ndarray:
     if not content:
         return image
 
-    # The generated Counter Circuit footprint is 5x8, or 8x5 after rotation,
-    # and make_9x9_layout places it at the upper-left of the 9x9 canvas.
-    candidates = ((5, 8), (8, 5))
-    crop_height, crop_width = min(
-        candidates,
-        key=lambda shape: sum(
-            index // width >= shape[0] or index % width >= shape[1]
-            for index in content
-        ),
-    )
+    # Randomized Counter Circuit layouts can have an outer row or column that
+    # consists entirely of wall tiles.  A fixed 5x8/8x5 crop therefore leaves
+    # grey strips.  Non-wall floor tiles and all semantic objects define the
+    # visible extent; object tiles are retained even though they are also walls.
+    content_rows = [index // width for index in content]
+    content_columns = [index % width for index in content]
+    top, bottom = min(content_rows), max(content_rows) + 1
+    left, right = min(content_columns), max(content_columns) + 1
     tile_height = image.shape[0] // height
     tile_width = image.shape[1] // width
-    return image[:crop_height * tile_height, :crop_width * tile_width]
+    return image[
+        top * tile_height:bottom * tile_height,
+        left * tile_width:right * tile_width,
+    ]
 
 
 def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
@@ -80,36 +86,47 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
     )
 
 
-def metric_text(row: pd.Series) -> str:
-    action_a = str(row["argmax_a"])
-    action_b = str(row["argmax_b"])
-    return (
-        f"A: {action_a}   |   B: {action_b}"
-        rf"   |   Rep. distance: $d_\pi$ = "
-        f"{row['policy_rep_zscored_rms_distance']:.3f},  "
-        rf"$d_V$ = {row['value_rep_zscored_rms_distance']:.3f}"
-    )
-
-
-def draw_summary(axis, row: pd.Series, model: str):
+def draw_behavior(axis, variant: str, rows: dict[str, pd.Series]):
+    """Show both models' decisions directly below one environment."""
     axis.axis("off")
     return axis.text(
-        .5, .5, f"{MODEL_LABELS[model]}   |   {metric_text(row)}",
-        ha="center", va="center",
-        bbox=dict(
-            boxstyle="round,pad=.35",
-            facecolor="#F6F6F6",
-            edgecolor=MODEL_COLORS[model], linewidth=1.6,
+        .5, .5,
+        "   |   ".join(
+            f"{MODEL_LABELS[model]}: {rows[model][f'argmax_{variant.lower()}']}"
+            for model in MODEL_ORDER
         ),
+        ha="center", va="center",
     )
+
+
+def draw_representation_summary(axis, rows: dict[str, pd.Series]):
+    """Place representation distances in a separate full-width panel."""
+    axis.axis("off")
+    axis.set_xlim(0, 1)
+    axis.set_ylim(0, 1)
+    axis.text(
+        .5, .82, "Representation distance",
+        ha="center", va="center", fontweight="bold",
+    )
+    artists = []
+    for y, model in zip((.49, .18), MODEL_ORDER):
+        row = rows[model]
+        artists.append(axis.text(
+            .5, y,
+            rf"{MODEL_LABELS[model]}: $d_\pi$ = "
+            f"{row['policy_rep_zscored_rms_distance']:.3f},   "
+            rf"$d_V$ = {row['value_rep_zscored_rms_distance']:.3f}",
+            ha="center", va="center",
+        ))
+    return artists
 
 
 def fit_summary_width(figure, artists, base_size=(10.0, 5.694)) -> None:
-    """Grow the paper figure only when a one-line summary would be clipped."""
+    """Grow the paper figure only when text would be clipped."""
     figure.canvas.draw()
     renderer = figure.canvas.get_renderer()
     widest = max(
-        artist.get_bbox_patch().get_window_extent(renderer).width
+        artist.get_window_extent(renderer).width
         for artist in artists
     )
     available = figure.bbox.width * .94
@@ -202,20 +219,22 @@ def main() -> None:
     ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    # Maps are columns (environment A/B), while model results are full-width
-    # rows so a model is not visually associated with only one environment.
+    # Each map is followed by both models' behavior for that environment.  The
+    # representation distances compare A with B, so they occupy a shared panel.
     paper_size = (10.0, 5.694)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        3, 2, height_ratios=(3.0, .30, .30), hspace=.08, wspace=.10
+        3, 2, height_ratios=(3.0, .28, .72), hspace=.08, wspace=.10
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
-    summary_artists = []
-    for row_index, model in enumerate(MODEL_ORDER, start=1):
-        summary_artists.append(draw_summary(
-            figure.add_subplot(grid[row_index, :]), rows[model], model
-        ))
+    summary_artists = [
+        draw_behavior(figure.add_subplot(grid[1, 0]), "A", rows),
+        draw_behavior(figure.add_subplot(grid[1, 1]), "B", rows),
+    ]
+    summary_artists.extend(draw_representation_summary(
+        figure.add_subplot(grid[2, :]), rows
+    ))
 
     figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
     fit_summary_width(figure, summary_artists, paper_size)

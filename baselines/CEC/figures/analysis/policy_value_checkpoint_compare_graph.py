@@ -155,7 +155,7 @@ def main() -> None:
     paper_size = (12.0, 5.3)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(3.2, .65), hspace=.08, wspace=.12
+        2, 2, height_ratios=(3.2, .65), hspace=.08, wspace=.02
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])

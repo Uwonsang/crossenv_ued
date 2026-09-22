@@ -52,28 +52,19 @@ def draw_state(axis, record: dict, image: np.ndarray) -> None:
 def metric_text(row: pd.Series) -> str:
     action_a = str(row["argmax_a"])
     action_b = str(row["argmax_b"])
-    probability_a = row[f"prob_{action_a.lower()}_a"]
-    probability_b = row[f"prob_{action_b.lower()}_b"]
-    lines = (
-        f"A: {action_a} ({probability_a:.3f})   |   "
-        f"B: {action_b} ({probability_b:.3f})",
-        rf"$\hat{{V}}_1(s_0^A)={row['predicted_value_a']:.2f}$"
-        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$",
-        rf"Z-scored RMS:  $h_\pi$="
-        f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
-        rf"$h_V$={row['value_rep_zscored_rms_distance']:.3f}",
+    return (
+        f"A: {action_a}   |   B: {action_b}"
+        rf"   |   Z-RMS: $h_\pi$="
+        f"{row['policy_rep_zscored_rms_distance']:.3f},  "
+        rf"$h_V$={row['value_rep_zscored_rms_distance']:.3f}"
     )
-    return "\n".join(lines)
 
 
 def draw_summary(axis, row: pd.Series, model: str) -> None:
     axis.axis("off")
-    axis.set_title(
-        MODEL_LABELS[model], color=MODEL_COLORS[model], pad=5,
-    )
     axis.text(
-        .5, .5, metric_text(row), ha="center", va="center",
-        linespacing=1.25,
+        .5, .5, f"{MODEL_LABELS[model]}   |   {metric_text(row)}",
+        ha="center", va="center",
         bbox=dict(
             boxstyle="round,pad=.35",
             facecolor="#F6F6F6",
@@ -165,21 +156,21 @@ def main() -> None:
     ensure_zscored_rms(rows, config)
     state_images = [render_state(config, state, args.horizon) for state in states]
 
-    # Keep the requested aspect ratio while giving two 24 pt summary panels
-    # enough horizontal room to remain fully separate.
-    figure = plt.figure(figsize=(16.0, 9.11))
+    # Maps are columns (environment A/B), while model results are full-width
+    # rows so a model is not visually associated with only one environment.
+    figure = plt.figure(figsize=(16.0, 8.5))
     grid = figure.add_gridspec(
-        2, 2, height_ratios=(2.45, 1.15), hspace=.10, wspace=.10
+        3, 2, height_ratios=(3.0, .42, .42), hspace=.12, wspace=.10
     )
     draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
     draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
-    for column, model in enumerate(MODEL_ORDER):
-        draw_summary(figure.add_subplot(grid[1, column]), rows[model], model)
+    for row_index, model in enumerate(MODEL_ORDER, start=1):
+        draw_summary(figure.add_subplot(grid[row_index, :]), rows[model], model)
 
     figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
     output = args.output or (
         args.analysis_dir / "comparison_figures" /
-        f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_compact.pdf"
+        f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_paper.pdf"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(output, bbox_inches="tight")

@@ -12,6 +12,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "mathtext.fontset": "dejavusans",
+})
+
 from policy_value_concrete_example import ROOT, instantiate, load_config
 
 
@@ -46,7 +51,8 @@ def metric_text(row: pd.Series) -> str:
         f"Behavior:  A: {action_a} ({probability_a:.3f})   |   "
         f"B: {action_b} ({probability_b:.3f})\n"
         rf"$\hat{{V}}_1(s_0^A)={row['predicted_value_a']:.2f}$"
-        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$\n"
+        rf"   |   $\hat{{V}}_1(s_0^B)={row['predicted_value_b']:.2f}$"
+        "\n"
         f"Z-scored RMS:  policy: "
         f"{row['policy_rep_zscored_rms_distance']:.3f}   |   "
         f"value: {row['value_rep_zscored_rms_distance']:.3f}"
@@ -162,11 +168,7 @@ def main() -> None:
     for column, model in enumerate(MODEL_ORDER):
         draw_summary(figure.add_subplot(grid[1, column]), rows[model], model)
 
-    family = states[0].get("family", "unknown").replace("_", " ").title()
-    figure.suptitle(
-        f"Policy–value asymmetry · Pair {args.pair_id:02d} · {family} · seed {args.seed}",
-        fontsize=20, fontweight="bold",
-    )
+    figure.subplots_adjust(top=.97, bottom=.04, left=.03, right=.97)
     output = args.output or (
         args.analysis_dir / "comparison_figures" /
         f"pair{args.pair_id:02d}_cec_vs_dcec_{args.num_envs}_seed{args.seed}_compact.png"

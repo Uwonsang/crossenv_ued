@@ -152,7 +152,10 @@ def main() -> None:
     state_images = [render_state(config, state, args.horizon) for state in states]
 
     # Each map is followed by two model-colored behavior lines.
-    paper_size = (12.0, 5.3)
+    # A near-square column keeps the two 7x7 maps close together.  With a
+    # 12-inch-wide figure, imshow preserves its square aspect and leaves large
+    # horizontal gaps inside each subplot regardless of GridSpec.wspace.
+    paper_size = (9.0, 5.3)
     figure = plt.figure(figsize=paper_size)
     grid = figure.add_gridspec(
         2, 2, height_ratios=(3.2, .65), hspace=.08, wspace=.02

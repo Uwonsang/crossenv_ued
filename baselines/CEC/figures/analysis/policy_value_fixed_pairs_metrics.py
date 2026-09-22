@@ -11,6 +11,7 @@ from policy_value_concrete_example import (
     add_dataset_normalized_distances,
     checkpoint_path,
     compute_cka_rows,
+    compute_rsa_rows,
     evaluate_checkpoint,
     load_config,
     parse_model_spec,
@@ -115,9 +116,11 @@ def main() -> None:
             raise RuntimeError(f"No usable checkpoint found for {pair_file}")
 
         cka_rows = compute_cka_rows(rows)
+        rsa_rows = compute_rsa_rows(rows)
         add_dataset_normalized_distances(rows)
         write_csv(output_dir / "concrete_example_metrics.csv", rows)
         write_csv(output_dir / "concrete_example_cka.csv", cka_rows)
+        write_csv(output_dir / "concrete_example_rsa.csv", rsa_rows)
         print(f"Saved fixed-pair metrics to {output_dir}")
 
 

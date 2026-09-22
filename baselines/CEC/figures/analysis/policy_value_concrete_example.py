@@ -488,6 +488,159 @@ def linear_cka(left, right):
     return float(cross / denominator) if denominator > 0 else float("nan")
 
 
+def average_ranks(values):
+    """Return one-based average ranks, including ties, without SciPy."""
+    values = np.asarray(values)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=np.float64)
+    start = 0
+    while start < len(values):
+        stop = start + 1
+        while stop < len(values) and values[order[stop]] == values[order[start]]:
+            stop += 1
+        ranks[order[start:stop]] = .5 * (start + stop - 1) + 1
+        start = stop
+    return ranks
+
+
+def spearman_rsa(left, right):
+    """Spearman correlation between two vectorized dissimilarity matrices."""
+    left, right = np.asarray(left), np.asarray(right)
+    valid = np.isfinite(left) & np.isfinite(right)
+    if valid.sum() < 2:
+        return float("nan")
+    left_rank = average_ranks(left[valid])
+    right_rank = average_ranks(right[valid])
+    if left_rank.std() == 0 or right_rank.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
+def upper_triangle(matrix):
+    indices = np.triu_indices(matrix.shape[0], k=1)
+    return np.asarray(matrix)[indices]
+
+
+def cosine_rdm(features):
+    """Pairwise cosine-distance representational dissimilarity matrix."""
+    features = np.asarray(features, dtype=np.float64)
+    norms = np.linalg.norm(features, axis=1)
+    denominator = np.outer(norms, norms)
+    similarities = np.divide(
+        features @ features.T, denominator,
+        out=np.full_like(denominator, np.nan), where=denominator > 0,
+    )
+    result = 1 - np.clip(similarities, -1, 1)
+    np.fill_diagonal(result, 0)
+    return result
+
+
+def zscore_features(features):
+    features = np.asarray(features, dtype=np.float64)
+    std = features.std(axis=0)
+    safe_std = np.where(std > 1e-8, std, 1.0)
+    return (features - features.mean(axis=0)) / safe_std
+
+
+def rms_rdm(features):
+    """Pairwise RMS Euclidean distance matrix for already standardized features."""
+    features = np.asarray(features, dtype=np.float64)
+    differences = features[:, None, :] - features[None, :, :]
+    return np.sqrt(np.mean(np.square(differences), axis=-1))
+
+
+def js_rdm(probabilities):
+    """Pairwise Jensen-Shannon divergence matrix in nats."""
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    count = len(probabilities)
+    result = np.zeros((count, count), dtype=np.float64)
+    for left_index in range(count):
+        for right_index in range(left_index + 1, count):
+            distance = js_divergence(
+                probabilities[left_index], probabilities[right_index]
+            )
+            result[left_index, right_index] = distance
+            result[right_index, left_index] = distance
+    return result
+
+
+def compute_rsa_rows(rows):
+    """Compute checkpoint-wise RSA using all fixed A/B states in a layout."""
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(row["model"], row["num_envs"], row["seed"])].append(row)
+
+    summaries = []
+    for (model, num_envs, seed), group in grouped.items():
+        group = sorted(group, key=lambda row: row["pair_id"])
+        policy_a = np.stack([row["_policy_rep_a"] for row in group])
+        policy_b = np.stack([row["_policy_rep_b"] for row in group])
+        value_a = np.stack([row["_value_rep_a"] for row in group])
+        value_b = np.stack([row["_value_rep_b"] for row in group])
+        policy = np.concatenate((policy_a, policy_b), axis=0)
+        value = np.concatenate((value_a, value_b), axis=0)
+        probabilities = np.asarray([
+            [row[f"prob_{action.lower()}_a"] for action in ACTION_NAMES]
+            for row in group
+        ] + [
+            [row[f"prob_{action.lower()}_b"] for action in ACTION_NAMES]
+            for row in group
+        ])
+        returns = np.asarray(
+            [row["mc_return_a"] for row in group]
+            + [row["mc_return_b"] for row in group],
+            dtype=np.float64,
+        )
+        behavior_vector = upper_triangle(js_rdm(probabilities))
+        return_vector = upper_triangle(np.abs(returns[:, None] - returns[None, :]))
+
+        z_policy = zscore_features(policy)
+        z_value = zscore_features(value)
+        count = len(group)
+        rdms = {
+            "cosine": (cosine_rdm(policy), cosine_rdm(value)),
+            "zscored_rms": (rms_rdm(z_policy), rms_rdm(z_value)),
+        }
+        for distance_metric, (policy_rdm, value_rdm) in rdms.items():
+            policy_vector = upper_triangle(policy_rdm)
+            value_vector = upper_triangle(value_rdm)
+            policy_behavior = spearman_rsa(policy_vector, behavior_vector)
+            policy_return = spearman_rsa(policy_vector, return_vector)
+            value_behavior = spearman_rsa(value_vector, behavior_vector)
+            value_return = spearman_rsa(value_vector, return_vector)
+            policy_selectivity = policy_behavior - policy_return
+            value_selectivity = value_return - value_behavior
+            summaries.append({
+                "model": model,
+                "num_envs": num_envs,
+                "seed": seed,
+                "pairs": count,
+                "states": len(policy),
+                "rdm_entries": len(policy_vector),
+                "distance_metric": distance_metric,
+                "correlation": "spearman",
+                "behavior_distance": "jensen_shannon_nats",
+                "return_distance": "absolute_mc_return_difference",
+                "policy_value_rsa": spearman_rsa(policy_vector, value_vector),
+                "policy_a_b_rsa": spearman_rsa(
+                    upper_triangle(policy_rdm[:count, :count]),
+                    upper_triangle(policy_rdm[count:, count:]),
+                ),
+                "value_a_b_rsa": spearman_rsa(
+                    upper_triangle(value_rdm[:count, :count]),
+                    upper_triangle(value_rdm[count:, count:]),
+                ),
+                "policy_behavior_rsa": policy_behavior,
+                "policy_return_rsa": policy_return,
+                "value_behavior_rsa": value_behavior,
+                "value_return_rsa": value_return,
+                "policy_behavior_minus_return": policy_selectivity,
+                "value_return_minus_behavior": value_selectivity,
+                "rsa_asymmetry_score": policy_selectivity + value_selectivity,
+            })
+    return summaries
+
+
 def compute_cka_rows(rows):
     """Compute per-checkpoint CKA over the fixed, pair-aligned state set."""
     grouped = defaultdict(list)
@@ -898,6 +1051,7 @@ def main():
     if not rows:
         raise RuntimeError("No usable checkpoint was found")
     cka_rows = compute_cka_rows(rows)
+    rsa_rows = compute_rsa_rows(rows)
     add_dataset_normalized_distances(rows)
     with (args.output_dir / "concrete_example_metrics.csv").open(
         "w", newline="", encoding="utf-8"
@@ -911,6 +1065,12 @@ def main():
         writer = csv.DictWriter(file, fieldnames=list(cka_rows[0]))
         writer.writeheader()
         writer.writerows(cka_rows)
+    with (args.output_dir / "concrete_example_rsa.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=list(rsa_rows[0]))
+        writer.writeheader()
+        writer.writerows(rsa_rows)
     model_filtered = [row for row in rows if row["passes_concrete_example"]]
     with (args.output_dir / "concrete_example_model_filtered.csv").open(
         "w", newline="", encoding="utf-8"

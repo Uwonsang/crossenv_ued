@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from policy_value_fixed_pairs_metrics import save_rsa_figures
+
 
 FAMILY_ORDER = (
     "asymm_advantages",
@@ -79,6 +81,25 @@ def load_cka(input_dir: Path) -> pd.DataFrame:
         axis=1,
     )
     return frame
+
+
+def plot_saved_rsa(input_dir: Path) -> int:
+    """Regenerate per-layout RSA figures from already evaluated CSV files."""
+    count = 0
+    for family_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
+        rsa_path = family_dir / "concrete_example_rsa.csv"
+        if not rsa_path.is_file():
+            continue
+        rows = pd.read_csv(rsa_path).to_dict(orient="records")
+        if not rows:
+            continue
+        save_rsa_figures(rows, family_dir, family_dir.name)
+        count += 1
+    if count == 0:
+        raise FileNotFoundError(
+            f"No layout-level concrete_example_rsa.csv files found under {input_dir}"
+        )
+    return count
 
 
 def ordered_layouts(frame: pd.DataFrame) -> list[str]:
@@ -561,7 +582,12 @@ def main() -> None:
     plot_seed_layout_correlations(correlation_summary, common_pair_frame, output_dir)
     plot_cka(cka_frame, output_dir)
     plot_filter_rates(frame, output_dir)
+    try:
+        rsa_layout_count = plot_saved_rsa(input_dir)
+    except FileNotFoundError as error:
+        parser.error(str(error))
     print(f"Loaded {len(frame)} evaluations from {input_dir}")
+    print(f"Regenerated RSA figures for {rsa_layout_count} layouts")
     print(f"Saved large-scale PNG figures to {output_dir}")
 
 

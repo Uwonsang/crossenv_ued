@@ -36,11 +36,29 @@ FAMILY_LABELS = {
 
 
 def js_divergence(left, right):
+    # Policy probabilities arrive as float32. For extremely confident
+    # policies, multiplying a positive subnormal probability by 0.5 can
+    # underflow to zero before the logarithm. Compute the divergence in
+    # float64 and use log differences to keep every positive mixture entry
+    # representable.
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    left = np.clip(left, 0.0, None)
+    right = np.clip(right, 0.0, None)
+    left_sum, right_sum = left.sum(), right.sum()
+    if left_sum <= 0.0 or right_sum <= 0.0:
+        raise ValueError("Policy probabilities must have positive mass")
+    left = left / left_sum
+    right = right / right_sum
     midpoint = .5 * (left + right)
     left_mask, right_mask = left > 0, right > 0
     return float(.5 * (
-        np.sum(left[left_mask] * np.log(left[left_mask] / midpoint[left_mask]))
-        + np.sum(right[right_mask] * np.log(right[right_mask] / midpoint[right_mask]))
+        np.sum(left[left_mask] * (
+            np.log(left[left_mask]) - np.log(midpoint[left_mask])
+        ))
+        + np.sum(right[right_mask] * (
+            np.log(right[right_mask]) - np.log(midpoint[right_mask])
+        ))
     ))
 
 

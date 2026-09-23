@@ -22,7 +22,10 @@ REQUIRED_COLUMNS = {
     "chance_accuracy",
 }
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#0072B2"}
-BATCH_LABELS = {32: "8K", 64: "16K", 128: "32K", 256: "65K"}
+MODEL_ORDER = ("CEC", "CEC_IDAAC")
+MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
+DEFAULT_NUM_ENVS = (32, 64, 128, 256)
+DEFAULT_MODEL_ROOT = Path("/mnt/nas/wonsang/crossenv_ued/models/ICRL")
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,9 +33,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--input",
         type=Path,
-        nargs="+",
-        required=True,
-        help="One or more environment_probe_*.csv files.",
+        nargs="*",
+        help=(
+            "Explicit environment_probe_*.csv files. When omitted, files are "
+            "discovered from --input-dir."
+        ),
+    )
+    parser.add_argument("--model-root", type=Path, default=DEFAULT_MODEL_ROOT)
+    parser.add_argument(
+        "--input-dir", type=Path,
+        help=(
+            "Probe CSV directory. Defaults to "
+            "<model-root>/analysis/representation_probe."
+        ),
+    )
+    parser.add_argument(
+        "--representation", choices=("actor", "value"), default="actor"
+    )
+    parser.add_argument(
+        "--num-envs", nargs="+", type=int, default=list(DEFAULT_NUM_ENVS)
+    )
+    parser.add_argument(
+        "--models", nargs="+", choices=("cec", "dcec"),
+        default=["cec", "dcec"],
     )
     parser.add_argument(
         "--output",
@@ -43,6 +66,30 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     return parser.parse_args()
+
+
+def discover_inputs(args: argparse.Namespace) -> list[Path]:
+    if args.input:
+        return [path.expanduser() for path in args.input]
+    input_dir = (
+        args.input_dir.expanduser()
+        if args.input_dir is not None
+        else args.model_root.expanduser() / "analysis" / "representation_probe"
+    )
+    representation_prefix = "" if args.representation == "actor" else "value_"
+    paths = [
+        input_dir
+        / f"environment_probe_{representation_prefix}{model}_{num_envs}.csv"
+        for model in args.models
+        for num_envs in args.num_envs
+    ]
+    available = [path for path in paths if path.is_file()]
+    missing = [path.name for path in paths if not path.is_file()]
+    if missing:
+        print("Missing probe CSVs: " + ", ".join(missing))
+    if not available:
+        raise FileNotFoundError(f"No matching probe CSVs found under {input_dir}")
+    return available
 
 
 def load_seed_means(paths: list[Path]) -> tuple[pd.DataFrame, float, str]:
@@ -85,64 +132,59 @@ def load_seed_means(paths: list[Path]) -> tuple[pd.DataFrame, float, str]:
     return seed_means, float(chance_values[0]), str(representations[0])
 
 
-def display_label(model_label: str, num_envs: int) -> str:
-    batch = BATCH_LABELS.get(num_envs, f"{num_envs} envs")
-    return f"{model_label}\n({batch})"
-
-
 def plot(
     seed_means: pd.DataFrame, chance: float, representation: str,
     output_stem: Path,
 ) -> None:
-    groups = list(
-        seed_means.groupby(
-            ["model", "model_label", "model_num_envs"], sort=False
-        )
-    )
-    if not groups:
+    if seed_means.empty:
         raise ValueError("No model results to plot")
+    num_envs_values = sorted(seed_means["model_num_envs"].astype(int).unique())
+    present_models = set(seed_means["model"].astype(str))
+    models = [model for model in MODEL_ORDER if model in present_models]
+    models.extend(sorted(present_models - set(models)))
+    x = np.arange(len(num_envs_values), dtype=float)
+    width = 0.72 / max(len(models), 1)
 
-    fig, ax = plt.subplots(figsize=(7.2, 5.6))
+    fig_width = max(8.5, 1.65 * len(num_envs_values) + 3.0)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.8))
     rng = np.random.default_rng(42)
-    for x, ((model, model_label, num_envs), group) in enumerate(groups):
-        values = group["accuracy"].to_numpy(dtype=float)
-        mean = float(values.mean())
-        sem = (
-            float(values.std(ddof=1) / np.sqrt(len(values)))
-            if len(values) > 1
-            else 0.0
-        )
+    for model_index, model in enumerate(models):
         color = MODEL_COLORS.get(model, "#777777")
-        ax.bar(
-            x,
-            mean,
-            width=0.58,
-            color=color,
-            alpha=0.35,
-            edgecolor=color,
-            linewidth=1.8,
-            zorder=1,
-        )
-        ax.errorbar(
-            x, mean, yerr=sem, color=color, linewidth=2.0, capsize=5, zorder=3
-        )
-        jitter = rng.uniform(-0.075, 0.075, len(values))
-        ax.scatter(
-            x + jitter,
-            values,
-            s=58,
-            color=color,
-            edgecolor="white",
-            linewidth=0.7,
-            zorder=4,
-        )
+        offset = (model_index - (len(models) - 1) / 2) * width
+        label_added = False
+        for env_index, num_envs in enumerate(num_envs_values):
+            group = seed_means[
+                (seed_means["model"] == model)
+                & (seed_means["model_num_envs"] == num_envs)
+            ]
+            if group.empty:
+                continue
+            values = group["accuracy"].to_numpy(dtype=float)
+            mean = float(values.mean())
+            sem = (
+                float(values.std(ddof=1) / np.sqrt(len(values)))
+                if len(values) > 1 else 0.0
+            )
+            position = x[env_index] + offset
+            ax.bar(
+                position, mean, width=width * .9, color=color, alpha=.42,
+                edgecolor=color, linewidth=1.8, zorder=1,
+                label=MODEL_LABELS.get(model, model) if not label_added else None,
+            )
+            label_added = True
+            ax.errorbar(
+                position, mean, yerr=sem, color=color, linewidth=2.0,
+                capsize=5, zorder=3,
+            )
+            jitter = rng.uniform(-width * .16, width * .16, len(values))
+            ax.scatter(
+                position + jitter, values, s=48, color=color,
+                edgecolor="white", linewidth=.7, zorder=4,
+            )
 
-    labels = [
-        display_label(str(model_label), int(num_envs))
-        for (model, model_label, num_envs), _ in groups
-    ]
-    ax.set_xticks(np.arange(len(groups)))
-    ax.set_xticklabels(labels)
+    ax.set_xticks(x)
+    ax.set_xticklabels([str(value) for value in num_envs_values])
+    ax.set_xlabel("Number of Training Environments")
     ax.axhline(
         chance,
         color="#555555",
@@ -159,7 +201,7 @@ def plot(
     )
     ax.grid(axis="y", alpha=0.25)
     ax.set_axisbelow(True)
-    ax.legend(frameon=False, loc="upper right")
+    ax.legend(frameon=False, loc="upper center", ncol=len(models) + 1)
     fig.tight_layout()
 
     output_stem.parent.mkdir(parents=True, exist_ok=True)
@@ -172,11 +214,15 @@ def plot(
 
 def main() -> None:
     args = parse_args()
-    inputs = [path.expanduser() for path in args.input]
+    try:
+        inputs = discover_inputs(args)
+    except FileNotFoundError as error:
+        raise SystemExit(str(error)) from error
     output_stem = (
         args.output.expanduser()
         if args.output is not None
-        else inputs[0].parent / "environment_probe_comparison"
+        else inputs[0].parent
+        / f"environment_probe_{args.representation}_by_num_envs"
     )
     seed_means, chance, representation = load_seed_means(inputs)
     plot(seed_means, chance, representation, output_stem)

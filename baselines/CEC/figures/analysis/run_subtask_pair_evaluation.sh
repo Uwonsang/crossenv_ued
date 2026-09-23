@@ -7,13 +7,17 @@ MODEL_ROOT="${1:-/app/nas/models/ICRL}"
 
 cd "${REPO_ROOT}"
 
-families=(
-  asymm_advantages
-  coord_ring
-  counter_circuit
-  forced_coord
-  cramped_room
-)
+if (( $# > 1 )); then
+  families=("${@:2}")
+else
+  families=(
+    asymm_advantages
+    coord_ring
+    counter_circuit
+    forced_coord
+    cramped_room
+  )
+fi
 
 for family in "${families[@]}"; do
   echo "[subtask evaluation] family=${family}"

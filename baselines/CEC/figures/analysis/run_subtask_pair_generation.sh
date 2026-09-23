@@ -9,13 +9,17 @@ PAIRS_PER_SUBTASK="${PAIRS_PER_SUBTASK:-50}"
 
 cd "${REPO_ROOT}"
 
-families=(
-  asymm_advantages
-  coord_ring
-  counter_circuit
-  forced_coord
-  cramped_room
-)
+if (( $# > 1 )); then
+  families=("${@:2}")
+else
+  families=(
+    asymm_advantages
+    coord_ring
+    counter_circuit
+    forced_coord
+    cramped_room
+  )
+fi
 
 for family in "${families[@]}"; do
   echo "[subtask consistency] family=${family}"

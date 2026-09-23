@@ -11,8 +11,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from policy_value_fixed_pairs_metrics import save_rsa_figures
-
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_GENERALIZATION_DIR = REPOSITORY_ROOT / "artifacts" / "generalization_gap"
@@ -130,6 +128,8 @@ def load_rsa(input_dir: Path) -> pd.DataFrame:
 
 def plot_saved_rsa(input_dir: Path) -> int:
     """Regenerate per-layout RSA figures from already evaluated CSV files."""
+    from policy_value_fixed_pairs_metrics import save_rsa_figures
+
     count = 0
     for family_dir in sorted(path for path in input_dir.iterdir() if path.is_dir()):
         rsa_path = family_dir / "concrete_example_rsa.csv"
@@ -170,6 +170,210 @@ def mean_sem_by_seed(
     count = grouped.count().reindex(layouts)
     sem = (grouped.std().reindex(layouts) / np.sqrt(count)).fillna(0)
     return mean.to_numpy(), sem.to_numpy()
+
+
+def action_consistency_by_seed(frame: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate matched-pair behavior consistency within each checkpoint."""
+    data = frame.copy()
+    data["action_agreement"] = as_rate(data["argmax_same"])
+    return data.groupby(
+        ["series", "model", "num_envs", "layout", "seed"], as_index=False
+    ).agg(
+        pairs=("pair_id", "nunique"),
+        mean_policy_js_nats=("policy_js_nats", "mean"),
+        action_agreement=("action_agreement", "mean"),
+    )
+
+
+def summarize_action_consistency(seed_frame: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    keys = ["series", "model", "num_envs", "layout"]
+    for group_key, subset in seed_frame.groupby(keys, sort=False):
+        series, model, num_envs, layout = group_key
+        row = {
+            "series": series,
+            "model": model,
+            "num_envs": int(num_envs),
+            "layout": layout,
+            "seeds": int(subset["seed"].nunique()),
+            "mean_pairs_per_seed": float(subset["pairs"].mean()),
+        }
+        for metric in ("mean_policy_js_nats", "action_agreement"):
+            values = subset[metric].to_numpy(dtype=float)
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_sem"] = (
+                float(values.std(ddof=1) / np.sqrt(len(values)))
+                if len(values) > 1 else 0.0
+            )
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def aggregate_action_consistency_across_layouts(
+    seed_frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Give each held-out layout equal weight within every checkpoint seed."""
+    keys = ["series", "model", "num_envs", "seed"]
+    aggregate_by_seed = seed_frame.groupby(keys, as_index=False).agg(
+        layouts=("layout", "nunique"),
+        pairs=("pairs", "sum"),
+        mean_policy_js_nats=("mean_policy_js_nats", "mean"),
+        action_agreement=("action_agreement", "mean"),
+    )
+    rows = []
+    for group_key, subset in aggregate_by_seed.groupby(
+        ["series", "model", "num_envs"], sort=False
+    ):
+        series, model, num_envs = group_key
+        row = {
+            "series": series,
+            "model": model,
+            "num_envs": int(num_envs),
+            "seeds": int(subset["seed"].nunique()),
+            "mean_layouts_per_seed": float(subset["layouts"].mean()),
+            "mean_pairs_per_seed": float(subset["pairs"].mean()),
+        }
+        for metric in ("mean_policy_js_nats", "action_agreement"):
+            values = subset[metric].to_numpy(dtype=float)
+            row[f"{metric}_mean"] = float(values.mean())
+            row[f"{metric}_sem"] = (
+                float(values.std(ddof=1) / np.sqrt(len(values)))
+                if len(values) > 1 else 0.0
+            )
+        rows.append(row)
+    return aggregate_by_seed, pd.DataFrame(rows)
+
+
+def plot_action_consistency(
+    summary: pd.DataFrame, frame: pd.DataFrame, output_dir: Path
+) -> None:
+    """Create Figure 3(a): JS divergence and argmax-action agreement."""
+    requested_order = (
+        "asymm_advantages", "counter_circuit", "coord_ring",
+        "forced_coord", "cramped_room",
+    )
+    present = set(summary["layout"])
+    layouts = [layout for layout in requested_order if layout in present]
+    series_names = ordered_series(frame)
+    x = np.arange(len(layouts))
+    width = .8 / len(series_names)
+    metrics = (
+        ("mean_policy_js_nats", "Policy JS divergence (nats)"),
+        ("action_agreement", "Action agreement"),
+    )
+    with plt.rc_context(PAPER_RC):
+        figure, axes = plt.subplots(1, 2, figsize=(20.0, 5.694), squeeze=False)
+        for axis, (metric, ylabel) in zip(axes[0], metrics):
+            for offset, series in enumerate(series_names):
+                subset = summary[summary["series"] == series].set_index(
+                    "layout"
+                ).reindex(layouts)
+                positions = x + (offset - (len(series_names) - 1) / 2) * width
+                model_values = subset["model"].dropna()
+                model = model_values.iloc[0] if len(model_values) else series
+                label = series.rsplit(" (", 1)[0]
+                axis.bar(
+                    positions,
+                    subset[f"{metric}_mean"],
+                    width=width,
+                    yerr=subset[f"{metric}_sem"],
+                    capsize=3,
+                    color=MODEL_COLORS.get(model, ".5"),
+                    edgecolor="black",
+                    linewidth=.5,
+                    label=label,
+                )
+            axis.set_xticks(x)
+            axis.set_xticklabels([
+                FAMILY_ABBREVIATIONS.get(layout, layout) for layout in layouts
+            ])
+            axis.set_ylabel(ylabel)
+            axis.grid(axis="y", alpha=.25)
+        axes[0, 1].set_ylim(0, 1.05)
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        figure.legend(
+            handles, labels, loc="upper center", bbox_to_anchor=(.5, .99),
+            ncol=max(1, len(labels)), frameon=False,
+        )
+        figure.tight_layout(rect=(0, 0, 1, .86), w_pad=2.0)
+        figure.savefig(
+            output_dir / "action_distribution_consistency.pdf",
+            bbox_inches="tight", pad_inches=0,
+        )
+        figure.savefig(
+            output_dir / "action_distribution_consistency_by_layout.pdf",
+            bbox_inches="tight", pad_inches=0,
+        )
+        plt.close(figure)
+
+
+def plot_aggregate_action_consistency(
+    summary: pd.DataFrame, output_dir: Path
+) -> None:
+    """Plot the equal-layout aggregate used for the main consistency result."""
+    series_names = [
+        series for series in ordered_series(summary)
+        if series in set(summary["series"])
+    ]
+    metrics = (
+        ("mean_policy_js_nats", "Policy JS divergence (nats)"),
+        ("action_agreement", "Action agreement"),
+    )
+    x = np.arange(len(series_names))
+    with plt.rc_context(PAPER_RC):
+        figure, axes = plt.subplots(1, 2, figsize=(13.0, 5.694), squeeze=False)
+        for axis, (metric, ylabel) in zip(axes[0], metrics):
+            means, sems, colors, labels = [], [], [], []
+            for series in series_names:
+                row = summary[summary["series"] == series].iloc[0]
+                means.append(float(row[f"{metric}_mean"]))
+                sems.append(float(row[f"{metric}_sem"]))
+                colors.append(MODEL_COLORS.get(row["model"], ".5"))
+                labels.append(series.rsplit(" (", 1)[0])
+            axis.bar(
+                x, means, yerr=sems, capsize=4, width=.62,
+                color=colors, edgecolor="black", linewidth=.6,
+            )
+            axis.set_xticks(x)
+            axis.set_xticklabels(labels)
+            axis.set_ylabel(ylabel)
+            axis.grid(axis="y", alpha=.25)
+        axes[0, 1].set_ylim(0, 1.05)
+        figure.tight_layout(w_pad=2.0)
+        figure.savefig(
+            output_dir / "action_distribution_consistency_aggregate.pdf",
+            bbox_inches="tight", pad_inches=0,
+        )
+        plt.close(figure)
+
+
+def save_action_consistency_outputs(
+    frame: pd.DataFrame, output_dir: Path
+) -> pd.DataFrame:
+    """Save Figure 3(a) data/plots and return its common-pair frame."""
+    common_pair_frame = retain_common_pairs(frame)
+    action_seed_summary = action_consistency_by_seed(common_pair_frame)
+    action_summary = summarize_action_consistency(action_seed_summary)
+    action_aggregate_by_seed, action_aggregate_summary = (
+        aggregate_action_consistency_across_layouts(action_seed_summary)
+    )
+    action_seed_summary.to_csv(
+        output_dir / "action_distribution_consistency_by_seed.csv", index=False
+    )
+    action_summary.to_csv(
+        output_dir / "action_distribution_consistency_summary.csv", index=False
+    )
+    action_aggregate_by_seed.to_csv(
+        output_dir / "action_distribution_consistency_aggregate_by_seed.csv",
+        index=False,
+    )
+    action_aggregate_summary.to_csv(
+        output_dir / "action_distribution_consistency_aggregate_summary.csv",
+        index=False,
+    )
+    plot_action_consistency(action_summary, common_pair_frame, output_dir)
+    plot_aggregate_action_consistency(action_aggregate_summary, output_dir)
+    return common_pair_frame
 
 
 def plot_layout_distances(
@@ -794,6 +998,13 @@ def main() -> None:
     parser.add_argument("--input-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
+        "--action-consistency-only", action="store_true",
+        help=(
+            "Only create JS-divergence/action-agreement CSVs and figures. "
+            "This also supports concrete-example directories without CKA/RSA CSVs."
+        ),
+    )
+    parser.add_argument(
         "--generalization-csv", type=Path,
         help=(
             "Run-level generalization_gap CSV for the original five Overcooked "
@@ -817,12 +1028,28 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     frame = load_metrics(input_dir)
+    action_required = {
+        "model", "num_envs", "seed", "pair_id", "policy_js_nats",
+        "argmax_same",
+    }
+    missing_action = sorted(action_required - set(frame.columns))
+    if missing_action:
+        parser.error(
+            "Missing action-consistency columns: " + ", ".join(missing_action)
+        )
+    if args.action_consistency_only:
+        save_action_consistency_outputs(frame, output_dir)
+        print(f"Loaded {len(frame)} evaluations from {input_dir}")
+        print(f"Saved action-consistency figures to {output_dir}")
+        return
+
     try:
         cka_frame = load_cka(input_dir)
     except FileNotFoundError as error:
         parser.error(str(error))
     required = {
         "model", "num_envs", "seed", "pair_id", "mc_return_delta_a_minus_b",
+        "policy_js_nats", "argmax_same",
         "policy_rep_cosine_distance", "value_rep_cosine_distance",
         "policy_rep_raw_euclidean_distance", "value_rep_raw_euclidean_distance",
         "policy_rep_zscored_euclidean_distance",
@@ -864,7 +1091,7 @@ def main() -> None:
         "Z-scored RMS distance",
     )
     plot_return_scatter(frame, output_dir)
-    common_pair_frame = retain_common_pairs(frame)
+    common_pair_frame = save_action_consistency_outputs(frame, output_dir)
     seed_correlations = seed_layout_correlations(common_pair_frame)
     correlation_summary = summarize_seed_correlations(
         seed_correlations, args.bootstrap_samples

@@ -290,7 +290,9 @@ def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
     return correlation(x_rank, y_rank)
 
 
-def resolve_generalization_csv(requested: Path | None) -> Path | None:
+def resolve_generalization_csv(
+    requested: Path | None, model_root: Path
+) -> Path | None:
     """Find the run-level results for the original five Overcooked layouts."""
     if requested is not None:
         requested = requested.expanduser()
@@ -302,10 +304,15 @@ def resolve_generalization_csv(requested: Path | None) -> Path | None:
         "generalization_gap_runs_[0-9]*m.csv",  # legacy final-window name
         "generalization_gap_runs_last_*.csv",
     )
-    for pattern in patterns:
-        matches = sorted(DEFAULT_GENERALIZATION_DIR.glob(pattern))
-        if matches:
-            return matches[-1]
+    search_directories = (
+        model_root.expanduser() / "artifacts" / "generalization_gap",
+        DEFAULT_GENERALIZATION_DIR,
+    )
+    for directory in search_directories:
+        for pattern in patterns:
+            matches = sorted(directory.glob(pattern))
+            if matches:
+                return matches[-1]
     return None
 
 
@@ -878,7 +885,9 @@ def main() -> None:
         parser.error(str(error))
 
     try:
-        generalization_csv = resolve_generalization_csv(args.generalization_csv)
+        generalization_csv = resolve_generalization_csv(
+            args.generalization_csv, args.model_root
+        )
     except FileNotFoundError as error:
         parser.error(str(error))
     if generalization_csv is None:

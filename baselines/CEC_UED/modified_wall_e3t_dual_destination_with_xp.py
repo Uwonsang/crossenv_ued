@@ -167,14 +167,14 @@ class ActorCriticRNN(nn.Module):
                 reshaped_obs = obs.reshape(-1, 5,5,4)
 
             embedding = nn.Conv(
-                features=64 if "9" in self.config['layout_name'] else 2 * self.config["FC_DIM_SIZE"],
+                features=64,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
             embedding = nn.Conv(
-                features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
+                features=32,
                 kernel_size=(2, 2),
                 kernel_init=orthogonal(np.sqrt(2)),
                 bias_init=constant(0.0),
@@ -194,7 +194,7 @@ class ActorCriticRNN(nn.Module):
         # )(embedding)
         # embedding = nn.relu(embedding)
         embedding = nn.Dense(
-            self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
+            self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
 

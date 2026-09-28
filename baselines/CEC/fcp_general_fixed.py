@@ -246,7 +246,10 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(
+    config, update_step=0, save_info=None, opt_state=None,
+    train_state_step=None,
+):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     
@@ -254,7 +257,12 @@ def make_train(config, update_step=0):
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    resume_update_step = (
+        0 if opt_state is not None
+        else update_step * (
+            config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"]
+        )
+    )
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -287,9 +295,11 @@ def make_train(config, update_step=0):
         human_proxy_params = load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
             int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+            layout_names=(layout_name,),
         )
 
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
 
     def linear_schedule(count):
         frac = (
@@ -300,7 +310,10 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return config["LR"] * frac
 
-    def train(rng, frozen_param_stack, model_params=None, update_step=0, num_stacked_params=1):
+    def train(
+        rng, frozen_param_stack, model_params=None,
+        resume_runner_state=None, num_stacked_params=1,
+    ):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         bc_network = BCPolicy()
@@ -335,12 +348,28 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )
+        if opt_state is not None:
+            train_state = train_state.replace(
+                opt_state=opt_state,
+                step=(
+                    train_state.step
+                    if train_state_step is None else train_state_step
+                ),
+            )
 
-        # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+        # INIT OR RESTORE ENV RUNNER STATE
+        if resume_runner_state is None:
+            rng, _rng = jax.random.split(rng)
+            reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+            init_hstate = ScannedRNN.initialize_carry(
+                config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+            )
+            rng, runner_rng = jax.random.split(rng)
+        else:
+            (
+                env_state, obsv, restored_done, init_hstate, runner_rng,
+            ) = resume_runner_state
 
         def eval_layout_xp_direction(eval_env, main_params, bc_params, eval_rng, main_agent_id):
             """Rolls out `main_params` (recurrent) paired against a human_proxy BC policy.
@@ -415,7 +444,7 @@ def make_train(config, update_step=0):
             return jax.vmap(_one_seed)(bc_params_stacked, seed_rngs).mean()
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused, frozen_param_stack=frozen_param_stack, num_stacked_params=num_stacked_params):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
@@ -744,7 +773,10 @@ def make_train(config, update_step=0):
                 if current_return > best_return[0]:
                     best_return[0] = current_return
                     os.makedirs(config['filepath'], exist_ok=True)
-                    ckpt_path = f"{config['filepath']}/fcp_seed{config['SEED']}_best.pkl"
+                    ckpt_path = (
+                        f"{config['filepath']}/"
+                        f"fcp_fixed_seed{config['SEED']}_best.pkl"
+                    )
                     with open(ckpt_path, "wb") as f:
                         pickle.dump({
                             'params': metric["params"],
@@ -760,6 +792,44 @@ def make_train(config, update_step=0):
             metric["params"] = train_state.params
 
             jax.experimental.io_callback(callback, None, metric)
+
+            def ckpt_callback(
+                params, opt_state_, tx_step, step, env_state_, last_obs_,
+                last_done_, hstate_, rng_,
+            ):
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(
+                    mid_ckpt_dir, "resume_ckpt.pkl"
+                )
+                tmp_ckpt_path = f"{mid_ckpt_path}.tmp"
+                with open(tmp_ckpt_path, "wb") as f:
+                    pickle.dump({
+                        "params": params,
+                        "opt_state": opt_state_,
+                        "tx_step": tx_step,
+                        "final_update_step": int(step) + 1,
+                        "wandb_run_id": wandb.run.id,
+                        "runner_state": (
+                            env_state_, last_obs_, last_done_, hstate_, rng_,
+                        ),
+                    }, f)
+                os.replace(tmp_ckpt_path, mid_ckpt_path)
+
+            is_scheduled_ckpt = jnp.equal(
+                update_steps % LOG_INTERVAL, 0
+            )
+            jax.lax.cond(
+                is_scheduled_ckpt,
+                lambda _: jax.experimental.io_callback(
+                    ckpt_callback, None,
+                    train_state.params, train_state.opt_state,
+                    train_state.step, update_steps, env_state, last_obs,
+                    last_done, hstate, rng, ordered=True,
+                ),
+                lambda _: None,
+                operand=None,
+            )
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)
             return (runner_state, update_steps), metric
@@ -771,12 +841,18 @@ def make_train(config, update_step=0):
             train_state,
             env_state,
             obsv,
-            jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
+            (
+                jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+                if resume_runner_state is None else restored_done
+            ),
             init_hstate,
-            _rng,
+            runner_rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step,
+            (runner_state, update_step),
+            jnp.arange(remaining_updates),
+            remaining_updates,
         )
         return {"runner_state": runner_state}
 
@@ -787,6 +863,7 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    config["model_name"] = "FCP_FIXED"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
         finetune_appendage = "_improved_finetuneIK"
@@ -807,24 +884,52 @@ def main(config):
 
     if config["ENV_NAME"] == "ToyCoop":
         run_name = (
-            f"FCP_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
+            f"FCP_FIXED_ToyCoop_ik{config['ENV_KWARGS']['random_reset']}"
             f"_seed{config['SEED']}"
         )
     else:
-        run_name = f"FCP_{config['ENV_KWARGS']['layout']}_{config['SEED']}"
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["IPPO", "RNN", "FCP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=run_name
-    )
-    filepath = f"ckpts/fcp/{config['ENV_NAME']}"
+        run_name = (
+            f"FCP_FIXED_{config['ENV_KWARGS']['layout']}_"
+            f"{config['SEED']}"
+        )
+    resume_xpid = config.get("RESUME_XPID", "")
+    active_xpid = resume_xpid if resume_xpid else save_xpid
+    filepath = f"ckpts/fcp_fixed/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
         filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
+    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{active_xpid}"
     config['filepath'] = filepath
+    config["MID_CKPT_DIR"] = os.path.join(
+        filepath, f"seed{config['SEED']}_mid_ckpts"
+    )
+    mid_ckpt_path = os.path.join(
+        config["MID_CKPT_DIR"], "resume_ckpt.pkl"
+    )
+    has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    mid_ckpt = None
+    wandb_resume_id = None
+    if has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            mid_ckpt = pickle.load(f)
+        wandb_resume_id = mid_ckpt.get("wandb_run_id")
+
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["IPPO", "RNN", "FCP", "FCP_FIXED"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=run_name
+        )
 
     #####################
     # Load frozen params
@@ -845,14 +950,26 @@ def main(config):
 
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
         # check if ckpt exists
-        if os.path.exists(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
+        if os.path.exists(f"{filepath}/fcp_fixed_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             print(f"filepath: {filepath}")
             exit(0)
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    resume_runner_state = None
+    resume_train_state_step = None
+    opt_state = None
+    if has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = mid_ckpt["params"]
+        opt_state = mid_ckpt.get("opt_state")
+        resume_train_state_step = mid_ckpt.get("tx_step")
+        resume_runner_state = mid_ckpt.get("runner_state")
+        final_update_step = int(mid_ckpt["final_update_step"])
+        rng = jax.random.PRNGKey(config["SEED"])
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/fcp_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        with open(f"{filepath}/fcp_fixed_seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             final_update_step = previous_ckpt['final_update_step']
@@ -884,7 +1001,7 @@ def main(config):
             ckpt_id_list = [0, 1, 3]
         elif config['ENV_KWARGS']['incentivize_strat'] == 3:
             ckpt_id_list = [1, 2, 3]
-        seed_list = range(6)
+        seed_list = [0, 1, 2, 3, 5, 6]
         CKPT_ROOT = Path(__file__).resolve().parents[2] / config['FCP_filepath']
         if config["ENV_NAME"] == "ToyCoop":
             custom_path = str(CKPT_ROOT)
@@ -892,18 +1009,14 @@ def main(config):
             custom_path = os.path.join(CKPT_ROOT, config['ENV_KWARGS']['layout'])
         for ckpt_id in ckpt_id_list:
             for ckpt_seed in seed_list:
-                print(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl")
-                if os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}{finetune_appendage}.pkl"
-                elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved.pkl"
-                elif os.path.exists(f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"):
-                    path_to_open = f"{filepath}/seed{ckpt_seed}_ckpt{ckpt_id}_improved_partial_obs.pkl"
-                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"):
-                    path_to_open = f"{custom_path}/seed{ckpt_seed}/seed{ckpt_seed}_{ckpt_id}.pkl"
-                elif os.path.exists(f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"):
-                    path_to_open = f"{custom_path}/seed{ckpt_seed}/fcp_pool/seed{ckpt_seed}_{ckpt_id}.pkl"
-                else:
+                path_to_open = (
+                    Path(custom_path)
+                    / f"seed{ckpt_seed}"
+                    / "fcp_pool"
+                    / f"seed{ckpt_seed}_{ckpt_id}.pkl"
+                )
+                print(f"Looking for FCP partner: {path_to_open}")
+                if not path_to_open.exists():
                     continue
                 with open(path_to_open, "rb") as f:
                     frozen_ckpt= pickle.load(f)
@@ -911,22 +1024,36 @@ def main(config):
     num_stacked_params = len(frozen_param_stack)
     frozen_param_stack = jax.tree.map(lambda *x: jnp.stack(x), *frozen_param_stack)
     
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, frozen_param_stack, model_params, final_update_step, num_stacked_params)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    rng = runner_state[-1]
+    save_info = {"filepath": filepath}
+    train_jit = jax.jit(
+        make_train(
+            config, final_update_step, save_info, opt_state,
+            resume_train_state_step,
+        ),
+        device=jax.devices()[0],
+    )
+    out = train_jit(
+        rng, frozen_param_stack, model_params, resume_runner_state,
+        num_stacked_params,
+    )
+    final_runner_state, final_update_step = out['runner_state']
+    model_state = final_runner_state[0]
+    rng = final_runner_state[-1]
     
     num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
         
     # save model
     os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl", "wb") as f:
+    final_checkpoint = (
+        f"{filepath}/seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}_fcp_fixed"
+        f"{finetune_appendage}_updates{num_updates}.pkl"
+    )
+    with open(final_checkpoint, "wb") as f:
         ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
         pickle.dump(ckpt, f)
 
-    print(f"Saved model to {filepath}/seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_fcp{finetune_appendage}_updates{num_updates}.pkl")
+    print(f"Saved model to {final_checkpoint}")
     print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
     print(f"--------------------------------")
     

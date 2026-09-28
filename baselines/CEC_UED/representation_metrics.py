@@ -374,7 +374,7 @@ def compute_minibatch_penultimate_metrics(
     as PPO. Time and actor axes are flattened only after features are computed;
     actors from the same environment remain separate rows.
     """
-    (_, _, _), intermediates = network.apply(
+    _, intermediates = network.apply(
         params,
         initial_hstate,
         network_inputs,
@@ -464,7 +464,7 @@ def compute_separate_trunk_penultimate_metrics(
     cutoff=0.01,
 ):
     """Measure actor/critic representations for independent recurrent trunks."""
-    (_, _, _), intermediates = network.apply(
+    _, intermediates = network.apply(
         params,
         initial_hstate,
         network_inputs,

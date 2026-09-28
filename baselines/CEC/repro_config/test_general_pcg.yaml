@@ -52,10 +52,15 @@
 "FCP": False
 "FCP_KWARGS":
   "train_oracle": True
-"MODEL_PATH": "/app/baselines_model"
-"SAVE_PATH": "/app/baselines/CEC/results/test_general_pcg"
+"MODEL_PATH": "/mnt/nas/wonsang/crossenv_ued/models/ICRL"
+"MODEL_NUM_ENVS": 256  # CEC and CEC_IDAAC checkpoint subdirectory
+"SAVE_PATH": "artifacts/test_general_pcg"
+"OUTPUT_DIR": null  # optional exact output directory
+"NUM_MODELS": 6
+"MODEL_SEEDS": null  # optional explicit checkpoint seed list
+"XP_ONLY": True
 # WandB Params
 "ENTITY": "overcooked_ai"                                          
 "PROJECT": "crossenv_ued"
 "WANDB_MODE" : "disabled" # disabled, online, offline
-"model_name": "IPPO" # CEC, E3T, FCP, IPPO
+"model_name": "IPPO" # CEC, CEC_Finetune, CEC_IDAAC, CEC_IDAAC_Finetune, E3T, FCP, FCP_Fixed, IPPO

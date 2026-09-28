@@ -236,3 +236,7 @@ Thumbs.db
 # stray screenshots / images at repo root
 /*.png
 /*.jpg
+
+# from gradient branch
+baselines/human_proxy/data/origin
+artifacts

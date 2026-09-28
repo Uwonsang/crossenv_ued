@@ -28,7 +28,7 @@ import functools
 from jax_tqdm import scan_tqdm
 import time
 import yaml
-from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy
+from algo_utils import make_eval_envs_overcooked, EVAL_LAYOUTS_9, load_human_proxy_params, BCPolicy, get_finetune_checkpoint_path
 
 from gradient_conflict_utils import (
     compute_layout_gradient_metrics,
@@ -678,8 +678,11 @@ def make_train(
             )
 
             run_eval = jnp.logical_or(
-                jnp.equal(update_steps % LOG_INTERVAL, 0),
-                jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+                jnp.logical_or(
+                    jnp.equal(update_steps % LOG_INTERVAL, 0),
+                    jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+                ),
+                jnp.equal(update_steps, update_step),
             )
 
             layout_gradient_window_steps = int(
@@ -843,6 +846,44 @@ def make_train(
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
+
+            # Save the small final checkpoint immediately after the final PPO
+            # update, before loss-surface snapshots, evaluation, WandB, and the
+            # larger resumable checkpoint can delay or interrupt finalization.
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+
+                def final_save_callback(params):
+                    ckpt_path = save_info["final_ckpt_path"]
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump({
+                            'key': save_info["rng"],
+                            'params': params,
+                            'update_steps': num_updates_total,
+                        }, f)
+                    print(f"Saved final model to {ckpt_path}")
+                    print(
+                        f"Finished training for seed {config['SEED']} with "
+                        f"ckpt {config['TRAIN_KWARGS']['ckpt_id']}"
+                        f"_updates{num_updates_total}"
+                    )
+                    print("--------------------------------")
+
+                is_last_step = jnp.equal(
+                    update_steps, num_updates_total - 1
+                )
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(
+                        final_save_callback,
+                        None,
+                        train_state.params,
+                        ordered=True,
+                    ),
+                    lambda _: None,
+                    operand=None,
+                )
 
             save_critic_loss_surface_snapshots(
                 completed_updates=update_steps + 1,
@@ -1129,6 +1170,7 @@ def make_train(
                 if (
                     step % LOG_INTERVAL == 0
                     or step == int(config["NUM_UPDATES"]) - 1
+                    or step == update_step
                 ):
                     log_dict = {
                         "update_step": step,
@@ -1210,44 +1252,18 @@ def make_train(
                         ),
                     }, f)
 
-            # Keep resume checkpoints aligned with WandB aggregation boundaries.
+            # Keep periodic checkpoints.
             save_ckpt_interval = LOG_INTERVAL
             if save_ckpt_interval > 0:
-                run_save_ckpt = jnp.equal(update_steps % save_ckpt_interval, 0)
+                is_scheduled_ckpt = jnp.equal(
+                    update_steps % save_ckpt_interval, 0
+                )
                 jax.lax.cond(
-                    run_save_ckpt,
+                    is_scheduled_ckpt,
                     lambda _: jax.experimental.io_callback(
                         ckpt_callback, None,
                         train_state.params, train_state.opt_state, train_state.step,
                         update_steps, env_state, last_obs, last_done, hstate, rng,
-                        ordered=True,
-                    ),
-                    lambda _: None,
-                    operand=None,
-                )
-
-            if save_info is not None:
-                num_updates_total = save_info["num_updates"]
-                def final_save_callback(params):
-                    fp = save_info["filepath"]
-                    prefix = save_info["fcp_prefix"]
-                    appendage = save_info["finetune_appendage"]
-                    rng_key = save_info["rng"]
-                    os.makedirs(fp, exist_ok=True)
-                    ckpt_path = f"{fp}/{prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{appendage}_updates{num_updates_total}.pkl"
-                    with open(ckpt_path, "wb") as f:
-                        pickle.dump({'key': rng_key, 'params': params, 'update_steps': num_updates_total}, f)
-                    print(f"Saved final model to {ckpt_path}")
-                    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates_total}")
-                    print("--------------------------------")
-
-                is_last_step = jnp.equal(update_steps, num_updates_total - 1)
-                jax.lax.cond(
-                    is_last_step,
-                    lambda _: jax.experimental.io_callback(
-                        final_save_callback,
-                        None,
-                        train_state.params,
                         ordered=True,
                     ),
                     lambda _: None,
@@ -1295,7 +1311,11 @@ def make_train(
 @hydra.main(version_base=None, config_path="config", config_name="ippo_overcooked_CEC_gradient")
 def main(config):
     config = OmegaConf.to_container(config)
-    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    xpid = (
+        f"envs{config['NUM_ENVS']}_"
+        f"mb{config['NUM_MINIBATCHES']}_"
+        f"lr-{time.strftime('%Y%m%d-%H%M%S')}"
+    )
 
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
@@ -1326,11 +1346,19 @@ def main(config):
     resume_xpid = config["RESUME_XPID"]
     active_xpid = resume_xpid if resume_xpid else xpid
 
-    filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
-    if config["ENV_NAME"] == "overcooked":
-        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
-    filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
-    filepath = f"{filepath_base}/{active_xpid}"
+    if config['TRAIN_KWARGS']['finetune']:
+        filepath = os.path.join(
+            "ckpts",
+            "ippo_finetune",
+            config['ENV_KWARGS']['layout'],
+            active_xpid,
+        )
+    else:
+        filepath_base = f"ckpts/ippo/{config['ENV_NAME']}"
+        if config["ENV_NAME"] == "overcooked":
+            filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+        filepath_base += f"/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}"
+        filepath = f"{filepath_base}/{active_xpid}"
     print(f"Working on: \n{filepath}\n")
 
     config['MID_CKPT_DIR'] = os.path.join(filepath, f"seed{config['SEED']}_mid_ckpts")
@@ -1364,9 +1392,25 @@ def main(config):
             name=f"CEC_gradient_{layout_name}_seed{config['SEED']}"
         )
 
+    num_updates = int(
+        config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
+    )
+    final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}"
+        f"_updates{num_updates}.pkl",
+    )
+    legacy_final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl",
+    )
     if not config['TRAIN_KWARGS']['overwrite_ckpt']:
-        # check if ckpt exists
-        if os.path.exists(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
+        if (
+            os.path.exists(final_ckpt_path)
+            or os.path.exists(legacy_final_ckpt_path)
+        ):
             print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
             exit(0)
 
@@ -1390,37 +1434,32 @@ def main(config):
             rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
 
     elif config['TRAIN_KWARGS']['finetune']:
-        finetune_filepath =f"ckpts/ippo/{config['ENV_NAME']}"
-        if config["ENV_NAME"] == "overcooked":
-            finetune_filepath += f"/cramped_room_9"
-        if config['FCP']:
-            finetune_filepath = f"{finetune_filepath}/ikFalse/{xpid}"
-            finetune_ckpt_num = 19 if config['ENV_NAME'] == 'ToyCoop' else 6
-        else:
-            finetune_filepath = f"{finetune_filepath}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/{xpid}"
-            finetune_ckpt_num = 29 if config['ENV_NAME'] == 'overcooked' else 19
-        print(f"Loading checkpoint for finetuning: {finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl")
-        with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{finetune_ckpt_num}_improved.pkl", "rb") as f:  # need to resume from last checkpoint
+        seed = int(config['SEED'])
+        finetune_checkpoint = get_finetune_checkpoint_path(
+            config['TRAIN_KWARGS']['finetune_checkpoint_root'],
+            seed,
+        )
+        print(f"Loading CEC-IPPO checkpoint for finetuning: {finetune_checkpoint}")
+        with open(finetune_checkpoint, "rb") as f:
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
             opt_state = None
-            # final_update_step = previous_ckpt['final_update_step']
             final_update_step = 0
-            rng = previous_ckpt['key']
-            rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
+            rng = jnp.asarray(previous_ckpt['key'], dtype=jnp.uint32)
+            rng, _rng = jax.random.split(rng)
     else:
         model_params = None
         opt_state = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
     save_info = {
         "filepath": filepath,
         "fcp_prefix": fcp_prefix,
         "finetune_appendage": finetune_appendage,
         "rng": rng,
         "num_updates": num_updates,
+        "final_ckpt_path": final_ckpt_path,
     }
 
     print(f"Starting from update step {final_update_step}")

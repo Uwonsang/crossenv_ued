@@ -26,6 +26,19 @@
 "ACTIVATION": "relu"
 "ANNEAL_LR": True
 "SEED": 0
+"RESUME_XPID": null  # 기존 lr-... 실행을 중간 체크포인트에서 재개할 때 지정
+"GRAD_CONFLICT_WINDOW_STEPS": 32
+"SHARPNESS":
+  "EPSILONS": [0.001, 0.0005]
+  "LBFGSB_MAXITER": 10
+  "NUM_ACTORS": 16
+  "NUM_STEPS": 400
+"CRITIC_LOSS_SURFACE":
+  "SNAPSHOT_FRACTIONS":
+    "early": 0.1
+    "middle": 0.5
+    "final": 1.0
+  "NUM_ACTORS": 16
 "ENV_KWARGS": 
   "random_reset" : False # relevant for which env to train/test on. If true, it is CEC, otherwise single task
   "max_steps": 400

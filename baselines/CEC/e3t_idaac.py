@@ -5,6 +5,7 @@ Note, this file will only work for MPE environments with homogenous agents (e.g.
 
 """
 import os
+import glob
 import pickle
 import jax
 import jax.numpy as jnp
@@ -13,7 +14,7 @@ import flax.linen as nn
 import numpy as np
 import optax
 from flax.linen.initializers import constant, orthogonal
-from typing import Sequence, NamedTuple, Any, Dict
+from typing import Sequence, NamedTuple, Dict
 from flax.training.train_state import TrainState
 import distrax
 import hydra
@@ -26,7 +27,6 @@ from jaxmarl.environments.overcooked.layouts import make_counter_circuit_9x9, ma
 
 import wandb
 import functools
-import pdb
 from jax_tqdm import scan_tqdm
 import yaml
 import time
@@ -40,6 +40,58 @@ from baselines.CEC.evaluation_rollout_utils import (
     evaluate_cross_play_layout,
     evaluate_self_play_layout,
 )
+from baselines.CEC_UED.evaluation_metrics import (
+    EVAL_CRITIC_STAT_NAMES,
+    add_evaluation_metrics_to_log_dict,
+    empty_evaluation_metrics,
+)
+from baselines.CEC_UED.value_diagnostics import compute_value_diagnostics
+from baselines.CEC_UED.representation_metrics import (
+    compute_optimizer_update_metrics,
+    compute_minibatch_penultimate_metrics,
+    empty_penultimate_metrics,
+    first_epoch_first_minibatch_indices,
+)
+from baselines.CEC_UED.sharpness import (
+    collect_final_sharpness_batch,
+    compute_keskar_sharpness,
+)
+from baselines.CEC_UED.critic_loss_surface import (
+    build_critic_loss_surface_settings,
+    save_critic_loss_surface_snapshots,
+)
+from baselines.CEC_UED.gradient_conflict_utils import (
+    compute_layout_gradient_metrics,
+    empty_layout_gradient_metrics,
+)
+
+
+LAYOUT_NAMES = tuple(EVAL_LAYOUTS_9)
+
+
+def _e3t_idaac_parameter_groups(config):
+    """Return parameter module names for the instantiated E3T-IDAAC model."""
+    shared_keys = ["Dense_0", "Dense_1", "ScannedRNN_0"]
+    if config["CONV_NET"]:
+        shared_keys = ["Conv_0", "Conv_1", *shared_keys]
+
+    if config["ENV_NAME"] == "overcooked":
+        actor_branch_keys = [f"Dense_{index}" for index in range(2, 12)]
+        value_branch_keys = [f"Dense_{index}" for index in range(12, 17)]
+    else:
+        actor_branch_keys = [f"Dense_{index}" for index in range(2, 11)]
+        value_branch_keys = [f"Dense_{index}" for index in range(11, 14)]
+
+    actor_branch_keys.extend(["advantage_output", "order_classifier_output"])
+    if config["IDAAC_USE_NONLINEAR_CLF"]:
+        actor_branch_keys.append("order_classifier_hidden")
+
+    shared_keys = tuple(shared_keys)
+    return (
+        (*shared_keys, *actor_branch_keys),
+        (*shared_keys, *value_branch_keys),
+        shared_keys,
+    )
 
 def initialize_environment(config):
     layout_name = config["ENV_KWARGS"]["layout"]
@@ -110,6 +162,48 @@ def initialize_environment(config):
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
     return env
 
+
+def _is_connected_jax(passable_9x9):
+    """Return whether all passable cells form one connected component."""
+    flat = passable_9x9.astype(jnp.float32).flatten()
+    visited = jnp.zeros_like(flat).at[jnp.argmax(flat)].set(1.0).reshape(9, 9)
+
+    def _spread(current, _):
+        neighbors = jnp.maximum(
+            jnp.maximum(
+                jnp.pad(current[1:], ((0, 1), (0, 0))),
+                jnp.pad(current[:-1], ((1, 0), (0, 0))),
+            ),
+            jnp.maximum(
+                jnp.pad(current[:, 1:], ((0, 0), (0, 1))),
+                jnp.pad(current[:, :-1], ((0, 0), (1, 0))),
+            ),
+        )
+        return (
+            passable_9x9.astype(jnp.float32)
+            * jnp.maximum(current, neighbors),
+            None,
+        )
+
+    visited, _ = jax.lax.scan(_spread, visited, None, 18)
+    return jnp.sum(visited) == jnp.sum(passable_9x9.astype(jnp.float32))
+
+
+def _classify_layout_jax(maze_map_9x9_ch0):
+    """Map a 9x9 Overcooked maze to its index in ``LAYOUT_NAMES``."""
+    passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
+    num_passable = passable.sum()
+    connected = _is_connected_jax(passable)
+    return jnp.where(
+        num_passable == 8,
+        2,
+        jnp.where(
+            num_passable == 6,
+            jnp.where(connected, 0, 4),
+            jnp.where(connected, 3, 1),
+        ),
+    ).astype(jnp.int32)
+
 class ScannedRNN(nn.Module):
     @functools.partial(
         nn.scan,
@@ -154,8 +248,24 @@ class ActorCriticRNN(nn.Module):
         detach_order_features=False,
     ):
         obs, dones, agent_positions = x
+        batch_size, num_envs, _ = obs.shape
+        collect_intermediates = (
+            not self.is_initializing()
+            and self.is_mutable_collection("intermediates")
+        )
+
+        def record_feature_norm(name, features):
+            if collect_intermediates:
+                feature_vectors = features.reshape(
+                    (batch_size, num_envs, -1)
+                )
+                self.sow(
+                    "intermediates",
+                    f"feature_norm_{name}",
+                    jnp.linalg.norm(feature_vectors, axis=-1),
+                )
+
         if self.config["CONV_NET"]:
-            batch_size, num_envs, flattened_obs_dim = obs.shape
             if self.config["ENV_NAME"] == "overcooked":
                 reshaped_obs = obs.reshape(-1, 9,9,26)
             else:
@@ -168,6 +278,7 @@ class ActorCriticRNN(nn.Module):
                 bias_init=constant(0.0),
             )(reshaped_obs)
             embedding = nn.relu(embedding)
+            record_feature_norm("shared_conv_0", embedding)
             embedding = nn.Conv(
                 features=32 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"],
                 kernel_size=(2, 2),
@@ -175,6 +286,7 @@ class ActorCriticRNN(nn.Module):
                 bias_init=constant(0.0),
             )(embedding)
             embedding = nn.relu(embedding)
+            record_feature_norm("shared_conv_1", embedding)
 
             embedding = embedding.reshape((batch_size, num_envs, -1))
         else:
@@ -184,6 +296,7 @@ class ActorCriticRNN(nn.Module):
             self.config["FC_DIM_SIZE"] * 2, kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
+        record_feature_norm("shared_dense_0", embedding)
         # embedding = nn.Dense(
         #     self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         # )(embedding)
@@ -192,9 +305,14 @@ class ActorCriticRNN(nn.Module):
             self.config["FC_DIM_SIZE"] * 2 if "9" in self.config['layout_name'] else self.config["FC_DIM_SIZE"], kernel_init=orthogonal(np.sqrt(2)), bias_init=constant(0.0)
         )(embedding)
         embedding = nn.relu(embedding)
+        record_feature_norm("shared_dense_1", embedding)
 
         rnn_in = (embedding, dones)
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
+        embedding = embedding.reshape((batch_size, num_envs, -1))
+        record_feature_norm("shared_recurrent", embedding)
+        if not self.is_initializing():
+            self.sow("intermediates", "shared_penultimate", embedding)
 
         #########
         # Model of other agent (patner_prediction module-> 7,8,9 index in original e3t paper)
@@ -219,19 +337,26 @@ class ActorCriticRNN(nn.Module):
             actor_embedding
         )
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_0", actor_mean)
         actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
             actor_mean
         )
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_1", actor_mean)
         actor_mean = nn.Dense(
             self.config["GRU_HIDDEN_DIM"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0)
         )(actor_mean)
         actor_mean = nn.relu(actor_mean)
+        record_feature_norm("actor_hidden_2", actor_mean)
         if self.config["ENV_NAME"] == "overcooked":
             actor_mean = nn.Dense(self.config["GRU_HIDDEN_DIM"] // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 actor_mean
             )
             actor_mean = nn.relu(actor_mean)  # extra layer 1
+            record_feature_norm("actor_hidden_3", actor_mean)
+
+        if not self.is_initializing():
+            self.sow("intermediates", "actor_penultimate", actor_mean)
 
         # DAAC auxiliary task: predict the normalized GAE for every action
         # from the same policy features used by the actor output. The loss
@@ -287,19 +412,25 @@ class ActorCriticRNN(nn.Module):
             embedding
         )
         critic = nn.relu(critic)
+        record_feature_norm("critic_hidden_0", critic)
         critic = nn.Dense(self.config["FC_DIM_SIZE"], kernel_init=orthogonal(2), bias_init=constant(0.0))(
             critic
         )
         critic = nn.relu(critic)
+        record_feature_norm("critic_hidden_1", critic)
         if self.config["ENV_NAME"] == "overcooked":
             critic = nn.Dense(self.config["FC_DIM_SIZE"] * 3 // 4, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
             critic = nn.relu(critic)  # extra layer 1
+            record_feature_norm("critic_hidden_2", critic)
             critic = nn.Dense(self.config["FC_DIM_SIZE"] // 2, kernel_init=orthogonal(2), bias_init=constant(0.0))(
                 critic
             )
             critic = nn.relu(critic)  # extra layer 2
+            record_feature_norm("critic_hidden_3", critic)
+        if not self.is_initializing():
+            self.sow("intermediates", "critic_penultimate", critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
             critic
         )
@@ -320,7 +451,144 @@ class Transition(NamedTuple):
     obs: jnp.ndarray
     info: jnp.ndarray
     agent_positions: jnp.ndarray
+    layout_id: jnp.ndarray
     other_action: jnp.ndarray
+
+
+def _idaac_order_mask(traj_batch):
+    not_last = (
+        jnp.arange(traj_batch.done.shape[0])[:, None]
+        < traj_batch.done.shape[0] - 1
+    )
+    next_is_reset = jnp.roll(traj_batch.done, shift=-1, axis=0)
+    return (not_last & ~next_is_reset).astype(jnp.float32)
+
+
+def _masked_mean(values, mask):
+    return (values * mask).sum() / jnp.maximum(mask.sum(), 1.0)
+
+
+def e3t_idaac_loss(
+    network,
+    params,
+    initial_hstate,
+    traj_batch,
+    advantages,
+    targets,
+    order_swap,
+    config,
+):
+    """E3T-IDAAC objective shared by training and final sharpness."""
+    (
+        _,
+        pi,
+        value,
+        other_pi,
+        advantage_predictions,
+        order_logits,
+    ) = network.apply(
+        params,
+        initial_hstate,
+        (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+        return_advantages=True,
+        order_swap=order_swap,
+    )
+    log_prob = pi.log_prob(traj_batch.action)
+    other_log_prob = other_pi.log_prob(traj_batch.other_action)
+    moa_nll_loss = -jnp.mean(other_log_prob)
+
+    value_pred_clipped = traj_batch.value + (
+        value - traj_batch.value
+    ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
+    value_loss = 0.5 * jnp.maximum(
+        jnp.square(value - targets),
+        jnp.square(value_pred_clipped - targets),
+    ).mean()
+
+    normalized_advantages = (
+        (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    )
+    predicted_advantage = jnp.take_along_axis(
+        advantage_predictions,
+        traj_batch.action[..., None],
+        axis=-1,
+    ).squeeze(-1)
+    advantage_loss = 0.5 * jnp.square(
+        predicted_advantage - jax.lax.stop_gradient(normalized_advantages)
+    ).mean()
+
+    order_mask = _idaac_order_mask(traj_batch)
+    classifier_loss = _masked_mean(
+        optax.sigmoid_binary_cross_entropy(
+            order_logits, order_swap.astype(jnp.float32)
+        ),
+        order_mask,
+    )
+    order_loss = _masked_mean(
+        optax.sigmoid_binary_cross_entropy(
+            order_logits, jnp.full_like(order_logits, 0.5)
+        ),
+        order_mask,
+    )
+    order_accuracy = _masked_mean(
+        (
+            (jax.nn.sigmoid(order_logits) >= 0.5) == order_swap
+        ).astype(jnp.float32),
+        order_mask,
+    )
+
+    logratio = log_prob - traj_batch.log_prob
+    ratio = jnp.exp(logratio)
+    actor_loss = -jnp.minimum(
+        ratio * normalized_advantages,
+        jnp.clip(
+            ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]
+        ) * normalized_advantages,
+    ).mean()
+    entropy = pi.entropy().mean()
+    approx_kl = ((ratio - 1) - logratio).mean()
+    clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+    total_loss = (
+        actor_loss
+        + config["MOA_COEF"] * moa_nll_loss
+        + config["VF_COEF"] * value_loss
+        + config["DAAC_ADV_COEF"] * advantage_loss
+        + config["IDAAC_ORDER_COEF"] * order_loss
+        - config["ENT_COEF"] * entropy
+    )
+    return total_loss, (
+        value_loss,
+        actor_loss,
+        advantage_loss,
+        order_loss,
+        classifier_loss,
+        order_accuracy,
+        entropy,
+        ratio,
+        approx_kl,
+        clip_frac,
+        moa_nll_loss,
+    )
+
+
+def e3t_idaac_classifier_loss(
+    network, params, initial_hstate, traj_batch, order_swap
+):
+    """Temporal-order classifier loss used for its separate optimizer step."""
+    *_, order_logits = network.apply(
+        params,
+        initial_hstate,
+        (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
+        return_advantages=True,
+        order_swap=order_swap,
+        detach_order_features=True,
+    )
+    return _masked_mean(
+        optax.sigmoid_binary_cross_entropy(
+            order_logits, order_swap.astype(jnp.float32)
+        ),
+        _idaac_order_mask(traj_batch),
+    )
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -332,20 +600,27 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0):
+def make_train(
+    config, update_step=0, save_info=None, opt_state=None,
+    train_state_step=None,
+):
     config.setdefault("DAAC_ADV_COEF", 0.25)
     config.setdefault("IDAAC_CLF_LR", config["LR"])
     config.setdefault("IDAAC_ORDER_COEF", 0.001)
     config.setdefault("IDAAC_USE_NONLINEAR_CLF", False)
     config.setdefault("IDAAC_CLF_HIDDEN_SIZE", 4)
-    # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
+    surface_layout_name = config["ENV_KWARGS"]["layout"]
     env = initialize_environment(config)
     
     config["NUM_ACTORS"] = env.num_agents * config["NUM_ENVS"]
     config["NUM_UPDATES"] = (
         config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
-    resume_update_step = update_step * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    resume_update_step = (
+        0 if opt_state is not None
+        else update_step
+        * (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])
+    )
     config["MAX_TRAIN_UPDATES"] = (
         config["MAX_TRAIN_STEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
     )
@@ -359,6 +634,20 @@ def make_train(config, update_step=0):
         else config["CLIP_EPS"]
     )
     config["obs_dim"] = env.observation_space(env.agents[0]).shape
+    config["ACTION_DIM"] = env.action_space(env.agents[0]).n
+    actor_trunk_keys, value_trunk_keys, shared_trunk_keys = (
+        _e3t_idaac_parameter_groups(config)
+    )
+
+    surface_settings = build_critic_loss_surface_settings(
+        config,
+        algorithm="E3T_IDAAC",
+        layout=surface_layout_name,
+        actor_trunk_keys=actor_trunk_keys,
+        value_trunk_keys=value_trunk_keys,
+        shared_trunk_keys=shared_trunk_keys,
+        value_coordinates="raw",
+    )
 
     obs, state = env.reset(jax.random.PRNGKey(0), params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
     
@@ -366,19 +655,21 @@ def make_train(config, update_step=0):
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
 
     eval_envs = make_eval_envs_overcooked(config)
-    eval_all_layouts = (
+    eval_enabled = (
         config["ENV_NAME"] == "overcooked"
-        and bool(config["ENV_KWARGS"]["random_reset"])
-        and config["ENV_KWARGS"]["random_reset_fn"] == "reset_all"
-        and bool(config["ENV_KWARGS"]["check_held_out"])
-        and len(eval_envs) > 0
+        and all(name in eval_envs for name in EVAL_LAYOUTS_9)
+    )
+    eval_xp_enabled = (
+        eval_enabled
+        and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
     human_proxy_params = (
         load_human_proxy_params(
             config["EVAL_KWARGS"]["human_proxy_ckpt_dir"],
             int(config["EVAL_KWARGS"]["human_proxy_num_seeds"]),
+            layout_names=EVAL_LAYOUTS_9,
         )
-        if eval_all_layouts
+        if eval_xp_enabled
         else {}
     )
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
@@ -392,7 +683,9 @@ def make_train(config, update_step=0):
         frac = jnp.maximum(1e-9, frac)
         return initial_lr * frac
 
-    def train(rng, model_params=None, update_step=0):
+    remaining_updates = int(config["NUM_UPDATES"]) - update_step
+
+    def train(rng, model_params=None, resume_runner_state=None):
         # INIT NETWORK
         network = ActorCriticRNN(env.action_space(env.agents[0]).n, config=config)
         bc_network = BCPolicy()
@@ -413,6 +706,7 @@ def make_train(config, update_step=0):
         if model_params is not None:
             network_params = model_params
         network_params = flax.core.freeze(network_params)
+
         param_labels = flax.core.freeze(
             flax.traverse_util.path_aware_map(
                 lambda path, _: (
@@ -453,12 +747,35 @@ def make_train(config, update_step=0):
             params=network_params,
             tx=tx,
         )
+        if opt_state is not None:
+            train_state = train_state.replace(opt_state=opt_state)
+        if train_state_step is not None:
+            train_state = train_state.replace(step=train_state_step)
 
         # INIT ENV
-        rng, _rng = jax.random.split(rng)
-        reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
-        obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
-        init_hstate = ScannedRNN.initialize_carry(config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"])
+        if resume_runner_state is None:
+            rng, _rng = jax.random.split(rng)
+            reset_rng = jax.random.split(_rng, config["NUM_ENVS"])
+            obsv, env_state = jax.vmap(env.reset, in_axes=(0,))(reset_rng)
+            init_hstate = ScannedRNN.initialize_carry(
+                config["NUM_ACTORS"], config["GRU_HIDDEN_DIM"]
+            )
+            rng, runner_rng = jax.random.split(rng)
+            initial_done = jnp.zeros((config["NUM_ACTORS"]), dtype=bool)
+        else:
+            env_state, obsv, initial_done, init_hstate, runner_rng = (
+                resume_runner_state
+            )
+
+        # Match ippo_general_gradient.py: average training scalars between the
+        # roughly 100 logging/evaluation points retained for each run.
+        _log_accum = {
+            "sum": {},
+            "count": {},
+            "layout_sum": {},
+            "layout_count": {},
+            "eval_last": None,
+        }
 
         def eval_layout_sp(eval_env, params, eval_rng):
             return evaluate_self_play_layout(
@@ -474,6 +791,8 @@ def make_train(config, update_step=0):
                 hidden_dim=config["GRU_HIDDEN_DIM"],
                 beta=config["EVAL_KWARGS"]["beta"],
                 argmax=config["EVAL_KWARGS"]["argmax"],
+                return_critic_stats=True,
+                gamma=config["GAMMA"],
             )
 
         def eval_layout_xp(
@@ -495,16 +814,29 @@ def make_train(config, update_step=0):
                 num_human_proxy_seeds=int(
                     config["EVAL_KWARGS"]["human_proxy_num_seeds"]
                 ),
+                return_critic_stats=True,
+                gamma=config["GAMMA"],
             )
 
         # TRAIN LOOP
-        @scan_tqdm(int(config["NUM_UPDATES"]))
+        @scan_tqdm(remaining_updates)
         def _update_step(update_runner_state, unused):
             # COLLECT TRAJECTORIES
             runner_state, update_steps = update_runner_state
 
             def _env_step(runner_state, unused):
                 train_state, env_state, last_obs, last_done, hstate, rng, update_step, beta_agent = runner_state
+
+                if config["ENV_NAME"] == "overcooked":
+                    pre_maze_map = env_state.env_state.maze_map
+                    layout_id = jax.vmap(_classify_layout_jax)(
+                        pre_maze_map[:, 4:13, 4:13, 0]
+                    )
+                    layout_id = jnp.tile(layout_id, [env.num_agents])
+                else:
+                    layout_id = jnp.zeros(
+                        (config["NUM_ACTORS"],), dtype=jnp.int32
+                    )
 
                 # SELECT ACTION
                 rng, _rng = jax.random.split(rng)
@@ -561,7 +893,8 @@ def make_train(config, update_step=0):
                     obs_batch,
                     info,
                     agent_positions,
-                    other_action.squeeze()
+                    layout_id,
+                    other_action.squeeze(),
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, beta_agent)
                 return runner_state, transition
@@ -603,18 +936,112 @@ def make_train(config, update_step=0):
                         delta
                         + config["GAMMA"] * config["GAE_LAMBDA"] * (1 - done) * gae
                     )
-                    return (gae, value), gae
+                    return (gae, value), (gae, delta)
 
-                _, advantages = jax.lax.scan(
+                _, (advantages, td_errors) = jax.lax.scan(
                     _get_advantages,
                     (jnp.zeros_like(last_val), last_val),
                     traj_batch,
                     reverse=True,
                     unroll=16,
                 )
-                return advantages, advantages + traj_batch.value
+                return advantages, advantages + traj_batch.value, td_errors
 
-            advantages, targets = _calculate_gae(traj_batch, last_val)
+            advantages, targets, td_errors = _calculate_gae(traj_batch, last_val)
+            original_params = train_state.params
+            actor_layout_ids = traj_batch.layout_id
+            environment_layout_ids = actor_layout_ids[:, :config["NUM_ENVS"]]
+            diagnostic_layout_names = (
+                LAYOUT_NAMES if config["ENV_NAME"] == "overcooked" else ()
+            )
+            target_stats = compute_value_diagnostics(
+                raw_targets=targets,
+                critic_targets=targets,
+                critic_values=traj_batch.value,
+                td_errors=td_errors,
+                rewards=traj_batch.reward,
+                actor_layout_ids=actor_layout_ids,
+                layout_names=diagnostic_layout_names,
+            )
+
+            run_eval = jnp.logical_or(
+                jnp.logical_or(
+                    jnp.equal(update_steps % LOG_INTERVAL, 0),
+                    jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
+                ),
+                jnp.equal(update_steps, update_step),
+            )
+
+            gradient_window_steps = int(
+                config["GRAD_CONFLICT_WINDOW_STEPS"]
+            )
+
+            def _compute_layout_gradient(_):
+                gradient_traj = jax.tree.map(
+                    lambda value: value[:gradient_window_steps], traj_batch
+                )
+                return compute_layout_gradient_metrics(
+                    network=network,
+                    original_params=original_params,
+                    initial_hstate=initial_hstate,
+                    traj_batch=gradient_traj,
+                    advantages=advantages[:gradient_window_steps],
+                    value_targets=targets[:gradient_window_steps],
+                    layout_ids_full=(
+                        environment_layout_ids[:gradient_window_steps]
+                    ),
+                    layout_names=LAYOUT_NAMES,
+                    config=config,
+                    num_agents=env.num_agents,
+                )
+
+            if config["ENV_NAME"] == "overcooked":
+                layout_gradient_metrics = jax.lax.cond(
+                    run_eval,
+                    _compute_layout_gradient,
+                    lambda _: empty_layout_gradient_metrics(LAYOUT_NAMES),
+                    operand=None,
+                )
+            else:
+                layout_gradient_metrics = empty_layout_gradient_metrics(
+                    LAYOUT_NAMES
+                )
+
+            def _compute_representation_metrics(_):
+                first_minibatch_indices = first_epoch_first_minibatch_indices(
+                    rng,
+                    config["NUM_ACTORS"],
+                    config["NUM_MINIBATCHES"],
+                )
+                representation_hstate = jax.tree.map(
+                    lambda h: jnp.take(
+                        h, first_minibatch_indices, axis=0
+                    ),
+                    initial_hstate,
+                )
+                representation_traj = jax.tree.map(
+                    lambda value: jnp.take(
+                        value, first_minibatch_indices, axis=1
+                    ),
+                    traj_batch,
+                )
+                return compute_minibatch_penultimate_metrics(
+                    network,
+                    train_state.params,
+                    representation_hstate,
+                    (
+                        representation_traj.obs,
+                        representation_traj.done,
+                        representation_traj.agent_positions,
+                    ),
+                )
+
+            representation_metrics = jax.lax.cond(
+                run_eval,
+                _compute_representation_metrics,
+                lambda _: empty_penultimate_metrics(),
+                operand=None,
+            )
 
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
@@ -627,21 +1054,6 @@ def make_train(config, update_step=0):
                         order_swap,
                     ) = batch_info
 
-                    def _order_mask(traj_batch):
-                        not_last = (
-                            jnp.arange(traj_batch.done.shape[0])[:, None]
-                            < traj_batch.done.shape[0] - 1
-                        )
-                        next_is_reset = jnp.roll(
-                            traj_batch.done, shift=-1, axis=0
-                        )
-                        return (not_last & ~next_is_reset).astype(jnp.float32)
-
-                    def _masked_mean(values, mask):
-                        return (values * mask).sum() / jnp.maximum(
-                            mask.sum(), 1.0
-                        )
-
                     def _loss_fn(
                         params,
                         init_hstate,
@@ -650,124 +1062,26 @@ def make_train(config, update_step=0):
                         targets,
                         order_swap,
                     ):
-                        # RERUN NETWORK
-                        (
-                            _,
-                            pi,
-                            value,
-                            other_pi,
-                            advantage_predictions,
-                            order_logits,
-                        ) = network.apply(
+                        return e3t_idaac_loss(
+                            network,
                             params,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
-                            (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
-                            return_advantages=True,
-                            order_swap=order_swap,
-                        )
-                        log_prob = pi.log_prob(traj_batch.action)
-                        other_log_prob = other_pi.log_prob(traj_batch.other_action)
-                        moa_nll_loss = -jnp.mean(other_log_prob)
-
-                        # CALCULATE VALUE LOSS
-                        value_pred_clipped = traj_batch.value + (
-                            value - traj_batch.value
-                        ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-                        value_losses = jnp.square(value - targets)
-                        value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
-
-                        # CALCULATE ACTOR LOSS
-                        logratio = log_prob - traj_batch.log_prob
-                        ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-                        predicted_advantage = jnp.take_along_axis(
-                            advantage_predictions,
-                            traj_batch.action[..., None],
-                            axis=-1,
-                        ).squeeze(-1)
-                        advantage_loss = 0.5 * jnp.square(
-                            predicted_advantage - jax.lax.stop_gradient(gae)
-                        ).mean()
-                        order_mask = _order_mask(traj_batch)
-                        order_targets = order_swap.astype(jnp.float32)
-                        classifier_loss = _masked_mean(
-                            optax.sigmoid_binary_cross_entropy(
-                                order_logits, order_targets
-                            ),
-                            order_mask,
-                        )
-                        order_loss = _masked_mean(
-                            optax.sigmoid_binary_cross_entropy(
-                                order_logits,
-                                jnp.full_like(order_logits, 0.5),
-                            ),
-                            order_mask,
-                        )
-                        order_accuracy = _masked_mean(
-                            (
-                                (jax.nn.sigmoid(order_logits) >= 0.5)
-                                == order_swap
-                            ).astype(jnp.float32),
-                            order_mask,
-                        )
-                        loss_actor1 = ratio * gae
-                        loss_actor2 = (
-                            jnp.clip(
-                                ratio,
-                                1.0 - config["CLIP_EPS"],
-                                1.0 + config["CLIP_EPS"],
-                            )
-                            * gae
-                        )
-                        loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
-
-                        # debug
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
-
-                        total_loss = (
-                            loss_actor
-                            + config["MOA_COEF"] * moa_nll_loss
-                            + config["VF_COEF"] * value_loss
-                            + config["DAAC_ADV_COEF"] * advantage_loss
-                            + config["IDAAC_ORDER_COEF"] * order_loss
-                            - config["ENT_COEF"] * entropy
-                        )
-                        return total_loss, (
-                            value_loss,
-                            loss_actor,
-                            advantage_loss,
-                            order_loss,
-                            classifier_loss,
-                            order_accuracy,
-                            entropy,
-                            ratio,
-                            approx_kl,
-                            clip_frac,
+                            traj_batch,
+                            gae,
+                            targets,
+                            order_swap,
+                            config,
                         )
 
                     def _classifier_loss_fn(
                         params, init_hstate, traj_batch, order_swap,
                     ):
-                        *_, order_logits = network.apply(
+                        return e3t_idaac_classifier_loss(
+                            network,
                             params,
                             jax.tree.map(lambda h: h.squeeze(), init_hstate),
-                            (traj_batch.obs, traj_batch.done, traj_batch.agent_positions),
-                            return_advantages=True,
-                            order_swap=order_swap,
-                            detach_order_features=True,
-                        )
-                        return _masked_mean(
-                            optax.sigmoid_binary_cross_entropy(
-                                order_logits,
-                                order_swap.astype(jnp.float32),
-                            ),
-                            _order_mask(traj_batch),
+                            traj_batch,
+                            order_swap,
                         )
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
@@ -795,8 +1109,20 @@ def make_train(config, update_step=0):
                         classifier_grads,
                         classifier_param_mask,
                     )
+                    optimizer_metrics = compute_optimizer_update_metrics(
+                        gradients=grads,
+                        params=train_state.params,
+                        actor_param_keys=actor_trunk_keys,
+                        critic_param_keys=value_trunk_keys,
+                        shared_param_keys=shared_trunk_keys,
+                    )
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    loss, loss_aux = total_loss
+                    return train_state, (
+                        loss,
+                        loss_aux,
+                        optimizer_metrics,
+                    )
 
                 (
                     train_state,
@@ -865,6 +1191,56 @@ def make_train(config, update_step=0):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
+
+            if save_info is not None:
+                num_updates_total = save_info["num_updates"]
+
+                def final_save_callback(params):
+                    ckpt_path = save_info["final_ckpt_path"]
+                    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                    with open(ckpt_path, "wb") as f:
+                        pickle.dump(
+                            {
+                                "key": save_info["rng"],
+                                "params": params,
+                                "update_steps": num_updates_total,
+                            },
+                            f,
+                        )
+                    print(f"Saved final model to {ckpt_path}")
+                    print(
+                        f"Finished training for seed {config['SEED']} with "
+                        f"ckpt {config['TRAIN_KWARGS']['ckpt_id']}"
+                        f"_updates{num_updates_total}"
+                    )
+                    print("--------------------------------")
+
+                is_last_step = jnp.equal(
+                    update_steps, num_updates_total - 1
+                )
+                jax.lax.cond(
+                    is_last_step,
+                    lambda _: jax.experimental.io_callback(
+                        final_save_callback,
+                        None,
+                        train_state.params,
+                        ordered=True,
+                    ),
+                    lambda _: None,
+                    operand=None,
+                )
+
+            save_critic_loss_surface_snapshots(
+                completed_updates=update_steps + 1,
+                total_updates=config["NUM_UPDATES"],
+                settings=surface_settings,
+                params=train_state.params,
+                initial_hstate=initial_hstate,
+                traj_batch=traj_batch,
+                advantages=advantages,
+                targets=targets,
+            )
+
             metric = traj_batch.info
             metric = jax.tree.map(
                 lambda x: x.reshape(
@@ -872,6 +1248,14 @@ def make_train(config, update_step=0):
                 ),
                 traj_batch.info,
             )
+            returns = metric["returned_episode_returns"][:, :, 0][
+                metric["returned_episode"][:, :, 0].astype(jnp.int32)
+            ].mean()
+
+            episode_returns_step = metric["returned_episode_returns"][:, :, 0]
+            episode_done_step = metric["returned_episode"][:, :, 0].astype(bool)
+            # Keep the scan output and host callback payload scalar-sized.
+            metric = jax.tree.map(lambda x: x.mean(), metric)
             ratio_0 = loss_info[1][7].at[0,0].get().mean()
             loss_info = jax.tree.map(lambda x: x.mean(), loss_info)
             metric["loss"] = {
@@ -887,136 +1271,301 @@ def make_train(config, update_step=0):
                 "ratio_0": ratio_0,
                 "approx_kl": loss_info[1][8],
                 "clip_frac": loss_info[1][9],
+                "moa_nll_loss": loss_info[1][10],
+                **loss_info[2],
+                **target_stats,
             }
+            metric["layout_gradient"] = layout_gradient_metrics
+            metric["representation"] = representation_metrics
             rng = update_state[-1]
 
-            if eval_all_layouts:
-                run_eval = (
-                    (update_steps % LOG_INTERVAL == 0)
-                    | (update_steps == int(config["NUM_UPDATES"]) - 1)
-                )
-
+            if eval_enabled:
                 def _do_eval(_):
                     base = jax.random.fold_in(rng, update_steps)
-                    eval_layout_names = EVAL_LAYOUTS_9
                     out = {}
-                    for i, eval_layout_name in enumerate(eval_layout_names):
-                        out[eval_layout_name] = eval_layout_sp(
+                    for index, eval_layout_name in enumerate(EVAL_LAYOUTS_9):
+                        layout_return, critic_stats = eval_layout_sp(
                             eval_envs[eval_layout_name],
                             train_state.params,
-                            jax.random.fold_in(base, i),
+                            jax.random.fold_in(base, index),
                         )
-                        out[f"{eval_layout_name}_xp"] = eval_layout_xp(
-                            eval_envs[eval_layout_name],
-                            train_state.params,
-                            human_proxy_params[eval_layout_name],
-                            jax.random.fold_in(base, 1000 + i),
-                        )
-                    out["mean"] = jnp.mean(jnp.stack([
-                        out[name] for name in eval_layout_names
-                    ]))
-                    out["mean_xp"] = jnp.mean(jnp.stack([
-                        out[f"{name}_xp"] for name in eval_layout_names
-                    ]))
-                    return out
+                        out[eval_layout_name] = layout_return
+                        for stat_name in EVAL_CRITIC_STAT_NAMES:
+                            value = critic_stats[
+                                "value_mse" if stat_name == "value_rmse"
+                                else "td_error_mse"
+                                if stat_name == "td_error_rmse"
+                                else stat_name
+                            ]
+                            out[f"{eval_layout_name}_critic_{stat_name}"] = (
+                                jnp.sqrt(value)
+                                if stat_name.endswith("_rmse")
+                                else value
+                            )
+                    out["mean"] = jnp.mean(
+                        jnp.stack([out[name] for name in EVAL_LAYOUTS_9])
+                    )
 
-                def _skip_eval(_):
-                    nan = jnp.array(jnp.nan, dtype=jnp.float32)
-                    eval_layout_names = EVAL_LAYOUTS_9
-                    out = {name: nan for name in eval_layout_names}
-                    out.update({
-                        f"{name}_xp": nan for name in eval_layout_names
-                    })
-                    out["mean"] = nan
-                    out["mean_xp"] = nan
+                    if eval_xp_enabled:
+                        xp_base = jax.random.fold_in(base, 1000)
+                        for index, eval_layout_name in enumerate(
+                            EVAL_LAYOUTS_9
+                        ):
+                            xp_return, xp_critic_stats = eval_layout_xp(
+                                eval_envs[eval_layout_name],
+                                train_state.params,
+                                human_proxy_params[eval_layout_name],
+                                jax.random.fold_in(xp_base, index),
+                            )
+                            out[f"{eval_layout_name}_xp"] = xp_return
+                            for stat_name in EVAL_CRITIC_STAT_NAMES:
+                                value = xp_critic_stats[
+                                    "value_mse"
+                                    if stat_name == "value_rmse"
+                                    else "td_error_mse"
+                                    if stat_name == "td_error_rmse"
+                                    else stat_name
+                                ]
+                                out[
+                                    f"{eval_layout_name}_xp_critic_{stat_name}"
+                                ] = (
+                                    jnp.sqrt(value)
+                                    if stat_name.endswith("_rmse")
+                                    else value
+                                )
+                        out["mean_xp"] = jnp.mean(
+                            jnp.stack(
+                                [out[f"{name}_xp"] for name in EVAL_LAYOUTS_9]
+                            )
+                        )
                     return out
 
                 metric["eval_returns"] = jax.lax.cond(
-                    run_eval, _do_eval, _skip_eval, operand=None
+                    run_eval,
+                    _do_eval,
+                    lambda _: empty_evaluation_metrics(
+                        EVAL_LAYOUTS_9,
+                        eval_xp_enabled,
+                    ),
+                    operand=None,
                 )
 
             def callback(metric):
-                log_data = {
-                    "returns": metric["returns"],
-                    "env_step": metric["update_steps"]
-                    * config["NUM_ENVS"]
-                    * config["NUM_STEPS"],
-                    **metric["loss"],
-                }
-                if "eval_returns" in metric:
-                    eval_layout_names = EVAL_LAYOUTS_9
-                    sp_mean = float(metric["eval_returns"]["mean"])
-                    xp_mean = float(metric["eval_returns"]["mean_xp"])
-                    if np.isfinite(sp_mean):
-                        log_data["eval/mean"] = sp_mean
-                        for eval_layout_name in eval_layout_names:
-                            log_data[f"eval/{eval_layout_name}"] = float(
-                                metric["eval_returns"][eval_layout_name]
-                            )
-                    if np.isfinite(xp_mean):
-                        log_data["eval_xp/mean"] = xp_mean
-                        for eval_layout_name in eval_layout_names:
-                            log_data[f"eval_xp/{eval_layout_name}"] = float(
-                                metric["eval_returns"][f"{eval_layout_name}_xp"]
-                            )
-                wandb.log(log_data, step=int(metric["update_steps"]))
-                current_return = float(metric["returns"])
-                if current_return > best_return[0]:
-                    best_return[0] = current_return
-                    os.makedirs(config['filepath'], exist_ok=True)
-                    ckpt_path = f"{config['filepath']}/{config['fcp_prefix']}seed{config['SEED']}_best_e3t_idaac.pkl"
-                    with open(ckpt_path, "wb") as f:
-                        pickle.dump({
-                            'params': metric["params"],
-                            'returns': current_return,
-                            'update_steps': int(metric['update_steps']),
-                        }, f)
+                step = int(metric["update_steps"])
+                snapshot_prefixes = (
+                    "target_raw/", "target_popart/", "critic/", "td_error/",
+                )
 
-            returns = metric["returned_episode_returns"][:, :, 0][
-                            metric["returned_episode"][:, :, 0].astype(jnp.int32)
-                        ].mean()
+                def _accumulate(key, value):
+                    value = float(value)
+                    _log_accum["sum"].setdefault(key, 0.0)
+                    _log_accum["count"].setdefault(key, 0)
+                    if np.isfinite(value):
+                        _log_accum["sum"][key] += value
+                        _log_accum["count"][key] += 1
+
+                _accumulate("returns", metric["returns"])
+                for key, value in metric["loss"].items():
+                    if not key.startswith(snapshot_prefixes):
+                        _accumulate(key, value)
+
+                if "eval_returns" in metric:
+                    eval_metrics = metric["eval_returns"]
+                    if np.isfinite(float(eval_metrics["mean"])):
+                        _log_accum["eval_last"] = {
+                            key: float(value)
+                            for key, value in eval_metrics.items()
+                            if np.isfinite(float(value))
+                        }
+
+                if config["ENV_NAME"] == "overcooked":
+                    episode_returns_array = np.asarray(
+                        metric["episode_returns_step"]
+                    )
+                    episode_done_array = np.asarray(
+                        metric["episode_done_step"]
+                    ).astype(bool)
+                    layout_ids_array = np.asarray(metric["layout_ids"])
+                    for time_index, env_index in np.argwhere(
+                        episode_done_array
+                    ):
+                        name = EVAL_LAYOUTS_9[
+                            int(layout_ids_array[time_index, env_index])
+                        ]
+                        _log_accum["layout_sum"][name] = (
+                            _log_accum["layout_sum"].get(name, 0.0)
+                            + float(
+                                episode_returns_array[time_index, env_index]
+                            )
+                        )
+                        _log_accum["layout_count"][name] = (
+                            _log_accum["layout_count"].get(name, 0) + 1
+                        )
+
+                if (
+                    step % LOG_INTERVAL == 0
+                    or step == int(config["NUM_UPDATES"]) - 1
+                    or step == update_step
+                ):
+                    log_data = {
+                        "update_step": step,
+                        "env_step": int(
+                            step
+                            * config["NUM_ENVS"]
+                            * config["NUM_STEPS"]
+                        ),
+                    }
+                    for key, value_sum in _log_accum["sum"].items():
+                        count = _log_accum["count"][key]
+                        log_data[key] = (
+                            value_sum / count if count > 0 else float("nan")
+                        )
+                    for key, value in metric["loss"].items():
+                        if key.startswith(snapshot_prefixes):
+                            log_data[key] = float(value)
+                    for key, value in metric["representation"].items():
+                        if np.isfinite(float(value)):
+                            log_data[key] = float(value)
+                    for key, value in metric["layout_gradient"].items():
+                        log_data[key] = float(value)
+                    add_evaluation_metrics_to_log_dict(
+                        log_data,
+                        _log_accum["eval_last"],
+                        EVAL_LAYOUTS_9,
+                        eval_xp_enabled,
+                    )
+                    for name in EVAL_LAYOUTS_9:
+                        count = _log_accum["layout_count"].get(name, 0)
+                        log_data[f"train_returns/{name}"] = (
+                            _log_accum["layout_sum"].get(name, 0.0) / count
+                            if count > 0
+                            else float("nan")
+                        )
+                    wandb.log(log_data, step=step)
+                    _log_accum["sum"] = {}
+                    _log_accum["count"] = {}
+                    _log_accum["layout_sum"] = {}
+                    _log_accum["layout_count"] = {}
+
             metric["returns"] = returns
             metric["update_steps"] = update_steps
-            metric["params"] = train_state.params
-            jax.experimental.io_callback(callback, None, metric)
+            callback_metric = {
+                **metric,
+                "episode_returns_step": episode_returns_step,
+                "episode_done_step": episode_done_step,
+                "layout_ids": environment_layout_ids,
+            }
+            jax.experimental.io_callback(
+                callback, None, callback_metric, ordered=True,
+            )
+
+            def checkpoint_callback(
+                params,
+                opt_state_,
+                tx_step,
+                step,
+                env_state_,
+                last_obs_,
+                last_done_,
+                hstate_,
+                rng_,
+            ):
+                step = int(step)
+                mid_ckpt_dir = config["MID_CKPT_DIR"]
+                os.makedirs(mid_ckpt_dir, exist_ok=True)
+                mid_ckpt_path = os.path.join(
+                    mid_ckpt_dir, "resume_ckpt.pkl"
+                )
+                with open(mid_ckpt_path, "wb") as f:
+                    pickle.dump(
+                        {
+                            "params": params,
+                            "opt_state": opt_state_,
+                            "tx_step": tx_step,
+                            "final_update_step": step + 1,
+                            "wandb_run_id": wandb.run.id,
+                            "runner_state": (
+                                env_state_,
+                                last_obs_,
+                                last_done_,
+                                hstate_,
+                                rng_,
+                            ),
+                        },
+                        f,
+                    )
+
+            is_scheduled_ckpt = jnp.equal(update_steps % LOG_INTERVAL, 0)
+            jax.lax.cond(
+                is_scheduled_ckpt,
+                lambda _: jax.experimental.io_callback(
+                    checkpoint_callback,
+                    None,
+                    train_state.params,
+                    train_state.opt_state,
+                    train_state.step,
+                    update_steps,
+                    env_state,
+                    last_obs,
+                    last_done,
+                    hstate,
+                    rng,
+                    ordered=True,
+                ),
+                lambda _: None,
+                operand=None,
+            )
             update_steps = update_steps + 1
             runner_state = (train_state, env_state, last_obs, last_done, hstate, rng)  # hstate resets automatically
             return (runner_state, update_steps), metric
 
-        best_return = [float('-inf')]
-        
-        rng, _rng = jax.random.split(rng)
         runner_state = (
             train_state,
             env_state,
             obsv,
-            jnp.zeros((config["NUM_ACTORS"]), dtype=bool),
+            initial_done,
             init_hstate,
-            _rng,
+            runner_rng,
         )
         runner_state, metric = jax.lax.scan(
-            _update_step, (runner_state, update_step), jnp.arange(int(config["NUM_UPDATES"])), int(config["NUM_UPDATES"])
+            _update_step,
+            (runner_state, update_step),
+            jnp.arange(remaining_updates),
+            remaining_updates,
         )
-        return {"runner_state": runner_state}
+        final_runner_state, final_update_count = runner_state
+        final_train_state = final_runner_state[0]
+        return {
+            "runner_state": runner_state,
+            "sharpness_params": final_train_state.params,
+            "sharpness_batch": collect_final_sharpness_batch(
+                env,
+                network,
+                final_runner_state,
+                final_update_count,
+                config,
+                batchify,
+                unbatchify,
+                include_other_action=True,
+            ),
+        }
 
     return train
 
 
 @hydra.main(version_base=None, config_path="repro_config", config_name="e3t_final_baseline")
 def main(config):
-    save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
     config["model_name"] = "E3T_IDAAC"
+    xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10
-        finetune_appendage = "_e3t_finetune"
+        finetune_appendage = "_e3t_idaac_finetune"
         fcp_prefix = "fcp_"
-    elif config['ENV_NAME'] == 'overcooked':
-        fcp_prefix = ""
-        finetune_appendage = "_e3t"
     else:
         fcp_prefix = ""
-        finetune_appendage = "_e3t"
+        finetune_appendage = "_e3t_idaac"
 
     save_variant = "e3t_idaac"
     if config["TRAIN_KWARGS"]["finetune"]:
@@ -1027,36 +1576,138 @@ def main(config):
             private_info = yaml.load(f, Loader=yaml.FullLoader)
         wandb.login(key=private_info["wandb_key"])
 
-    wandb.init(
-        entity=config["ENTITY"],
-        project=config["PROJECT"],
-        tags=["E3T", "IDAAC", "RNN", "SP"],
-        config=config,
-        mode=config["WANDB_MODE"],
-        name=f"e3t_idaac_{config['ENV_KWARGS']['layout']}_seed{config['SEED']}"
-    )
-    filepath = f"ckpts/e3t_idaac/{config['ENV_NAME']}"
+    resume_xpid = config.get("RESUME_XPID")
+    active_xpid = resume_xpid if resume_xpid else xpid
+
+    filepath_base = f"ckpts/e3t_idaac/{config['ENV_NAME']}"
     if config["ENV_NAME"] == "overcooked":
-        filepath += f"/{config['ENV_KWARGS']['layout']}"
-    filepath = f"{filepath}/ik{config['ENV_KWARGS']['random_reset']}/{config['ENV_KWARGS']['random_reset_fn']}/{save_xpid}"
+        filepath_base += f"/{config['ENV_KWARGS']['layout']}"
+    filepath_base += (
+        f"/ik{config['ENV_KWARGS']['random_reset']}"
+        f"/{config['ENV_KWARGS']['random_reset_fn']}"
+    )
+    filepath = f"{filepath_base}/{active_xpid}"
     config['filepath'] = filepath
     config['fcp_prefix'] = fcp_prefix
+    config["MID_CKPT_DIR"] = os.path.join(
+        filepath, f"seed{config['SEED']}_mid_ckpts"
+    )
     print(f"Working on: \n{filepath}\n")
 
-    if not config['TRAIN_KWARGS']['overwrite_ckpt']:
-        # check if ckpt exists
-        if os.path.exists(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl"):
-            print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
-            exit(0)
+    mid_ckpt_path = os.path.join(
+        config["MID_CKPT_DIR"], "resume_ckpt.pkl"
+    )
+    has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
+    checkpoint_data = None
+    wandb_resume_id = None
+    if has_mid_ckpt:
+        with open(mid_ckpt_path, "rb") as f:
+            checkpoint_data = pickle.load(f)
+        wandb_resume_id = checkpoint_data.get("wandb_run_id")
 
-    if config['TRAIN_KWARGS']['ckpt_id'] > 0:
+    if wandb_resume_id:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            id=wandb_resume_id,
+            resume="must",
+            mode=config["WANDB_MODE"],
+        )
+    else:
+        wandb.init(
+            entity=config["ENTITY"],
+            project=config["PROJECT"],
+            tags=["E3T", "IDAAC", "RNN", "SP"],
+            config=config,
+            mode=config["WANDB_MODE"],
+            name=(
+                f"e3t_idaac_{config['ENV_KWARGS']['layout']}"
+                f"_seed{config['SEED']}"
+            ),
+        )
+
+    num_updates = int(
+        config["TOTAL_TIMESTEPS"]
+        // config["NUM_STEPS"]
+        // config["NUM_ENVS"]
+    )
+    final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}"
+        f"_updates{num_updates}.pkl",
+    )
+    legacy_final_ckpt_path = os.path.join(
+        filepath,
+        f"{fcp_prefix}seed{config['SEED']}_ckpt"
+        f"{config['TRAIN_KWARGS']['ckpt_id']}{finetune_appendage}.pkl",
+    )
+    if not config['TRAIN_KWARGS']['overwrite_ckpt']:
+        if (
+            os.path.exists(final_ckpt_path)
+            or os.path.exists(legacy_final_ckpt_path)
+        ):
+            print(f"Checkpoint {config['TRAIN_KWARGS']['ckpt_id']} already exists, exiting")
+            return
+
+    resume_runner_state = None
+    resume_train_state_step = None
+    if has_mid_ckpt:
+        print(f"Found mid-run checkpoint: {mid_ckpt_path}")
+        model_params = checkpoint_data["params"]
+        opt_state = checkpoint_data.get("opt_state")
+        resume_train_state_step = checkpoint_data.get("tx_step")
+        resume_runner_state = checkpoint_data.get("runner_state")
+        final_update_step = checkpoint_data["final_update_step"]
+        rng = jax.random.PRNGKey(config["SEED"])
+        print(f"Resuming from update step {final_update_step}")
+    elif config['TRAIN_KWARGS']['ckpt_id'] > 0:
         print("Loading checkpoint")
-        with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id'] - 1}{finetune_appendage}.pkl", "rb") as f:
+        previous_ckpt_prefix = (
+            f"{fcp_prefix}seed{config['SEED']}_ckpt"
+            f"{config['TRAIN_KWARGS']['ckpt_id'] - 1}"
+        )
+        checkpoint_candidates = [
+            os.path.join(
+                filepath,
+                f"{previous_ckpt_prefix}_{save_variant}"
+                f"_updates{num_updates}.pkl",
+            ),
+            os.path.join(
+                filepath,
+                f"{previous_ckpt_prefix}{finetune_appendage}.pkl",
+            ),
+        ]
+        checkpoint_candidates.extend(
+            sorted(
+                glob.glob(
+                    os.path.join(
+                        filepath,
+                        f"{previous_ckpt_prefix}_{save_variant}"
+                        "_updates*.pkl",
+                    )
+                ),
+                reverse=True,
+            )
+        )
+        previous_ckpt_path = next(
+            (path for path in checkpoint_candidates if os.path.exists(path)),
+            None,
+        )
+        if previous_ckpt_path is None:
+            raise FileNotFoundError(
+                "Previous E3T-IDAAC checkpoint was not found under "
+                f"{filepath!r}. Set RESUME_XPID to the run directory that "
+                "contains the previous checkpoint."
+            )
+        with open(previous_ckpt_path, "rb") as f:
             previous_ckpt = pickle.load(f)
-            model_params = previous_ckpt['params']
-            final_update_step = previous_ckpt['final_update_step']
-            rng = previous_ckpt['key']
-            rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
+        model_params = previous_ckpt['params']
+        opt_state = None
+        final_update_step = previous_ckpt.get(
+            'final_update_step', previous_ckpt.get('update_steps', 0)
+        )
+        rng = previous_ckpt['key']
 
     elif config['TRAIN_KWARGS']['finetune']:
         finetune_filepath =f"ckpts/e3t/{config['ENV_NAME']}"
@@ -1068,33 +1719,75 @@ def main(config):
         with open(f"{finetune_filepath}/{fcp_prefix}seed{config['SEED']}_e3t_ckpt{fcp_ckpt_num}.pkl", "rb") as f:  # need to resume from last checkpoint
             previous_ckpt = pickle.load(f)
             model_params = previous_ckpt['params']
-            # final_update_step = previous_ckpt['final_update_step']
+            opt_state = None
             final_update_step = 0
             rng = previous_ckpt['key']
-            rng, _rng = jax.random.split(jax.random.PRNGKey(rng))
     else:
         model_params = None
+        opt_state = None
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
-    out = train_jit(rng, model_params, final_update_step)
-    runner_state = out['runner_state']
-    train_state = runner_state[0]
-    model_state = train_state[0]
-    rng = runner_state[-1]
-    num_updates = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
-    
-    # save model
-    os.makedirs(filepath, exist_ok=True)
-    with open(f"{filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl", "wb") as f:
-        ckpt = {'key': rng, 'params': model_state.params, 'update_steps': num_updates}
-        pickle.dump(ckpt, f)
+    save_info = {
+        "rng": rng,
+        "num_updates": num_updates,
+        "final_ckpt_path": final_ckpt_path,
+    }
 
-    print(f"Saved model to {filepath}/{fcp_prefix}seed{config['SEED']}_ckpt{config['TRAIN_KWARGS']['ckpt_id']}_{save_variant}_updates{num_updates}.pkl")
-    print(f"Finished training for seed {config['SEED']} with ckpt {config['TRAIN_KWARGS']['ckpt_id']}_updates{num_updates}")
-    print(f"--------------------------------")
+    print(f"Starting from update step {final_update_step}")
+    train_jit = jax.jit(
+        make_train(
+            config,
+            final_update_step,
+            save_info,
+            opt_state,
+            resume_train_state_step,
+        ),
+        device=jax.devices()[0],
+    )
+    train_output = train_jit(rng, model_params, resume_runner_state)
+    jax.effects_barrier()
+
+    print("Computing final Keskar sharpness with L-BFGS-B...")
+    sharpness_network = ActorCriticRNN(
+        int(config["ACTION_DIM"]), config=config
+    )
+    sharpness_batch = train_output["sharpness_batch"]
+    sharpness_order_swap = jax.random.bernoulli(
+        jax.random.PRNGKey(config["SEED"]),
+        shape=sharpness_batch.done.shape,
+    )
+
+    def sharpness_loss(params):
+        loss, _ = e3t_idaac_loss(
+            sharpness_network,
+            params,
+            sharpness_batch.initial_hstate,
+            sharpness_batch,
+            sharpness_batch.advantages,
+            sharpness_batch.targets,
+            sharpness_order_swap,
+            config,
+        )
+        return loss
+
+    sharpness_metrics = compute_keskar_sharpness(
+        sharpness_loss,
+        train_output["sharpness_params"],
+        config["SHARPNESS"]["EPSILONS"],
+        maxiter=int(config["SHARPNESS"]["LBFGSB_MAXITER"]),
+    )
+    wandb.log(sharpness_metrics, step=num_updates)
+    print(
+        "Final sharpness: "
+        + ", ".join(
+            f"{key}={value:.6g}"
+            for key, value in sharpness_metrics.items()
+            if key.startswith("sharpness/keskar_")
+        )
+    )
+    jax.clear_caches()
+    wandb.finish()
     
 
 if __name__ == "__main__":

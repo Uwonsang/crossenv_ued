@@ -57,3 +57,17 @@
 "PROJECT": "crossenv_ued_baseline"
 "WANDB_MODE" : "disabled" # disabled, online, offline
 "model_name": "IPPO"
+# BC cross-play evaluation. XP uses only ENV_KWARGS.layout.
+"EVAL_KWARGS":
+  "num_envs": 5
+  "num_steps": 400
+  "max_steps": 400
+  "random_reset": False
+  "check_held_out": False
+  "shuffle_inv_and_pot": False
+  "random_reset_fn": "reset_all"
+  "beta": 1.0
+  "argmax": False
+  "eval_xp": True
+  "human_proxy_ckpt_dir": "baselines/human_proxy/checkpoints"
+  "human_proxy_num_seeds": 5

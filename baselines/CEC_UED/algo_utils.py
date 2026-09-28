@@ -16,6 +16,23 @@ EVAL_LAYOUTS_9 = [
     "forced_coord_9",
 ]
 
+FINETUNE_UPDATES_BY_FOLDER = {
+    32: 366210,
+    64: 183105,
+    128: 91552,
+    256: 45776,
+}
+
+
+def get_finetune_checkpoint_path(checkpoint_root, seed):
+    folder_size = int(os.path.basename(os.path.normpath(checkpoint_root)))
+    num_updates = FINETUNE_UPDATES_BY_FOLDER[folder_size]
+    return os.path.join(
+        checkpoint_root,
+        f"seed{seed}",
+        f"seed{seed}_ckpt0_improved_updates{num_updates}.pkl",
+    )
+
 def classify_layout(maze_map_9x9_ch0: np.ndarray) -> str:
     passable = (maze_map_9x9_ch0 == 1) | (maze_map_9x9_ch0 == 10)
     n_passable = int(passable.sum())
@@ -83,13 +100,23 @@ def make_eval_envs_overcooked(config):
         )
     return envs
 
-def load_human_proxy_params(ckpt_dir, num_seeds):
-    """Loads human_proxy (BC) checkpoints for every EVAL_LAYOUTS_9 layout, stacked across seeds.
+def load_human_proxy_params(ckpt_dir, num_seeds, layout_names=None):
+    """Load human_proxy (BC) checkpoints, stacked across seeds.
 
     Returns {layout_name_9: params_pytree} where each leaf has a leading `num_seeds` axis.
+    When ``layout_names`` is omitted, checkpoints for every evaluation layout are loaded.
     """
+    if layout_names is None:
+        layout_names = EVAL_LAYOUTS_9
+
     params_by_layout = {}
-    for layout_name_9 in EVAL_LAYOUTS_9:
+    for layout_name_9 in layout_names:
+        if layout_name_9 not in EVAL_LAYOUTS_9:
+            supported_layouts = ", ".join(EVAL_LAYOUTS_9)
+            raise ValueError(
+                f"Unsupported BC evaluation layout '{layout_name_9}'. "
+                f"Choose one of: {supported_layouts}"
+            )
         layout_name = layout_name_9[:-2]  # strip the CEC_UED-only "_9" suffix
         seed_params = []
         for seed in range(num_seeds):

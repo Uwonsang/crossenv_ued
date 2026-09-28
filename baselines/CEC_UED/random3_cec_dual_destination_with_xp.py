@@ -91,41 +91,6 @@ def latest_match(patterns):
         return None
     return sorted(matches, key=lambda p: os.path.getmtime(p))[-1]
 
-def load_xp_partner_params(config):
-    xp_cfg = config.get("XP_KWARGS", {})
-    partner_seed = int(xp_cfg.get("partner_seed", 98))
-    explicit_path = str(xp_cfg.get("partner_path", "")).strip()
-    if explicit_path:
-        path = os.path.abspath(os.path.expanduser(explicit_path))
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing explicit XP partner checkpoint: {path}")
-        with open(path, "rb") as f:
-            ckpt = pickle.load(f)
-        print(f"Loaded explicit XP partner seed{partner_seed}: {path}")
-        return ckpt["params"], path
-
-    root = toy_ckpt_root(config)
-    if not config["ENV_KWARGS"]["random_reset"]:
-        patterns = [
-            f"{root}/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/ippo_layout_eval/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
-            f"{root}/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/ippo/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
-        ]
-        partner_name = "IPPO"
-    else:
-        patterns = [
-            f"{root}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/cec_layout_eval/**/seed{partner_seed}_ckpt0_improved_updates*.pkl",
-        ]
-        partner_name = "CEC"
-    path = latest_match(patterns)
-    if path is None:
-        raise FileNotFoundError(
-            f"Missing {partner_name} XP partner seed{partner_seed} under {root}"
-        )
-    with open(path, "rb") as f:
-        ckpt = pickle.load(f)
-    print(f"Loaded XP partner {partner_name} seed{partner_seed}: {path}")
-    return ckpt["params"], path
-
 def make_fixed_toy_env_kwargs(config, map_name):
     allowed = {"max_steps", "debug", "partial_obs", "incentivize_strat"}
     env_kwargs = {k: v for k, v in config["ENV_KWARGS"].items() if k in allowed}
@@ -406,7 +371,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0, xp_partner_params=None):
+def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     is_overcooked = config["ENV_NAME"] == "overcooked"
@@ -840,89 +805,18 @@ def make_train(config, update_step=0, xp_partner_params=None):
 
                 return returns.mean()
 
-            def xp_layout(eval_env, params_1, params_2, eval_rng):
-                xp_cfg = config.get("XP_KWARGS", {})
-                num_eval_envs = int(xp_cfg.get("num_envs", config["EVAL_KWARGS"]["num_envs"]))
-                num_steps = int(xp_cfg.get("num_steps", config["EVAL_KWARGS"]["num_steps"]))
-                beta = float(xp_cfg.get("beta", config["EVAL_KWARGS"]["beta"]))
-                argmax = bool(xp_cfg.get("argmax", config["EVAL_KWARGS"]["argmax"]))
-                num_actors_eval = eval_env.num_agents * num_eval_envs
-
-                eval_rng, reset_rng = jax.random.split(eval_rng)
-                reset_rngs = jax.random.split(reset_rng, num_eval_envs)
-                init_obs, init_state = jax.vmap(eval_env.reset, in_axes=(0,))(reset_rngs)
-                init_hstate_1 = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
-                init_hstate_2 = ScannedRNN.initialize_carry(num_actors_eval, config["GRU_HIDDEN_DIM"])
-                init_done = jnp.zeros((num_actors_eval,), dtype=bool)
-                init_returns = jnp.zeros((num_eval_envs,), dtype=jnp.float32)
-                runner_state = (init_state, init_obs, init_done, init_hstate_1, init_hstate_2, init_returns, eval_rng)
-
-                def _xp_step(carry, _):
-                    env_state_e, obs_e, done_e, hstate_1, hstate_2, returns_e, rng_e = carry
-
-                    rng_e, rng_1, rng_2 = jax.random.split(rng_e, 3)
-                    obs_batch = batchify(obs_e, eval_env.agents, num_actors_eval)
-                    agent_positions = {'agent_0': env_state_e.env_state.agent_pos, 'agent_1': env_state_e.env_state.agent_pos}
-                    agent_positions = batchify(agent_positions, eval_env.agents, num_actors_eval)
-                    ac_in = (
-                        obs_batch[np.newaxis, :],
-                        done_e[np.newaxis, :],
-                        agent_positions[np.newaxis, :],
-                    )
-                    hstate_1_next, pi_1, _ = network.apply(params_1, hstate_1, ac_in)
-                    hstate_2_next, pi_2, _ = network.apply(params_2, hstate_2, ac_in)
-                    pi_1 = distrax.Categorical(logits=pi_1.logits * beta)
-                    pi_2 = distrax.Categorical(logits=pi_2.logits * beta)
-                    sampled_1 = pi_1.sample(seed=rng_1)[0]
-                    sampled_2 = pi_2.sample(seed=rng_2)[0]
-                    greedy_1 = jnp.argmax(pi_1.probs, axis=-1)[0]
-                    greedy_2 = jnp.argmax(pi_2.probs, axis=-1)[0]
-                    action_1 = jnp.where(argmax, greedy_1, sampled_1)
-                    action_2 = jnp.where(argmax, greedy_2, sampled_2)
-                    action = jnp.concatenate(
-                        [action_1[:num_eval_envs], action_2[num_eval_envs:]],
-                        axis=0,
-                    )
-
-                    env_act = unbatchify(action, eval_env.agents, num_eval_envs, eval_env.num_agents)
-                    env_act = {k: v.squeeze() for k, v in env_act.items()}
-
-                    rng_e, _rng_e = jax.random.split(rng_e)
-                    rng_step_e = jax.random.split(_rng_e, num_eval_envs)
-                    obs_next, state_next, reward, done, _info = jax.vmap(
-                        eval_env.step, in_axes=(0, 0, 0)
-                    )(rng_step_e, env_state_e, env_act)
-
-                    done_next = batchify(done, eval_env.agents, num_actors_eval).squeeze()
-                    returns_next = returns_e + reward["agent_0"]
-
-                    return (state_next, obs_next, done_next, hstate_1_next, hstate_2_next, returns_next, rng_e), None
-
-                runner_state, _ = jax.lax.scan(_xp_step, runner_state, None, num_steps)
-                state, obs, done, h_state_1, h_state_2, returns, rng = runner_state
-                return returns.mean()
-
             run_eval = jnp.equal(update_steps % config["EVAL_KWARGS"]["eval_interval"], 0)
-            run_xp = bool(config.get("XP_KWARGS", {}).get("enabled", False)) and xp_partner_params is not None
 
             if len(eval_envs) > 0:
                 def _do_eval(_):
                     out = {}
                     base = jax.random.fold_in(rng, update_steps)
                     for i, layout_name in enumerate(eval_layout_names):
-                        if run_xp:
-                            out[layout_name] = xp_layout(
-                                eval_envs[layout_name],
-                                train_state.params,
-                                xp_partner_params,
-                                jax.random.fold_in(base, i),
-                            )
-                        else:
-                            out[layout_name] = eval_layout(
-                                eval_envs[layout_name],
-                                train_state.params,
-                                jax.random.fold_in(base, i),
-                            )
+                        out[layout_name] = eval_layout(
+                            eval_envs[layout_name],
+                            train_state.params,
+                            jax.random.fold_in(base, i),
+                        )
                     out["mean"] = jnp.mean(jnp.stack([out[n] for n in eval_layout_names]))
                     return out
 
@@ -932,7 +826,6 @@ def make_train(config, update_step=0, xp_partner_params=None):
                     return out
 
                 metric["eval_returns"] = jax.lax.cond(run_eval, _do_eval, _skip_eval, operand=None)
-                metric["using_xp_eval"] = jnp.array(run_xp, dtype=jnp.bool_)
 
             def callback(metric):
                 log_dict = {
@@ -944,20 +837,9 @@ def make_train(config, update_step=0, xp_partner_params=None):
                 }
                 if "eval_returns" in metric:
                     if np.isfinite(float(metric["eval_returns"]["mean"])):
-                        metric_prefix = "xp" if bool(metric.get("using_xp_eval", False)) else "eval"
-                        if metric_prefix == "xp":
-                            return_scale = 2.0 * float(config["ENV_KWARGS"]["max_steps"])
-                            mean_return = float(metric["eval_returns"]["mean"])
-                            log_dict["xp/return_mean_fixed_heldout"] = mean_return
-                            log_dict["xp/normalized_return_mean_fixed_heldout"] = mean_return / return_scale
-                            for _ln in eval_layout_names:
-                                layout_return = float(metric["eval_returns"][_ln])
-                                log_dict[f"xp/return_{_ln}"] = layout_return
-                                log_dict[f"xp/normalized_return_{_ln}"] = layout_return / return_scale
-                        else:
-                            log_dict["eval/return_mean_fixed_heldout"] = float(metric["eval_returns"]["mean"])
-                            for _ln in eval_layout_names:
-                                log_dict[f"eval/return_{_ln}"] = float(metric["eval_returns"][_ln])
+                        log_dict["eval/return_mean_fixed_heldout"] = float(metric["eval_returns"]["mean"])
+                        for _ln in eval_layout_names:
+                            log_dict[f"eval/return_{_ln}"] = float(metric["eval_returns"][_ln])
 
                 if config["ENV_NAME"] == "overcooked":
                     maze_map = np.array(metric["env_state"].env_state.maze_map)  # (num_envs, 17, 17, 3)
@@ -1149,13 +1031,8 @@ def main(config):
         final_update_step = 0
         rng = jax.random.PRNGKey(config["SEED"])
 
-    xp_partner_params = None
-    if bool(config.get("XP_KWARGS", {}).get("enabled", False)):
-        xp_partner_params, xp_partner_path = load_xp_partner_params(config)
-        config["XP_KWARGS"]["partner_path"] = xp_partner_path
-
     print(f"Starting from update step {final_update_step}")
-    train_jit = jax.jit(make_train(config, final_update_step, xp_partner_params), device=jax.devices()[0])
+    train_jit = jax.jit(make_train(config, final_update_step), device=jax.devices()[0])
     out = train_jit(rng, model_params, final_update_step)
     jax.effects_barrier()
     if (

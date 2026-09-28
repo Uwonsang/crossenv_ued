@@ -183,34 +183,6 @@ def modified_wall_ckpt_root(config):
     return f"ckpts/idaac/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
 
 
-def load_xp_partner_params(config):
-    xp_cfg = config.get("XP_KWARGS", {})
-    partner_seed = int(xp_cfg.get("partner_seed", 98))
-    explicit_path = str(xp_cfg.get("partner_path", "")).strip()
-    if explicit_path:
-        path = os.path.abspath(os.path.expanduser(explicit_path))
-        if not os.path.isfile(path):
-            raise FileNotFoundError(f"Missing explicit XP partner checkpoint: {path}")
-        with open(path, "rb") as f:
-            checkpoint = pickle.load(f)
-        print(f"Loaded explicit IDAAC XP partner seed{partner_seed}: {path}")
-        return checkpoint["params"], path
-
-    root = modified_wall_ckpt_root(config)
-    pattern = (
-        f"{root}/ikTrue/{config['ENV_KWARGS']['random_reset_fn']}/**/"
-        f"seed{partner_seed}_ckpt0_improved_updates*.pkl"
-    )
-    matches = glob.glob(pattern, recursive=True)
-    if not matches:
-        raise FileNotFoundError(f"Missing IDAAC XP partner seed{partner_seed} under {root}")
-    path = max(matches, key=os.path.getmtime)
-    with open(path, "rb") as f:
-        checkpoint = pickle.load(f)
-    print(f"Loaded IDAAC XP partner seed{partner_seed}: {path}")
-    return checkpoint["params"], path
-
-
 def get_toy_layout_wall_maps(layout_names):
     return jnp.asarray([
         [[token == "B" for token in row] for row in ToyCoopNoPink.LAYOUTS[name]]
@@ -719,7 +691,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
 
 def make_train(
     config, update_step=0, save_info=None, opt_state=None,
-    train_state_step=None, xp_partner_params=None,
+    train_state_step=None,
 ):
     config.setdefault("DAAC_ADV_COEF", 0.25)
     config.setdefault("DAAC_POLICY_LR", config["LR"])
@@ -766,11 +738,7 @@ def make_train(
         and len(eval_envs) > 0
         and bool(config["EVAL_KWARGS"]["eval_xp"])
     )
-    training_xp_enabled = (
-        bool(config.get("XP_KWARGS", {}).get("enabled", False))
-        and xp_partner_params is not None
-    )
-    eval_xp_enabled = human_proxy_xp_enabled or training_xp_enabled
+    eval_xp_enabled = human_proxy_xp_enabled
     human_proxy_params = {}
     if human_proxy_xp_enabled:
         human_proxy_params = load_human_proxy_params(
@@ -879,7 +847,6 @@ def make_train(
             "layout_sum": {},
             "layout_count": {},
             "eval_last": None,
-            "xp_last": None,
         }
 
         # TRAIN LOOP
@@ -1022,13 +989,6 @@ def make_train(
                 jnp.equal(update_steps % LOG_INTERVAL, 0),
                 jnp.equal(update_steps, int(config["NUM_UPDATES"]) - 1),
             )
-            run_xp = jnp.logical_and(
-                training_xp_enabled,
-                jnp.equal(
-                    update_steps % int(config["EVAL_KWARGS"]["eval_interval"]), 0
-                ),
-            )
-            run_eval = jnp.logical_or(run_eval, run_xp)
 
             layout_gradient_window_steps = int(
                 config["GRAD_CONFLICT_WINDOW_STEPS"]
@@ -1487,61 +1447,6 @@ def make_train(
                 )
                 return returns.mean(), critic_stats
 
-            def eval_idaac_xp(eval_env, params_1, params_2, eval_rng):
-                xp_cfg = config.get("XP_KWARGS", {})
-                num_envs = int(xp_cfg.get("num_envs", config["EVAL_KWARGS"]["num_envs"]))
-                num_steps = int(xp_cfg.get("num_steps", config["EVAL_KWARGS"]["num_steps"]))
-                beta = float(xp_cfg.get("beta", config["EVAL_KWARGS"]["beta"]))
-                argmax = bool(xp_cfg.get("argmax", config["EVAL_KWARGS"]["argmax"]))
-                num_actors = eval_env.num_agents * num_envs
-
-                eval_rng, reset_rng = jax.random.split(eval_rng)
-                obs, state = jax.vmap(eval_env.reset)(jax.random.split(reset_rng, num_envs))
-                done = jnp.zeros((num_actors,), dtype=bool)
-                hstate_1 = ActorCriticRNN.initialize_carry(num_actors, config["GRU_HIDDEN_DIM"])
-                hstate_2 = ActorCriticRNN.initialize_carry(num_actors, config["GRU_HIDDEN_DIM"])
-                returns = jnp.zeros((num_envs,), dtype=jnp.float32)
-
-                def _xp_step(carry, _):
-                    state, obs, done, hstate_1, hstate_2, returns, rng = carry
-                    rng, action_rng_1, action_rng_2, step_rng = jax.random.split(rng, 4)
-                    obs_batch = batchify(obs, eval_env.agents, num_actors)
-                    positions = batchify(
-                        {"agent_0": state.env_state.agent_pos, "agent_1": state.env_state.agent_pos},
-                        eval_env.agents,
-                        num_actors,
-                    )
-                    network_input = (
-                        obs_batch[jnp.newaxis, :],
-                        done[jnp.newaxis, :],
-                        positions[jnp.newaxis, :],
-                    )
-                    hstate_1, pi_1, _ = network.apply(params_1, hstate_1, network_input)
-                    hstate_2, pi_2, _ = network.apply(params_2, hstate_2, network_input)
-                    pi_1 = distrax.Categorical(logits=pi_1.logits * beta)
-                    pi_2 = distrax.Categorical(logits=pi_2.logits * beta)
-                    action_1 = jnp.where(
-                        argmax, jnp.argmax(pi_1.probs, axis=-1)[0], pi_1.sample(seed=action_rng_1)[0]
-                    )
-                    action_2 = jnp.where(
-                        argmax, jnp.argmax(pi_2.probs, axis=-1)[0], pi_2.sample(seed=action_rng_2)[0]
-                    )
-                    action = jnp.concatenate(
-                        [action_1[:num_envs], action_2[num_envs:]], axis=0
-                    )
-                    env_action = unbatchify(action, eval_env.agents, num_envs, eval_env.num_agents)
-                    env_action = {key: value.squeeze() for key, value in env_action.items()}
-                    obs, state, reward, done_dict, _ = jax.vmap(eval_env.step)(
-                        jax.random.split(step_rng, num_envs), state, env_action
-                    )
-                    done = batchify(done_dict, eval_env.agents, num_actors).squeeze()
-                    returns = returns + reward["agent_0"]
-                    return (state, obs, done, hstate_1, hstate_2, returns, rng), None
-
-                carry = (state, obs, done, hstate_1, hstate_2, returns, eval_rng)
-                carry, _ = jax.lax.scan(_xp_step, carry, None, num_steps)
-                return carry[5].mean()
-
             def eval_layout_xp(eval_env, main_params, bc_params_stacked, eval_rng):
                 """Cross-play score for one layout: averaged over human_proxy seeds and over
                 which env seat (agent_0/agent_1) the main agent occupies."""
@@ -1593,27 +1498,6 @@ def make_train(
                                     jnp.sqrt(value) if stat_name.endswith("rmse") else value
                                 )
                         out["mean_xp"] = jnp.mean(jnp.stack([out[f"{n}_xp"] for n in layout_names]))
-                    if training_xp_enabled:
-                        xp_base = jax.random.fold_in(base, 2000)
-                        for i, layout_name in enumerate(layout_names):
-                            out[f"{layout_name}_xp"] = jax.lax.cond(
-                                run_xp,
-                                lambda _: eval_idaac_xp(
-                                    eval_envs[layout_name],
-                                    train_state.params,
-                                    xp_partner_params,
-                                    jax.random.fold_in(xp_base, i),
-                                ),
-                                lambda _: jnp.asarray(jnp.nan, dtype=jnp.float32),
-                                operand=None,
-                            )
-                            for stat_name in EVAL_CRITIC_STAT_NAMES:
-                                out[f"{layout_name}_xp_critic_{stat_name}"] = jnp.asarray(
-                                    jnp.nan, dtype=jnp.float32
-                                )
-                        out["mean_xp"] = jnp.mean(
-                            jnp.stack([out[f"{name}_xp"] for name in layout_names])
-                        )
                     return out
 
                 def _skip_eval(_):
@@ -1664,13 +1548,6 @@ def make_train(
                                     for stat_name in EVAL_CRITIC_STAT_NAMES:
                                         source_key = f"{_ln}_xp_critic_{stat_name}"
                                         eval_last[source_key] = float(metric["eval_returns"][source_key])
-                            _log_accum["xp_last"] = {
-                                "mean_xp": eval_last["mean_xp"],
-                                **{
-                                    f"{name}_xp": eval_last[f"{name}_xp"]
-                                    for name in layout_names
-                                },
-                            }
                         _log_accum["eval_last"] = eval_last
 
                 if len(layout_names) > 0:
@@ -1704,20 +1581,6 @@ def make_train(
                         log_dict, _log_accum["eval_last"],
                         layout_names, human_proxy_xp_enabled,
                     )
-                    if training_xp_enabled and _log_accum["xp_last"] is not None:
-                        xp_mean = _log_accum["xp_last"]["mean_xp"]
-                        return_scale = 2.0 * float(config["ENV_KWARGS"]["max_steps"])
-                        log_dict["xp/return_mean_fixed_heldout"] = xp_mean
-                        log_dict["xp/normalized_return_mean_fixed_heldout"] = (
-                            xp_mean / return_scale
-                        )
-                        for name in layout_names:
-                            xp_return = _log_accum["xp_last"][f"{name}_xp"]
-                            log_dict[f"xp/return_{name}"] = xp_return
-                            log_dict[f"xp/normalized_return_{name}"] = (
-                                xp_return / return_scale
-                            )
-
                     # Expensive diagnostics are evaluated only at this update and
                     # logged directly rather than averaged across the interval.
                     for k, v in metric["layout_gradient"].items():
@@ -1991,16 +1854,11 @@ def main(config):
         "num_updates": num_updates,
     }
 
-    xp_partner_params = None
-    if bool(config.get("XP_KWARGS", {}).get("enabled", False)):
-        xp_partner_params, xp_partner_path = load_xp_partner_params(config)
-        config["XP_KWARGS"]["partner_path"] = xp_partner_path
-
     print(f"Starting from update step {final_update_step}")
     train_jit = jax.jit(
         make_train(
             config, final_update_step, save_info, opt_state,
-            resume_train_state_step, xp_partner_params,
+            resume_train_state_step,
         ),
         device=jax.devices()[0],
     )

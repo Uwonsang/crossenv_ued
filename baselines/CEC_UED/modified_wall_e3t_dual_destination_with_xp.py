@@ -100,25 +100,6 @@ def initialize_environment(config):
     return env
 
 
-def load_xp_partner_params(config):
-    partner_seed = int(config.get("XP_KWARGS", {}).get("partner_seed", 98))
-    root = (
-        f"ckpts/e3t/{config['ENV_NAME']}/modified_wall/{get_wall_map_dir_name(config)}"
-        f"/ikFalse/{config['ENV_KWARGS']['random_reset_fn']}/e3t"
-    )
-    matches = glob.glob(
-        f"{root}/**/seed{partner_seed}_ckpt0_e3t_updates*.pkl",
-        recursive=True,
-    )
-    if not matches:
-        raise FileNotFoundError(
-            f"Missing E3T XP partner seed{partner_seed} under {root}"
-        )
-    path = max(matches, key=os.path.getmtime)
-    with open(path, "rb") as f:
-        checkpoint = pickle.load(f)
-    print(f"Loaded E3T XP partner seed{partner_seed}: {path}")
-    return checkpoint["params"], path
 
 
 class ScannedRNN(nn.Module):
@@ -292,7 +273,7 @@ def unbatchify(x: jnp.ndarray, agent_list, num_envs, num_actors):
     return {a: x[i] for i, a in enumerate(agent_list)}
 
 
-def make_train(config, update_step=0, xp_partner_params=None):
+def make_train(config, update_step=0):
     # env = jaxmarl.make(config["ENV_NAME"], **config["ENV_KWARGS"])
     env = initialize_environment(config)
     
@@ -335,14 +316,6 @@ def make_train(config, update_step=0, xp_partner_params=None):
         )
         if eval_all_layouts
         else {}
-    )
-    training_xp_enabled = (
-        bool(config.get("XP_KWARGS", {}).get("enabled", False))
-        and xp_partner_params is not None
-    )
-    xp_layout_names = get_toy_layout_names(config)
-    xp_eval_envs = (
-        make_modified_wall_eval_envs(config) if training_xp_enabled else {}
     )
     LOG_INTERVAL = max(1, int(config["NUM_UPDATES"]) // 100)
 
@@ -433,110 +406,6 @@ def make_train(config, update_step=0, xp_partner_params=None):
                     config["EVAL_KWARGS"]["human_proxy_num_seeds"]
                 ),
             )
-
-        def eval_training_xp(eval_env, params_1, params_2, eval_rng):
-            xp_cfg = config.get("XP_KWARGS", {})
-            num_envs = int(
-                xp_cfg.get("num_envs", config["EVAL_KWARGS"]["num_envs"])
-            )
-            num_steps = int(
-                xp_cfg.get("num_steps", config["EVAL_KWARGS"]["num_steps"])
-            )
-            beta = float(
-                xp_cfg.get("beta", config["EVAL_KWARGS"]["beta"])
-            )
-            argmax = bool(
-                xp_cfg.get("argmax", config["EVAL_KWARGS"]["argmax"])
-            )
-            num_actors = eval_env.num_agents * num_envs
-
-            eval_rng, reset_rng = jax.random.split(eval_rng)
-            obs, state = jax.vmap(eval_env.reset)(
-                jax.random.split(reset_rng, num_envs)
-            )
-            done = jnp.zeros((num_actors,), dtype=bool)
-            hstate_1 = ScannedRNN.initialize_carry(
-                num_actors, config["GRU_HIDDEN_DIM"]
-            )
-            hstate_2 = ScannedRNN.initialize_carry(
-                num_actors, config["GRU_HIDDEN_DIM"]
-            )
-            returns = jnp.zeros((num_envs,), dtype=jnp.float32)
-
-            def _xp_step(carry, _):
-                state, obs, done, hstate_1, hstate_2, returns, rng = carry
-                rng, action_rng_1, action_rng_2, step_rng = jax.random.split(
-                    rng, 4
-                )
-                obs_batch = batchify(obs, eval_env.agents, num_actors)
-                positions = batchify(
-                    {
-                        "agent_0": state.env_state.agent_pos,
-                        "agent_1": state.env_state.agent_pos,
-                    },
-                    eval_env.agents,
-                    num_actors,
-                )
-                network_input = (
-                    obs_batch[jnp.newaxis, :],
-                    done[jnp.newaxis, :],
-                    positions[jnp.newaxis, :],
-                )
-                hstate_1, pi_1, _, _ = network.apply(
-                    params_1, hstate_1, network_input
-                )
-                hstate_2, pi_2, _, _ = network.apply(
-                    params_2, hstate_2, network_input
-                )
-                pi_1 = distrax.Categorical(logits=pi_1.logits * beta)
-                pi_2 = distrax.Categorical(logits=pi_2.logits * beta)
-                action_1 = jnp.where(
-                    argmax,
-                    jnp.argmax(pi_1.probs, axis=-1)[0],
-                    pi_1.sample(seed=action_rng_1)[0],
-                )
-                action_2 = jnp.where(
-                    argmax,
-                    jnp.argmax(pi_2.probs, axis=-1)[0],
-                    pi_2.sample(seed=action_rng_2)[0],
-                )
-                action = jnp.concatenate(
-                    [action_1[:num_envs], action_2[num_envs:]], axis=0
-                )
-                env_action = unbatchify(
-                    action, eval_env.agents, num_envs, eval_env.num_agents
-                )
-                env_action = {
-                    key: value.squeeze() for key, value in env_action.items()
-                }
-                obs, state, reward, done_dict, _ = jax.vmap(eval_env.step)(
-                    jax.random.split(step_rng, num_envs), state, env_action
-                )
-                done = batchify(
-                    done_dict, eval_env.agents, num_actors
-                ).squeeze()
-                returns = returns + reward["agent_0"]
-                return (
-                    state,
-                    obs,
-                    done,
-                    hstate_1,
-                    hstate_2,
-                    returns,
-                    rng,
-                ), None
-
-            carry = (
-                state,
-                obs,
-                done,
-                hstate_1,
-                hstate_2,
-                returns,
-                eval_rng,
-            )
-            carry, _ = jax.lax.scan(_xp_step, carry, None, num_steps)
-            return carry[5].mean()
 
         # TRAIN LOOP
         @scan_tqdm(int(config["NUM_UPDATES"]))
@@ -846,48 +715,6 @@ def make_train(config, update_step=0, xp_partner_params=None):
                     run_eval, _do_eval, _skip_eval, operand=None
                 )
 
-            if training_xp_enabled:
-                run_training_xp = (
-                    (
-                        update_steps
-                        % int(config["EVAL_KWARGS"]["eval_interval"])
-                        == 0
-                    )
-                    | (update_steps == int(config["NUM_UPDATES"]) - 1)
-                )
-
-                def _do_training_xp(_):
-                    base = jax.random.fold_in(rng, update_steps)
-                    out = {}
-                    for i, xp_layout_name in enumerate(xp_layout_names):
-                        out[xp_layout_name] = eval_training_xp(
-                            xp_eval_envs[xp_layout_name],
-                            train_state.params,
-                            xp_partner_params,
-                            jax.random.fold_in(base, 2000 + i),
-                        )
-                    out["mean"] = jnp.mean(
-                        jnp.stack([out[name] for name in xp_layout_names])
-                    )
-                    return out
-
-                def _skip_training_xp(_):
-                    out = {
-                        name: jnp.asarray(jnp.nan, dtype=jnp.float32)
-                        for name in xp_layout_names
-                    }
-                    out["mean"] = jnp.asarray(
-                        jnp.nan, dtype=jnp.float32
-                    )
-                    return out
-
-                metric["training_xp_returns"] = jax.lax.cond(
-                    run_training_xp,
-                    _do_training_xp,
-                    _skip_training_xp,
-                    operand=None,
-                )
-
             def callback(metric):
                 log_data = {
                     "returns": metric["returns"],
@@ -912,26 +739,6 @@ def make_train(config, update_step=0, xp_partner_params=None):
                             log_data[f"eval_xp/{eval_layout_name}"] = float(
                                 metric["eval_returns"][f"{eval_layout_name}_xp"]
                             )
-                if "training_xp_returns" in metric:
-                    xp_mean = float(metric["training_xp_returns"]["mean"])
-                    if np.isfinite(xp_mean):
-                        return_scale = 2.0 * float(
-                            config["ENV_KWARGS"]["max_steps"]
-                        )
-                        log_data["xp/return_mean_fixed_heldout"] = xp_mean
-                        log_data[
-                            "xp/normalized_return_mean_fixed_heldout"
-                        ] = xp_mean / return_scale
-                        for xp_layout_name in xp_layout_names:
-                            xp_return = float(
-                                metric["training_xp_returns"][xp_layout_name]
-                            )
-                            log_data[
-                                f"xp/return_{xp_layout_name}"
-                            ] = xp_return
-                            log_data[
-                                f"xp/normalized_return_{xp_layout_name}"
-                            ] = xp_return / return_scale
                 wandb.log(log_data, step=int(metric["update_steps"]))
                 current_return = float(metric["returns"])
                 if current_return > best_return[0]:
@@ -986,11 +793,6 @@ def main(config):
     map_name = get_wall_map_name(config)
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
 
-    xp_partner_params = None
-    if bool(config.get("XP_KWARGS", {}).get("enabled", False)):
-        xp_partner_params, xp_partner_path = load_xp_partner_params(config)
-        config["XP_KWARGS"]["partner_path"] = xp_partner_path
-
     if config["WANDB_MODE"] == "online":
         with open("private.yaml") as f:
             private_info = yaml.load(f, Loader=yaml.FullLoader)
@@ -1023,7 +825,6 @@ def main(config):
         make_train(
             config,
             final_update_step,
-            xp_partner_params=xp_partner_params,
         ),
         device=jax.devices()[0],
     )

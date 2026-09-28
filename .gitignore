@@ -206,6 +206,10 @@ overcooked_decoupled_scaling.pdf
 # evaluation / plotting code kept out of the published repo
 local_only/
 
+# AI assistant instruction files (kept locally, not published)
+AGENTS.md
+CLAUDE.md
+
 # paper-internal notes: reviews, audits, cleanup logs (never publish)
 docs/reviews/
 docs/audits/
@@ -228,3 +232,7 @@ CLEANUP_NOTES.md
 Thumbs.db
 
 
+
+# stray screenshots / images at repo root
+/*.png
+/*.jpg

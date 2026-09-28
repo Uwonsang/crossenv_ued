@@ -201,5 +201,27 @@ baselines/CEC_UED/results/*
 ongoingworks.pdf
 2504.12714v2.pdf
 overcooked_decoupled_scaling.pdf
+*.pdf
+
+# paper-internal notes: reviews, audits, cleanup logs (never publish)
+docs/reviews/
+docs/audits/
+CLEANUP_NOTES.md
+
+# model checkpoints (ckpts/ and our_ckpts/ are already ignored above)
+*.pkl
+!baselines/human_proxy/checkpoints/**/*.pkl
+
+# experiment artifacts
+*.h5
+*.hdf5
+
+# stray editor / OS files
+*.orig
+*.rej
+* copy
+* copy.*
+.DS_Store
+Thumbs.db
 
 

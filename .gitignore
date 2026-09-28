@@ -203,6 +203,9 @@ ongoingworks.pdf
 overcooked_decoupled_scaling.pdf
 *.pdf
 
+# evaluation / plotting code kept out of the published repo
+local_only/
+
 # paper-internal notes: reviews, audits, cleanup logs (never publish)
 docs/reviews/
 docs/audits/

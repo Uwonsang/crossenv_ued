@@ -13,6 +13,18 @@ import numpy as np
 from PIL import Image, ImageChops
 
 
+plt.rcParams.update({
+    "font.family": "DejaVu Sans",
+    "font.size": 24,
+    "axes.titlesize": 28,
+    "axes.labelsize": 24,
+    "xtick.labelsize": 24,
+    "ytick.labelsize": 24,
+    "figure.titlesize": 28,
+    "legend.fontsize": 24,
+})
+
+
 REPO_ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_DIR = REPO_ROOT / "artifacts" / "standard_layouts"
 
@@ -20,7 +32,9 @@ DEFAULT_DIR = REPO_ROOT / "artifacts" / "standard_layouts"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--dual-image", type=Path, default=DEFAULT_DIR / "dual_setting.png"
+        "--dual-image",
+        type=Path,
+        default=DEFAULT_DIR / "dual_setting_no_titles.png",
     )
     parser.add_argument(
         "--overcooked-image",
@@ -74,7 +88,7 @@ def main():
         center = bounds[0] + bounds[2] / 2
         figure.text(
             center, 0.075, label, ha="center", va="center",
-            fontsize=18, fontfamily="serif",
+            fontsize=24, fontfamily="DejaVu Sans",
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

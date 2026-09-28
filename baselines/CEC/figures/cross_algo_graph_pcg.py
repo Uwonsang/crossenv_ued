@@ -75,16 +75,16 @@ def save_heatmap(data: pd.DataFrame, tag: str, save_dir: Path) -> None:
     image = plot_heatmap(
         ax,
         data,
-        "Overall",
+        "100 Procedurally Generated Tasks",
         xlabel="Agent 1" if tag == "directional" else "Algorithm",
         ylabel="Agent 0" if tag == "directional" else "Algorithm",
         vmin=vmin,
         vmax=vmax,
+        title_fontweight="normal",
     )
     # Keep the same blue scale used by the fixed-task cross-play figure.
     image.set_cmap(CEC_IDAAC_BLUE)
     colorbar = fig.colorbar(image, ax=ax, pad=0.04, fraction=0.05)
-    colorbar.set_label("Mean Reward", fontsize=22)
     colorbar.ax.tick_params(labelsize=18)
     fig.tight_layout()
 

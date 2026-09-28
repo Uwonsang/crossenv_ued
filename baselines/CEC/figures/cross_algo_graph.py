@@ -4,6 +4,9 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
@@ -104,6 +107,7 @@ def plot_heatmap(
     label_fontsize: int = 20,
     axis_fontsize: int = 22,
     title_fontsize: int = 24,
+    title_fontweight: str = "bold",
     value_fontsize: int = 17,
 ):
     algos = list(data.index)
@@ -130,7 +134,10 @@ def plot_heatmap(
     ax.set_yticklabels(display_algos, fontsize=label_fontsize)
     ax.set_xlabel(xlabel, fontsize=axis_fontsize)
     ax.set_ylabel(ylabel, fontsize=axis_fontsize)
-    ax.set_title(title, fontsize=title_fontsize, fontweight="bold", pad=12)
+    ax.set_title(
+        title, fontsize=title_fontsize,
+        fontweight=title_fontweight, pad=12,
+    )
 
     for i in range(len(algos)):
         for j in range(len(algos)):
@@ -238,11 +245,13 @@ def save_figures(
     )
 
     fig2, ax2 = plt.subplots(figsize=(14.0, 7.5))
-    im2 = plot_heatmap(ax2, overall_pivot, "Overall",
-                       xlabel=xlabel, ylabel=ylabel,
-                       vmin=color_min, vmax=color_max)
+    im2 = plot_heatmap(
+        ax2, overall_pivot, "5 Fixed Tasks",
+        xlabel=xlabel, ylabel=ylabel,
+        vmin=color_min, vmax=color_max,
+        title_fontweight="normal",
+    )
     cbar2 = fig2.colorbar(im2, ax=ax2, pad=0.04, fraction=0.05)
-    cbar2.set_label("Mean Reward", fontsize=22)
     cbar2.ax.tick_params(labelsize=18)
     fig2.tight_layout()
 

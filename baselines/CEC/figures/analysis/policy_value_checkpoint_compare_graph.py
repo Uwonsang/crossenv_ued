@@ -143,11 +143,14 @@ def render_state(config: dict, record: dict, horizon: int) -> np.ndarray:
     return crop_counter_circuit_view(image, record)
 
 
-def draw_state(axis, record: dict, image: np.ndarray) -> None:
+def draw_state(
+    axis, record: dict, image: np.ndarray, display_variant: str | None = None
+) -> None:
     axis.imshow(image)
     axis.axis("off")
     axis.set_title(
-        f"Environment {record['variant']}",
+        f"Environment {display_variant or record['variant']}",
+        fontweight="normal",
     )
 
 
@@ -234,6 +237,23 @@ def load_metrics(
     return rows
 
 
+def prioritize_joint_interact(
+    states: list[dict], rows: dict[str, pd.Series]
+) -> list[dict]:
+    """Place the environment where both policies choose Interact first."""
+    def both_choose_interact(state: dict) -> bool:
+        variant = str(state["variant"]).lower()
+        action_column = f"argmax_{variant}"
+        return all(
+            str(rows[model][action_column]).lower() == "interact"
+            for model in MODEL_ORDER
+        )
+
+    # Python's stable sort preserves the original A/B order when both
+    # environments have the same joint-Interact status.
+    return sorted(states, key=lambda state: not both_choose_interact(state))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--analysis-dir", type=Path, required=True)
@@ -255,6 +275,7 @@ def main() -> None:
         parser.error(str(error))
     if len(states) != 2:
         parser.error(f"Expected two states, found {len(states)}")
+    states = prioritize_joint_interact(states, rows)
     config = load_config(args.config)
     state_images = [render_state(config, state, args.horizon) for state in states]
     state_images = trim_pair_to_common_content(state_images, states)
@@ -268,14 +289,21 @@ def main() -> None:
     grid = figure.add_gridspec(
         2, 2, height_ratios=(3.2, .30), hspace=.01, wspace=.04
     )
-    draw_state(figure.add_subplot(grid[0, 0]), states[0], state_images[0])
-    draw_state(figure.add_subplot(grid[0, 1]), states[1], state_images[1])
+    # Paper convention: after prioritizing the joint-Interact state, rename
+    # the displayed left/right environments A/B. Metric lookup below still
+    # uses each state's original variant so behavior remains correctly paired.
+    draw_state(
+        figure.add_subplot(grid[0, 0]), states[0], state_images[0], "A"
+    )
+    draw_state(
+        figure.add_subplot(grid[0, 1]), states[1], state_images[1], "B"
+    )
     summary_artists = []
     summary_artists.extend(draw_behavior(
-        figure.add_subplot(grid[1, 0]), "A", rows
+        figure.add_subplot(grid[1, 0]), str(states[0]["variant"]), rows
     ))
     summary_artists.extend(draw_behavior(
-        figure.add_subplot(grid[1, 1]), "B", rows
+        figure.add_subplot(grid[1, 1]), str(states[1]["variant"]), rows
     ))
 
     figure.subplots_adjust(top=.95, bottom=.02, left=.005, right=.995)

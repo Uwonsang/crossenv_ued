@@ -134,6 +134,11 @@ def load_grid(config, results_dir: Path) -> pd.DataFrame:
                 if n_pairs > 1
                 else 0.0
             )
+            # Treat seed_1 as the focal training seed. Average over partner
+            # seeds and trajectories before averaging across layouts.
+            seed_rewards = (
+                df.groupby("seed_1")["reward"].mean().astype(float).to_dict()
+            )
             rows.append(
                 {
                     "algorithm": alg,
@@ -142,6 +147,7 @@ def load_grid(config, results_dir: Path) -> pd.DataFrame:
                     "sem_pairs": sem_pairs,
                     "n_pairs": n_pairs,
                     "n_rows": len(df),
+                    "seed_rewards": seed_rewards,
                     "source_file": str(path),
                 }
             )
@@ -196,6 +202,10 @@ def load_human_proxy_grid(results_dir: Path) -> pd.DataFrame:
                     "sem_pairs": sem_pairs,
                     "n_pairs": n_pairs,
                     "n_rows": len(df),
+                    "seed_rewards": (
+                        df.groupby("model_seed")["reward"]
+                        .mean().astype(float).to_dict()
+                    ),
                     "source_file": str(path),
                 }
             )
@@ -254,7 +264,7 @@ def plot_per_map(
         )
         label = MAP_LABEL_KO.get(map_name, map_name)
         ax.set_title(label)
-        ax.set_ylabel("mean reward")
+        ax.set_ylabel("Mean Reward")
         ax.grid(axis="y", alpha=0.35)
         ax.set_axisbelow(True)
 
@@ -266,20 +276,46 @@ def plot_per_map(
     plt.close(fig)
 
 
+def aggregate_overall_by_seed(grid: pd.DataFrame) -> pd.DataFrame:
+    """Average layouts within each training seed, then summarize seeds."""
+    seed_rows = []
+    for row in grid.itertuples(index=False):
+        for seed, reward in row.seed_rewards.items():
+            seed_rows.append(
+                {
+                    "algorithm": row.algorithm,
+                    "map": row.map,
+                    "seed": int(seed),
+                    "reward": float(reward),
+                }
+            )
+    if not seed_rows:
+        raise RuntimeError("No seed-level rewards are available")
+
+    seed_frame = pd.DataFrame(seed_rows)
+    seed_overall = (
+        seed_frame.groupby(["algorithm", "seed"], as_index=False)["reward"]
+        .mean()
+    )
+    overall = seed_overall.groupby("algorithm", as_index=False).agg(
+        mean_reward=("reward", "mean"),
+        std_seeds=("reward", "std"),
+        n_seeds=("reward", "count"),
+    )
+    overall["sem_seeds"] = (
+        overall["std_seeds"] / np.sqrt(overall["n_seeds"])
+    ).fillna(0.0)
+    return overall.set_index("algorithm").reindex(ALG_ORDER)
+
+
 def plot_overall(
     grid: pd.DataFrame,
     out_path: Path,
     evaluation_label: str,
 ) -> None:
-    overall = (
-        grid.groupby("algorithm", as_index=False)
-        .agg(mean_reward=("mean_reward", "mean"), std_maps=("mean_reward", "std"), n_maps=("mean_reward", "count"))
-        .set_index("algorithm")
-        .reindex(ALG_ORDER)
-    )
+    overall = aggregate_overall_by_seed(grid)
     means = overall["mean_reward"].values.astype(float)
-
-    errs = (overall["std_maps"] / np.sqrt(overall["n_maps"])).values.astype(float)
+    errs = overall["sem_seeds"].values.astype(float)
     errs = np.nan_to_num(errs, nan=0.0)
 
     fig, ax = plt.subplots(figsize=(14.0, 7.5))
@@ -303,7 +339,7 @@ def plot_overall(
     ax.set_xticklabels(overall_labels, rotation=0, ha="center")
     ax.tick_params(axis="x", labelsize=24, pad=12)
     ax.tick_params(axis="y", labelsize=24)
-    ax.set_ylabel("mean reward (average over maps)", fontsize=26)
+    ax.set_ylabel("Mean Reward", fontsize=26)
     ax.grid(axis="y", alpha=0.35)
     ax.set_axisbelow(True)
     fig.tight_layout()
@@ -317,18 +353,7 @@ def plot_overall_line(
     evaluation_label: str,
 ) -> None:
     """Plot scaling as one line per architecture without replacing the bars."""
-    overall = (
-        grid.groupby("algorithm", as_index=False)
-        .agg(
-            mean_reward=("mean_reward", "mean"),
-            std_maps=("mean_reward", "std"),
-            n_maps=("mean_reward", "count"),
-        )
-        .set_index("algorithm")
-    )
-    overall["sem_maps"] = (
-        overall["std_maps"] / np.sqrt(overall["n_maps"])
-    ).fillna(0.0)
+    overall = aggregate_overall_by_seed(grid)
 
     env_counts = np.asarray([32, 64, 128, 256])
     x = np.arange(len(env_counts))
@@ -353,7 +378,7 @@ def plot_overall_line(
         ax.errorbar(
             x,
             family["mean_reward"].to_numpy(dtype=float),
-            yerr=family["sem_maps"].to_numpy(dtype=float),
+            yerr=family["sem_seeds"].to_numpy(dtype=float),
             label=label,
             color=color,
             marker=marker,
@@ -365,8 +390,8 @@ def plot_overall_line(
     ax.set_xticks(x)
     ax.set_xticklabels(["8K", "16K", "32K", "65K"])
     ax.set_xlabel("Batch Size")
-    ax.set_ylabel("mean reward (average over maps)")
-    ax.grid(alpha=0.35)
+    ax.set_ylabel("XP Reward")
+    ax.grid(alpha=0.25)
     ax.set_axisbelow(True)
     ax.legend(frameon=False)
     fig.tight_layout()
@@ -412,19 +437,8 @@ def save_graph_set(
     )
     pivot = pivot.reindex(index=MAP_ORDER, columns=ALG_ORDER)
     pivot.to_csv(per_map_csv, encoding="utf-8")
-    overall_df = (
-        grid.groupby("algorithm", as_index=False)
-        .agg(
-            mean_over_maps=("mean_reward", "mean"),
-            std_across_maps=("mean_reward", "std"),
-            n_maps=("mean_reward", "count"),
-        )
-    )
-    overall_df["sem_across_maps"] = (
-        overall_df["std_across_maps"] / np.sqrt(overall_df["n_maps"])
-    )
-    overall_df = (
-        overall_df.set_index("algorithm").reindex(ALG_ORDER).reset_index()
+    overall_df = aggregate_overall_by_seed(grid).reset_index().rename(
+        columns={"mean_reward": "mean_over_maps"}
     )
     overall_df.to_csv(overall_csv, index=False, encoding="utf-8")
 

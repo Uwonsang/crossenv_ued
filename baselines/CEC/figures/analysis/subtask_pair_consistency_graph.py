@@ -28,8 +28,11 @@ FAMILY_ORDER = (
     "forced_coord", "cramped_room",
 )
 FAMILY_LABELS = {
-    "asymm_advantages": "AA", "counter_circuit": "CC",
-    "coord_ring": "CR", "forced_coord": "FC", "cramped_room": "CRoom",
+    "asymm_advantages": "Asymmetric\nAdvantages",
+    "counter_circuit": "Counter\nCircuit",
+    "coord_ring": "Coordination\nRing",
+    "forced_coord": "Forced\nCoordination",
+    "cramped_room": "Cramped\nRoom",
 }
 MODEL_LABELS = {"CEC": "CEC", "CEC_IDAAC": "DCEC"}
 MODEL_COLORS = {"CEC": "#117733", "CEC_IDAAC": "#56B4E9"}
@@ -209,6 +212,73 @@ def plot_overall(summary: pd.DataFrame, output: Path) -> None:
     plt.close(figure)
 
 
+def plot_policy_js_paper(
+    summary: pd.DataFrame,
+    category: str | None,
+    categories: list[str],
+    labels: list[str],
+    output: Path,
+    *,
+    figure_size: tuple[float, float] | None = None,
+    show_ylabel: bool = True,
+    legend_inside: bool = False,
+    panel_title: str | None = None,
+) -> None:
+    """Draw a compact paper panel containing only policy JS divergence."""
+    series_names = ordered_series(summary)
+    x = np.arange(len(categories), dtype=float)
+    width = .76 / len(series_names)
+    if figure_size is None:
+        figure_size = (max(7.2, 1.35 * len(categories) + 2.6), 4.8)
+    figure, axis = plt.subplots(figsize=figure_size)
+    for offset, series in enumerate(series_names):
+        if category is None:
+            subset = summary.set_index("series").reindex([series])
+        else:
+            subset = (
+                summary[summary["series"] == series]
+                .set_index(category).reindex(categories)
+            )
+        positions = x + (offset - (len(series_names) - 1) / 2) * width
+        model_values = subset["model"].dropna()
+        model = model_values.iloc[0] if len(model_values) else series
+        axis.bar(
+            positions,
+            subset["policy_js_nats_mean"],
+            width=width,
+            yerr=subset["policy_js_nats_sem"],
+            capsize=4,
+            color=MODEL_COLORS.get(model, ".5"),
+            alpha=.85,
+            edgecolor="none",
+            linewidth=0,
+            error_kw={"ecolor": "black", "elinewidth": 1.5},
+            label=series.rsplit(" (", 1)[0],
+        )
+    axis.set_xticks(x)
+    axis.set_xticklabels(labels)
+    if show_ylabel:
+        axis.set_ylabel("Policy JS Divergence")
+    if panel_title is not None:
+        axis.set_title(panel_title, pad=12, fontweight="normal")
+    axis.set_ylim(bottom=0)
+    axis.grid(False)
+    axis.set_axisbelow(True)
+    if legend_inside:
+        axis.legend(
+            loc="upper right", bbox_to_anchor=(.98, 1.0),
+            ncol=1, frameon=False,
+        )
+    else:
+        axis.legend(
+            loc="upper center", bbox_to_anchor=(.5, 1.16),
+            ncol=len(series_names), frameon=False,
+        )
+    figure.tight_layout()
+    figure.savefig(output, bbox_inches="tight", pad_inches=.02)
+    plt.close(figure)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-root", type=Path, required=True)
@@ -237,6 +307,11 @@ def main() -> None:
         [SUBTASK_LABELS[subtask] for subtask in subtasks],
         output_dir / "subtask_consistency_by_subtask.pdf",
     )
+    plot_policy_js_paper(
+        by_subtask, "subtask", subtasks,
+        [SUBTASK_LABELS[subtask] for subtask in subtasks],
+        output_dir / "subtask_policy_js_by_subtask_paper.pdf",
+    )
 
     by_layout_seed = equal_weight_aggregate(seed_frame, "family")
     by_layout = summarize(by_layout_seed, ["family"])
@@ -248,10 +323,23 @@ def main() -> None:
         [FAMILY_LABELS.get(family, family) for family in families],
         output_dir / "subtask_consistency_by_layout.pdf",
     )
+    plot_policy_js_paper(
+        by_layout, "family", families,
+        [FAMILY_LABELS.get(family, family) for family in families],
+        output_dir / "subtask_policy_js_by_layout_paper.pdf",
+        figure_size=(8.5, 5.2),
+        show_ylabel=True,
+        legend_inside=True,
+        panel_title="(b) Cross-Environment Policy Divergence (↓)",
+    )
 
     overall_seed = equal_weight_aggregate(seed_frame, None)
     overall = summarize(overall_seed, [])
     plot_overall(overall, output_dir / "subtask_consistency_overall.pdf")
+    plot_policy_js_paper(
+        overall, None, ["Overall"], ["Overall"],
+        output_dir / "subtask_policy_js_overall_paper.pdf",
+    )
 
     seed_frame.to_csv(output_dir / "subtask_consistency_by_seed.csv", index=False)
     by_subtask.to_csv(

@@ -15,13 +15,14 @@ import matplotlib.pyplot as plt
 
 plt.rcParams.update(
     {
-        "font.size": 18,
-        "axes.titlesize": 20,
-        "axes.labelsize": 20,
-        "xtick.labelsize": 18,
-        "ytick.labelsize": 18,
-        "figure.titlesize": 22,
-        "legend.fontsize": 18,
+        "font.family": "DejaVu Sans",
+        "font.size": 24,
+        "axes.titlesize": 28,
+        "axes.labelsize": 24,
+        "xtick.labelsize": 24,
+        "ytick.labelsize": 24,
+        "figure.titlesize": 28,
+        "legend.fontsize": 24,
     }
 )
 
@@ -243,7 +244,7 @@ def make_checkpoint_summary(pair_units: pd.DataFrame) -> pd.DataFrame:
 
 def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
     indexed = summary.set_index("algorithm").reindex(ALGORITHM_ORDER)
-    fig, ax = plt.subplots(figsize=(14.0, 7.5))
+    fig, ax = plt.subplots(figsize=(10.0, 5.694))
     x = np.arange(len(ALGORITHM_ORDER))
     ax.bar(
         x,
@@ -251,9 +252,9 @@ def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
         yerr=indexed["sem_pair_units"],
         capsize=5,
         color=[ALGORITHM_COLORS[a] for a in ALGORITHM_ORDER],
-        edgecolor="black",
-        linewidth=0.7,
-        alpha=0.92,
+        edgecolor="none",
+        linewidth=0,
+        alpha=0.8,
     )
     ax.set_xticks(x)
     overall_labels = [
@@ -263,16 +264,14 @@ def plot_overall(summary: pd.DataFrame, output_path: Path) -> None:
         for algorithm in ALGORITHM_ORDER
     ]
     ax.set_xticklabels(overall_labels, rotation=0, ha="center")
-    ax.tick_params(axis="x", labelsize=24, pad=12)
-    ax.tick_params(axis="y", labelsize=24)
-    ax.set_ylabel("XP Reward", fontsize=26)
+    ax.tick_params(axis="x", pad=12)
+    ax.set_ylabel("XP Reward")
     ax.set_title(
         "(b) 100 Procedurally Generated Tasks",
-        fontsize=28,
-        fontweight="bold",
+        fontweight="normal",
         pad=16,
     )
-    ax.grid(axis="y", alpha=0.35)
+    ax.grid(False)
     ax.set_axisbelow(True)
     fig.tight_layout()
     fig.savefig(output_path)

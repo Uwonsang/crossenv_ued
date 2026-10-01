@@ -131,6 +131,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--num-envs", nargs="*", type=int, default=None)
     parser.add_argument(
+        "--seeds",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Only include runs whose SEED is one of these values.",
+    )
+    parser.add_argument(
         "--algorithms",
         nargs="*",
         default=("CEC", "CEC_DECOUPLED", "CEC_IDAAC"),
@@ -216,6 +223,8 @@ def fetch_history(args: argparse.Namespace):
             print(f"Skipping run with invalid NUM_ENVS/SEED: {run.id}")
             continue
         if args.num_envs and num_envs not in args.num_envs:
+            continue
+        if args.seeds and seed not in args.seeds:
             continue
 
         if not any(metric in run.summary for metric in ALL_METRICS):
@@ -375,6 +384,20 @@ def build_window_summary(args, history_rows, run_rows, window_start):
 
 
 def short_metric_name(metric: str) -> str:
+    display_names = {
+        "sample_gradient_gsnr/value_parameterwise_gsnr_mean": (
+            "Mean parameter-wise GSNR"
+        ),
+        "sample_gradient_gsnr/value_parameterwise_gsnr_mean_log10": (
+            "Mean parameter-wise log10(GSNR)"
+        ),
+        "env_gradient_snr/policy_snr": "Policy gradient SNR",
+        "env_gradient_snr/value_snr": "Value gradient SNR",
+        "env_gradient_snr/policy_log_snr": "Policy gradient log10(SNR)",
+        "env_gradient_snr/value_log_snr": "Value gradient log10(SNR)",
+    }
+    if metric in display_names:
+        return display_names[metric]
     return metric.split("/", 1)[1].replace("_", " ")
 
 
@@ -386,6 +409,11 @@ def subplot_grid(num_panels: int):
 
 def plot_summary(args, aggregate_rows, window_start, output_suffix):
     for group, configured_metrics in METRIC_GROUPS.items():
+        plotted_algorithms = (
+            ("CEC", "CEC_DECOUPLED")
+            if group == "sample_gradient_gsnr"
+            else args.algorithms
+        )
         metrics = [
             metric for metric in configured_metrics
             if any(row["metric"] == metric for row in aggregate_rows)
@@ -396,7 +424,7 @@ def plot_summary(args, aggregate_rows, window_start, output_suffix):
         fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 3.8 * rows))
         axes = np.asarray(axes, dtype=object).reshape(-1)
         for ax, metric in zip(axes, metrics):
-            for algorithm in args.algorithms:
+            for algorithm in plotted_algorithms:
                 points = [
                     row for row in aggregate_rows
                     if row["algorithm"] == algorithm and row["metric"] == metric
@@ -438,10 +466,214 @@ def plot_summary(args, aggregate_rows, window_start, output_suffix):
         )
         fig.tight_layout(rect=(0, 0, 1, 0.91))
         output = args.output_dir / (
-            f"{group}_vs_num_envs_{output_suffix}.png"
+            f"{group}_vs_num_envs_{output_suffix}.pdf"
         )
-        fig.savefig(output, dpi=200, bbox_inches="tight")
+        fig.savefig(output, bbox_inches="tight")
         plt.close(fig)
+
+
+def plot_metrics_over_training(
+    args,
+    history_rows,
+    group,
+    filenames,
+    figure_titles,
+):
+    """Write one 2x2 training figure per configured metric."""
+    configured_metrics = tuple(
+        metric for metric in METRIC_GROUPS[group] if metric in filenames
+    )
+    compared_algorithms = ("CEC", "CEC_DECOUPLED")
+    rows = [
+        row for row in history_rows
+        if row["metric_group"] == group
+        and row["metric"] in configured_metrics
+        and row["algorithm"] in compared_algorithms
+    ]
+    if not rows:
+        return
+
+    algorithms = [
+        algorithm for algorithm in compared_algorithms
+        if algorithm in args.algorithms
+        if any(row["algorithm"] == algorithm for row in rows)
+    ]
+    metrics = [
+        metric for metric in configured_metrics
+        if any(row["metric"] == metric for row in rows)
+    ]
+    if not algorithms or not metrics:
+        return
+
+    # Exact env-step values coincide across seeds for a fixed NUM_ENVS. If
+    # multiple seeds are selected, average them at each measurement step; no
+    # averaging or smoothing is performed across training time.
+    grouped_values = defaultdict(list)
+    for row in rows:
+        key = (
+            row["algorithm"],
+            row["num_envs"],
+            row["metric"],
+            row["env_step"],
+        )
+        grouped_values[key].append(row["value"])
+
+    num_envs_values = sorted({row["num_envs"] for row in rows})
+    for metric in metrics:
+        is_log10 = metric.endswith("_log10") or metric.endswith("_log_snr")
+        figure_title = figure_titles.get(metric)
+        panel_title_size = 16 if is_log10 else 14
+        axis_label_size = 15 if is_log10 else 13
+        tick_label_size = 13 if is_log10 else 11
+        legend_size = 14 if is_log10 else 12
+        subplot_rows = 2
+        subplot_cols = int(math.ceil(len(num_envs_values) / subplot_rows))
+        fig, axes = plt.subplots(
+            subplot_rows,
+            subplot_cols,
+            figsize=(10.5, 7.5),
+            squeeze=False,
+            sharex=True,
+            sharey=True,
+        )
+        for column_index, num_envs in enumerate(num_envs_values):
+            ax = axes.reshape(-1)[column_index]
+            for algorithm in algorithms:
+                points = [
+                    (
+                        env_step,
+                        float(np.mean(values)),
+                        float(np.std(values, ddof=1))
+                        if len(values) > 1 else 0.0,
+                    )
+                    for (alg, envs, metric_name, env_step), values
+                    in grouped_values.items()
+                    if alg == algorithm
+                    and envs == num_envs
+                    and metric_name == metric
+                ]
+                if not points:
+                    continue
+                points.sort(key=lambda item: item[0])
+                x = np.asarray([point[0] for point in points]) / 1e6
+                y = np.asarray([point[1] for point in points])
+                yerr = np.asarray([point[2] for point in points])
+                ax.plot(
+                    x,
+                    y,
+                    color=ALGORITHM_COLORS[algorithm],
+                    linewidth=1.6,
+                    label=algorithm,
+                )
+                if np.any(yerr > 0.0):
+                    ax.fill_between(
+                        x,
+                        y - yerr,
+                        y + yerr,
+                        color=ALGORITHM_COLORS[algorithm],
+                        alpha=0.12,
+                        linewidth=0,
+                    )
+            ax.set_title(f"NUM_ENVS={num_envs}", fontsize=panel_title_size)
+            panel_row = column_index // subplot_cols
+            if panel_row == subplot_rows - 1:
+                ax.set_xlabel("Environment steps (millions)", fontsize=axis_label_size)
+            ax.tick_params(axis="both", labelsize=tick_label_size)
+            ax.grid(alpha=0.3)
+        for ax in axes.reshape(-1)[len(num_envs_values):]:
+            ax.set_visible(False)
+
+        legend_entries = {}
+        for ax in axes.reshape(-1):
+            handles, labels = ax.get_legend_handles_labels()
+            for handle, label in zip(handles, labels):
+                legend_entries.setdefault(label, handle)
+        if legend_entries:
+            fig.legend(
+                legend_entries.values(),
+                legend_entries.keys(),
+                loc="upper center",
+                bbox_to_anchor=(0.5, 0.93 if figure_title else 0.985),
+                ncol=len(legend_entries),
+                fontsize=legend_size,
+            )
+        fig.text(
+            0.012,
+            0.5,
+            short_metric_name(metric),
+            va="center",
+            rotation="vertical",
+            fontsize=axis_label_size,
+        )
+        if figure_title:
+            fig.suptitle(
+                figure_title,
+                fontsize=14,
+                y=0.995,
+            )
+            fig.tight_layout(rect=(0.035, 0, 1, 0.88))
+        else:
+            fig.tight_layout(rect=(0.035, 0, 1, 0.91))
+        fig.savefig(args.output_dir / filenames[metric], bbox_inches="tight")
+        plt.close(fig)
+
+
+def plot_sample_gsnr_over_training(args, history_rows):
+    """Write separate raw and log10 sample-wise GSNR figures."""
+    raw_metric = "sample_gradient_gsnr/value_parameterwise_gsnr_mean"
+    log_metric = "sample_gradient_gsnr/value_parameterwise_gsnr_mean_log10"
+    plot_metrics_over_training(
+        args,
+        history_rows,
+        "sample_gradient_gsnr",
+        {
+            raw_metric: "sample_gradient_gsnr_over_training.pdf",
+            log_metric: "sample_gradient_gsnr_over_training_log10.pdf",
+        },
+        {
+            raw_metric: (
+                "Sample-wise value parameter GSNR: CEC vs. CEC_DECOUPLED"
+            ),
+            log_metric: None,
+        },
+    )
+
+
+def plot_env_snr_over_training(args, history_rows):
+    """Write policy/value environment-conditioned SNR training figures."""
+    policy_metric = "env_gradient_snr/policy_snr"
+    value_metric = "env_gradient_snr/value_snr"
+    policy_log_metric = "env_gradient_snr/policy_log_snr"
+    value_log_metric = "env_gradient_snr/value_log_snr"
+    plot_metrics_over_training(
+        args,
+        history_rows,
+        "env_gradient_snr",
+        {
+            policy_metric: "env_gradient_policy_snr_over_training.pdf",
+            value_metric: "env_gradient_value_snr_over_training.pdf",
+            policy_log_metric: "env_gradient_policy_snr_over_training_log10.pdf",
+            value_log_metric: "env_gradient_value_snr_over_training_log10.pdf",
+        },
+        {
+            policy_metric: (
+                "Environment-conditioned policy gradient SNR: "
+                "CEC vs. CEC_DECOUPLED"
+            ),
+            value_metric: (
+                "Environment-conditioned value gradient SNR: "
+                "CEC vs. CEC_DECOUPLED"
+            ),
+            policy_log_metric: (
+                "Environment-conditioned policy gradient log10(SNR): "
+                "CEC vs. CEC_DECOUPLED"
+            ),
+            value_log_metric: (
+                "Environment-conditioned value gradient log10(SNR): "
+                "CEC vs. CEC_DECOUPLED"
+            ),
+        },
+    )
 
 
 def main():
@@ -486,6 +718,8 @@ def main():
         full_aggregate_rows,
     )
     plot_summary(args, full_aggregate_rows, 0, "full_window")
+    plot_sample_gsnr_over_training(args, history_rows)
+    plot_env_snr_over_training(args, history_rows)
 
     print(f"Runs fetched: {len(run_rows)}")
     for row in sorted(run_rows, key=lambda item: (item["algorithm"], item["num_envs"])):

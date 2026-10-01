@@ -58,10 +58,11 @@ e.g. `grad_norm_value_CEC_POP_5rwobcx9_env_step.png`.
   포함된다.
 - **`gradient_diagnostics_num_envs_graph.py`** — `cec_stiffness_100m`에서
   `TOTAL_TIMESTEPS=300M`인 IPPO/IDAAC run의 `policy_value`, environment
-  gradient cosine, effective rank, vector SNR, parameter-wise GSNR 및
-  parallel-slot gradient norm 분포 요약(mean, CV, p10, p90, IQM), 첫
+  gradient cosine, effective rank, vector SNR, static-grid-conditioned
+  parameter-wise GSNR, 논문 정의를 따른 sample-wise value GSNR 및
+  static-grid gradient norm 분포 요약(mean, CV, p10, p90, IQM), 첫
   optimizer minibatch 전체로 계산한 pooled representation effective rank,
-  parallel-slot별 feature-rank 분포 및 slot centroid 사이의 effective rank를
+  static-grid별 feature-rank 분포 및 grid centroid 사이의 effective rank를
   가져온다. 알고리즘·`NUM_ENVS`별
   feature rank 출력은 `feature_rank_shared`, `feature_rank_policy`,
   `feature_rank_value` 그룹으로 나눈다. 환경별 centered feature covariance의

@@ -77,6 +77,13 @@ def parse_args() -> argparse.Namespace:
         help="Only include these NUM_ENVS values.",
     )
     parser.add_argument(
+        "--seeds",
+        nargs="*",
+        type=int,
+        default=None,
+        help="Only include runs whose SEED is one of these values.",
+    )
+    parser.add_argument(
         "--all-matching-runs",
         action="store_true",
         help=(
@@ -169,6 +176,8 @@ def fetch_run_means(args: argparse.Namespace):
             seed = int(seed)
         except (TypeError, ValueError):
             print(f"Skipping run without integer SEED: {run.id} ({run.name})")
+            continue
+        if args.seeds and seed not in args.seeds:
             continue
         if not any(wandb_key in run.summary for wandb_key in keys):
             print(f"No stiffness metric in summary: {run.id} ({run.name})")
@@ -347,7 +356,7 @@ def plot(rows, output_path: Path, target_timesteps: int):
         fontsize=14,
     )
     fig.subplots_adjust(left=0.065, right=0.99, bottom=0.20, top=0.78, wspace=0.34)
-    fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    fig.savefig(output_path, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -364,7 +373,7 @@ def main():
     suffix = f"{args.target_timesteps // 1_000_000}m"
     run_csv = args.output_dir / f"stiffness_run_means_{suffix}.csv"
     aggregate_csv = args.output_dir / f"stiffness_num_envs_aggregate_{suffix}.csv"
-    figure_path = args.output_dir / f"stiffness_vs_num_envs_{suffix}.png"
+    figure_path = args.output_dir / f"stiffness_vs_num_envs_{suffix}.pdf"
     write_csv(run_csv, run_rows, list(run_rows[0]))
     write_csv(aggregate_csv, aggregate_rows, list(aggregate_rows[0]))
     plot(aggregate_rows, figure_path, args.target_timesteps)

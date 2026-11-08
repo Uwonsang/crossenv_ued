@@ -27,6 +27,8 @@ all_models=(
   CEC_Finetune
   CEC_IDAAC
   CEC_IDAAC_Finetune
+  CEC_DAAC
+  CEC_decouple
   E3T
   FCP
   FCP_Fixed
@@ -70,7 +72,7 @@ layouts=(
 
 for layout in "${layouts[@]}"; do
   for model in "${models[@]}"; do
-    if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" ]]; then
+    if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" ]]; then
       selected_envs=("${model_num_envs_values[@]}")
     else
       selected_envs=("${model_num_envs_values[0]}")
@@ -86,7 +88,7 @@ for layout in "${layouts[@]}"; do
       model_output_dir=""
       if [[ -n "${output_dir}" ]]; then
         model_output_dir="${output_dir%/}/${model}"
-        if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" ]]; then
+        if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" ]]; then
           model_output_dir="${model_output_dir}/envs${model_num_envs}"
         fi
       fi

@@ -70,6 +70,7 @@
   "overwrite_ckpt": True # if true, will overwrite ckpt_id
   "finetune": False # if true, load from opposing paradigm and cut learning rate by 10x
   "e3t_beta": 0.55  # how much randomness to add to probabilities of one partner. If 0 then it's completely uniform, if 1 then it's same as original, if higher than 1 we're magnifying the extremes
+  "e3t_beta_warmup_frac": 0.0  # noise curriculum: beta goes 1.0 -> e3t_beta linearly over this fraction of MAX_TRAIN_UPDATES (0 = constant e3t_beta)
 "TEST_KWARGS":
   "beta": 1.0
   "argmax": False  # otherwise we sample from policy

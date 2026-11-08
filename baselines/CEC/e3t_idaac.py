@@ -453,6 +453,7 @@ class Transition(NamedTuple):
     agent_positions: jnp.ndarray
     layout_id: jnp.ndarray
     other_action: jnp.ndarray
+    ego_mask: jnp.ndarray  # 0 for the beta-tempered (noisy) partner actor
 
 
 def _idaac_order_mask(traj_batch):
@@ -476,9 +477,15 @@ def e3t_idaac_loss(
     advantages,
     targets,
     order_swap,
+    ego_mask,
     config,
 ):
-    """E3T-IDAAC objective shared by training and final sharpness."""
+    """E3T-IDAAC objective shared by training and final sharpness.
+
+    ego_mask zeroes the beta-tempered (noisy) partner's transitions: it acts
+    off-policy (its stored log_prob comes from tempered logits), so RL losses
+    use only the ego actor's transitions.
+    """
     (
         _,
         pi,
@@ -500,22 +507,28 @@ def e3t_idaac_loss(
     value_pred_clipped = traj_batch.value + (
         value - traj_batch.value
     ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
-    value_loss = 0.5 * jnp.maximum(
-        jnp.square(value - targets),
-        jnp.square(value_pred_clipped - targets),
-    ).mean()
-
-    normalized_advantages = (
-        (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    value_loss = 0.5 * _masked_mean(
+        jnp.maximum(
+            jnp.square(value - targets),
+            jnp.square(value_pred_clipped - targets),
+        ),
+        ego_mask,
     )
+
+    adv_mean = _masked_mean(advantages, ego_mask)
+    adv_std = jnp.sqrt(_masked_mean(jnp.square(advantages - adv_mean), ego_mask))
+    normalized_advantages = (advantages - adv_mean) / (adv_std + 1e-8)
     predicted_advantage = jnp.take_along_axis(
         advantage_predictions,
         traj_batch.action[..., None],
         axis=-1,
     ).squeeze(-1)
-    advantage_loss = 0.5 * jnp.square(
-        predicted_advantage - jax.lax.stop_gradient(normalized_advantages)
-    ).mean()
+    advantage_loss = 0.5 * _masked_mean(
+        jnp.square(
+            predicted_advantage - jax.lax.stop_gradient(normalized_advantages)
+        ),
+        ego_mask,
+    )
 
     order_mask = _idaac_order_mask(traj_batch)
     classifier_loss = _masked_mean(
@@ -539,15 +552,21 @@ def e3t_idaac_loss(
 
     logratio = log_prob - traj_batch.log_prob
     ratio = jnp.exp(logratio)
-    actor_loss = -jnp.minimum(
-        ratio * normalized_advantages,
-        jnp.clip(
-            ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]
-        ) * normalized_advantages,
-    ).mean()
-    entropy = pi.entropy().mean()
-    approx_kl = ((ratio - 1) - logratio).mean()
-    clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+    actor_loss = -_masked_mean(
+        jnp.minimum(
+            ratio * normalized_advantages,
+            jnp.clip(
+                ratio, 1.0 - config["CLIP_EPS"], 1.0 + config["CLIP_EPS"]
+            ) * normalized_advantages,
+        ),
+        ego_mask,
+    )
+    entropy = _masked_mean(pi.entropy(), ego_mask)
+    approx_kl = _masked_mean((ratio - 1) - logratio, ego_mask)
+    clip_frac = _masked_mean(
+        (jnp.abs(ratio - 1) > config["CLIP_EPS"]).astype(jnp.float32),
+        ego_mask,
+    )
     total_loss = (
         actor_loss
         + config["MOA_COEF"] * moa_nll_loss
@@ -852,8 +871,19 @@ def make_train(
 
                 unbatched_logits = unbatchify(pi.logits, env.agents, config["NUM_ENVS"], env.num_agents)
                 # agent 0 mask is 1 if beta_agent is 0, 0 otherwise
-                agent_0_mask = jnp.where(beta_agent == 0, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
-                agent_1_mask = jnp.where(beta_agent == 1, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
+                # Noise curriculum: beta anneals from 1.0 (no noise) to e3t_beta
+                # over the first e3t_beta_warmup_frac of training (0 = off).
+                warmup_updates = (
+                    config["TRAIN_KWARGS"]["e3t_beta_warmup_frac"]
+                    * config["MAX_TRAIN_UPDATES"]
+                )
+                if warmup_updates > 0:
+                    noise_frac = jnp.minimum(1.0, update_step / warmup_updates)
+                else:
+                    noise_frac = 1.0
+                e3t_beta = 1.0 - (1.0 - config["TRAIN_KWARGS"]["e3t_beta"]) * noise_frac
+                agent_0_mask = jnp.where(beta_agent == 0, e3t_beta, 1.00)
+                agent_1_mask = jnp.where(beta_agent == 1, e3t_beta, 1.00)
                 multiply_row = lambda x, y: x * y
                 unbatched_logits['agent_0'] = jax.vmap(multiply_row)(unbatched_logits['agent_0'], agent_0_mask)
                 unbatched_logits['agent_1'] = jax.vmap(multiply_row)(unbatched_logits['agent_1'], agent_1_mask)
@@ -867,6 +897,10 @@ def make_train(
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
                 other_env_act = {'agent_0': env_act['agent_1'], 'agent_1': env_act['agent_0']}  # get other agent's action
                 other_action = batchify(other_env_act, env.agents, config["NUM_ACTORS"])
+                ego_mask = batchify(
+                    {'agent_0': beta_agent != 0, 'agent_1': beta_agent != 1},
+                    env.agents, config["NUM_ACTORS"],
+                ).squeeze().astype(jnp.float32)
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -895,6 +929,7 @@ def make_train(
                     agent_positions,
                     layout_id,
                     other_action.squeeze(),
+                    ego_mask,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, beta_agent)
                 return runner_state, transition
@@ -1070,6 +1105,7 @@ def make_train(
                             gae,
                             targets,
                             order_swap,
+                            traj_batch.ego_mask,
                             config,
                         )
 
@@ -1767,6 +1803,8 @@ def main(config):
             sharpness_batch.advantages,
             sharpness_batch.targets,
             sharpness_order_swap,
+            # The sharpness rollout has no noisy partner: every actor is ego.
+            jnp.ones_like(sharpness_batch.advantages),
             config,
         )
         return loss

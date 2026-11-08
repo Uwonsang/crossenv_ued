@@ -269,6 +269,11 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
     other_action: jnp.ndarray
+    ego_mask: jnp.ndarray  # 0 for the beta-tempered (noisy) partner actor
+
+
+def _masked_mean(values, mask):
+    return (values * mask).sum() / jnp.maximum(mask.sum(), 1.0)
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -437,8 +442,19 @@ def make_train(config, update_step=0):
 
                 unbatched_logits = unbatchify(pi.logits, env.agents, config["NUM_ENVS"], env.num_agents)
                 # agent 0 mask is 1 if beta_agent is 0, 0 otherwise
-                agent_0_mask = jnp.where(beta_agent == 0, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
-                agent_1_mask = jnp.where(beta_agent == 1, config["TRAIN_KWARGS"]["e3t_beta"], 1.00)
+                # Noise curriculum: beta anneals from 1.0 (no noise) to e3t_beta
+                # over the first e3t_beta_warmup_frac of training (0 = off).
+                warmup_updates = (
+                    config["TRAIN_KWARGS"]["e3t_beta_warmup_frac"]
+                    * config["MAX_TRAIN_UPDATES"]
+                )
+                if warmup_updates > 0:
+                    noise_frac = jnp.minimum(1.0, update_step / warmup_updates)
+                else:
+                    noise_frac = 1.0
+                e3t_beta = 1.0 - (1.0 - config["TRAIN_KWARGS"]["e3t_beta"]) * noise_frac
+                agent_0_mask = jnp.where(beta_agent == 0, e3t_beta, 1.00)
+                agent_1_mask = jnp.where(beta_agent == 1, e3t_beta, 1.00)
                 multiply_row = lambda x, y: x * y
                 unbatched_logits['agent_0'] = jax.vmap(multiply_row)(unbatched_logits['agent_0'], agent_0_mask)
                 unbatched_logits['agent_1'] = jax.vmap(multiply_row)(unbatched_logits['agent_1'], agent_1_mask)
@@ -452,6 +468,10 @@ def make_train(config, update_step=0):
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
                 other_env_act = {'agent_0': env_act['agent_1'], 'agent_1': env_act['agent_0']}  # get other agent's action
                 other_action = batchify(other_env_act, env.agents, config["NUM_ACTORS"])
+                ego_mask = batchify(
+                    {'agent_0': beta_agent != 0, 'agent_1': beta_agent != 1},
+                    env.agents, config["NUM_ACTORS"],
+                ).squeeze().astype(jnp.float32)
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -478,7 +498,8 @@ def make_train(config, update_step=0):
                     obs_batch,
                     info,
                     agent_positions,
-                    other_action.squeeze()
+                    other_action.squeeze(),
+                    ego_mask,
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, beta_agent)
                 return runner_state, transition
@@ -549,20 +570,26 @@ def make_train(config, update_step=0):
                         other_log_prob = other_pi.log_prob(traj_batch.other_action)
                         moa_nll_loss = -jnp.mean(other_log_prob)
 
+                        # The beta-tempered partner acts off-policy (its stored
+                        # log_prob comes from tempered logits), so RL losses use
+                        # only the ego actor's transitions.
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * jnp.maximum(
-                            value_losses, value_losses_clipped
-                        ).mean()
+                        value_loss = 0.5 * _masked_mean(
+                            jnp.maximum(value_losses, value_losses_clipped),
+                            traj_batch.ego_mask,
+                        )
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+                        gae_mean = _masked_mean(gae, traj_batch.ego_mask)
+                        gae_std = jnp.sqrt(_masked_mean(jnp.square(gae - gae_mean), traj_batch.ego_mask))
+                        gae = (gae - gae_mean) / (gae_std + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -573,12 +600,15 @@ def make_train(config, update_step=0):
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = loss_actor.mean()
-                        entropy = pi.entropy().mean()
+                        loss_actor = _masked_mean(loss_actor, traj_batch.ego_mask)
+                        entropy = _masked_mean(pi.entropy(), traj_batch.ego_mask)
 
                         # debug
-                        approx_kl = ((ratio - 1) - logratio).mean()
-                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
+                        approx_kl = _masked_mean((ratio - 1) - logratio, traj_batch.ego_mask)
+                        clip_frac = _masked_mean(
+                            (jnp.abs(ratio - 1) > config["CLIP_EPS"]).astype(jnp.float32),
+                            traj_batch.ego_mask,
+                        )
 
                         total_loss = (
                             loss_actor

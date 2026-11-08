@@ -207,9 +207,12 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    scalable_model_names = {"CEC", "CEC_IDAAC"}
+    scalable_model_names = {"CEC", "CEC_IDAAC", "CEC_DAAC", "CEC_decouple"}
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
-    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune"}
+    # DAAC/decouple checkpoints share the IDAAC actor parameter names.
+    idaac_model_names = {
+        "CEC_IDAAC", "CEC_IDAAC_Finetune", "CEC_DAAC", "CEC_decouple",
+    }
     if config.get("OUTPUT_DIR"):
         save_path_final = config["OUTPUT_DIR"]
     else:

@@ -360,9 +360,12 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, res
 def main(config):
     config = OmegaConf.to_container(config)
     model_name = config["model_name"]
-    scalable_model_names = {"CEC", "CEC_IDAAC"}
+    scalable_model_names = {"CEC", "CEC_IDAAC", "CEC_DAAC", "CEC_decouple"}
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
-    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune"}
+    # DAAC/decouple checkpoints share the IDAAC actor parameter names.
+    idaac_model_names = {
+        "CEC_IDAAC", "CEC_IDAAC_Finetune", "CEC_DAAC", "CEC_decouple",
+    }
     rnn_model_names = {
         "CEC",
         "CEC_Finetune",

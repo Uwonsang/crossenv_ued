@@ -269,11 +269,6 @@ class Transition(NamedTuple):
     info: jnp.ndarray
     agent_positions: jnp.ndarray
     other_action: jnp.ndarray
-    ego_mask: jnp.ndarray  # 0 for the beta-tempered (noisy) partner actor
-
-
-def _masked_mean(values, mask):
-    return (values * mask).sum() / jnp.maximum(mask.sum(), 1.0)
 
 def batchify(x: dict, agent_list, num_actors):
     x = jnp.stack([x[a] for a in agent_list])
@@ -468,10 +463,6 @@ def make_train(config, update_step=0):
                 env_act = {k: v.squeeze() for k, v in env_act.items()}
                 other_env_act = {'agent_0': env_act['agent_1'], 'agent_1': env_act['agent_0']}  # get other agent's action
                 other_action = batchify(other_env_act, env.agents, config["NUM_ACTORS"])
-                ego_mask = batchify(
-                    {'agent_0': beta_agent != 0, 'agent_1': beta_agent != 1},
-                    env.agents, config["NUM_ACTORS"],
-                ).squeeze().astype(jnp.float32)
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
@@ -498,8 +489,7 @@ def make_train(config, update_step=0):
                     obs_batch,
                     info,
                     agent_positions,
-                    other_action.squeeze(),
-                    ego_mask,
+                    other_action.squeeze()
                 )
                 runner_state = (train_state, env_state, obsv, done_batch, hstate, rng, update_step, beta_agent)
                 return runner_state, transition
@@ -570,26 +560,20 @@ def make_train(config, update_step=0):
                         other_log_prob = other_pi.log_prob(traj_batch.other_action)
                         moa_nll_loss = -jnp.mean(other_log_prob)
 
-                        # The beta-tempered partner acts off-policy (its stored
-                        # log_prob comes from tempered logits), so RL losses use
-                        # only the ego actor's transitions.
                         # CALCULATE VALUE LOSS
                         value_pred_clipped = traj_batch.value + (
                             value - traj_batch.value
                         ).clip(-config["CLIP_EPS"], config["CLIP_EPS"])
                         value_losses = jnp.square(value - targets)
                         value_losses_clipped = jnp.square(value_pred_clipped - targets)
-                        value_loss = 0.5 * _masked_mean(
-                            jnp.maximum(value_losses, value_losses_clipped),
-                            traj_batch.ego_mask,
-                        )
+                        value_loss = 0.5 * jnp.maximum(
+                            value_losses, value_losses_clipped
+                        ).mean()
 
                         # CALCULATE ACTOR LOSS
                         logratio = log_prob - traj_batch.log_prob
                         ratio = jnp.exp(logratio)
-                        gae_mean = _masked_mean(gae, traj_batch.ego_mask)
-                        gae_std = jnp.sqrt(_masked_mean(jnp.square(gae - gae_mean), traj_batch.ego_mask))
-                        gae = (gae - gae_mean) / (gae_std + 1e-8)
+                        gae = (gae - gae.mean()) / (gae.std() + 1e-8)
                         loss_actor1 = ratio * gae
                         loss_actor2 = (
                             jnp.clip(
@@ -600,15 +584,12 @@ def make_train(config, update_step=0):
                             * gae
                         )
                         loss_actor = -jnp.minimum(loss_actor1, loss_actor2)
-                        loss_actor = _masked_mean(loss_actor, traj_batch.ego_mask)
-                        entropy = _masked_mean(pi.entropy(), traj_batch.ego_mask)
+                        loss_actor = loss_actor.mean()
+                        entropy = pi.entropy().mean()
 
                         # debug
-                        approx_kl = _masked_mean((ratio - 1) - logratio, traj_batch.ego_mask)
-                        clip_frac = _masked_mean(
-                            (jnp.abs(ratio - 1) > config["CLIP_EPS"]).astype(jnp.float32),
-                            traj_batch.ego_mask,
-                        )
+                        approx_kl = ((ratio - 1) - logratio).mean()
+                        clip_frac = jnp.mean(jnp.abs(ratio - 1) > config["CLIP_EPS"])
 
                         total_loss = (
                             loss_actor
@@ -823,6 +804,9 @@ def make_train(config, update_step=0):
 def main(config):
     save_xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
     config = OmegaConf.to_container(config)
+    warmup_frac = config["TRAIN_KWARGS"]["e3t_beta_warmup_frac"]
+    if warmup_frac > 0:  # tag noise-curriculum runs in the save folder name
+        save_xpid += f"_warmup{warmup_frac}"
     config["model_name"] = "E3T"
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10

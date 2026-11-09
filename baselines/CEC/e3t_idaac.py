@@ -1594,6 +1594,9 @@ def main(config):
     config = OmegaConf.to_container(config)
     config["model_name"] = "E3T_IDAAC"
     xpid = "lr-%s" % time.strftime("%Y%m%d-%H%M%S")
+    warmup_frac = config["TRAIN_KWARGS"]["e3t_beta_warmup_frac"]
+    if warmup_frac > 0:  # tag noise-curriculum runs in the save folder name
+        xpid += f"_warmup{warmup_frac}"
 
     if config['TRAIN_KWARGS']['finetune']:
         config['LR'] = config['LR'] / 10

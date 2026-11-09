@@ -40,6 +40,7 @@ from actor_networks import (
     ActorCriticE3T as EvalActorCriticE3T,
     ActorCriticRNN as EvalActorCriticRNN,
     IDAACActorRNN as EvalIDAACActorRNN,
+    IDAACActorRNNSmall as EvalIDAACActorRNNSmall,
 )
 # import tsnex
 
@@ -360,7 +361,9 @@ def get_rollouts(model_param_1, model_param_2, config, env, network, seed=0, res
 def main(config):
     config = OmegaConf.to_container(config)
     model_name = config["model_name"]
-    scalable_model_names = {"CEC", "CEC_IDAAC", "CEC_DAAC", "CEC_decouple"}
+    scalable_model_names = {
+        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple",
+    }
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
     # DAAC/decouple checkpoints share the IDAAC actor parameter names.
     idaac_model_names = {
@@ -480,7 +483,9 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    if model_name in idaac_model_names:
+    if model_name == "CEC_IDAAC_small":
+        network = EvalIDAACActorRNNSmall(env.action_space("agent_0").n, config=config)
+    elif model_name in idaac_model_names:
         network = EvalIDAACActorRNN(
             env.action_space("agent_0").n, config=config
         )

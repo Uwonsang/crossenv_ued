@@ -34,6 +34,7 @@ from actor_networks import (
     ActorCriticE3T,
     ActorCriticRNN,
     IDAACActorRNN,
+    IDAACActorRNNSmall,
 )
 
 
@@ -207,7 +208,9 @@ def main(config):
     else:
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
-    scalable_model_names = {"CEC", "CEC_IDAAC", "CEC_DAAC", "CEC_decouple"}
+    scalable_model_names = {
+        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple",
+    }
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
     # DAAC/decouple checkpoints share the IDAAC actor parameter names.
     idaac_model_names = {
@@ -365,7 +368,9 @@ def main(config):
     layout_name = config['ENV_KWARGS']['layout']
     env = initialize_environment(config)
     env = LogWrapper(env, env_params={'random_reset_fn': config['ENV_KWARGS']['random_reset_fn']})
-    if model_name in idaac_model_names:
+    if model_name == "CEC_IDAAC_small":
+        network = IDAACActorRNNSmall(env.action_space("agent_0").n, config=config)
+    elif model_name in idaac_model_names:
         network = IDAACActorRNN(
             env.action_space("agent_0").n,
             config=config,

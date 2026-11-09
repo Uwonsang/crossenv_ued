@@ -276,6 +276,116 @@ class IDAACActorRNN(nn.Module):
         return hidden, pi, jnp.zeros(logits.shape[:-1])
 
 
+class IDAACActorTrunkSmall(nn.Module):
+    """IDAACActorTrunk with the CEC_IDAAC_small sizes (dense 256, LSTM 256).
+
+    Matches IDAAC_MATCHED_FC_DIM in CEC_UED/idaac_general_gradient_small.py.
+    """
+
+    config: Dict
+
+    @nn.compact
+    def __call__(self, hidden, obs, dones):
+        time_size, actor_size, _ = obs.shape
+
+        embedding = obs.reshape(-1, 9, 9, 26)
+        embedding = nn.Conv(
+            features=64,
+            kernel_size=(2, 2),
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="conv_0",
+        )(embedding)
+        embedding = nn.relu(embedding)
+        embedding = nn.Conv(
+            features=32,
+            kernel_size=(2, 2),
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="conv_1",
+        )(embedding)
+        embedding = nn.relu(embedding)
+        embedding = embedding.reshape((time_size, actor_size, -1))
+
+        embedding = nn.Dense(
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_0",
+        )(embedding)
+        embedding = nn.relu(embedding)
+        embedding = nn.Dense(
+            256,
+            kernel_init=orthogonal(np.sqrt(2)),
+            bias_init=constant(0.0),
+            name="dense_1",
+        )(embedding)
+        embedding = nn.relu(embedding)
+
+        hidden, embedding = ScannedRNN(name="recurrent")(
+            hidden, (embedding, dones)
+        )
+        embedding = embedding.reshape((time_size, actor_size, -1))
+        return hidden, embedding
+
+
+class IDAACActorRNNSmall(nn.Module):
+    """Policy-only module matching CEC_IDAAC_small checkpoint parameter names.
+
+    Policy head 1024 -> 512 -> 128 -> 64 (IDAAC_MATCHED_POLICY_HIDDEN_DIMS in
+    CEC_UED/idaac_general_gradient_small.py). Overcooked only.
+    """
+
+    action_dim: Sequence[int]
+    config: Dict
+
+    @nn.compact
+    def __call__(self, hidden, x):
+        obs, dones, _agent_positions = x
+        hidden, embedding = IDAACActorTrunkSmall(
+            config=self.config,
+            name="actor_trunk",
+        )(hidden, obs, dones)
+
+        actor_mean = nn.Dense(
+            1024,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_0",
+        )(embedding)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            512,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_1",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            128,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_2",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+        actor_mean = nn.Dense(
+            64,
+            kernel_init=orthogonal(2),
+            bias_init=constant(0.0),
+            name="actor_hidden_3",
+        )(actor_mean)
+        actor_mean = nn.relu(actor_mean)
+
+        logits = nn.Dense(
+            self.action_dim,
+            kernel_init=orthogonal(0.01),
+            bias_init=constant(0.0),
+            name="actor_output",
+        )(actor_mean)
+        pi = distrax.Categorical(logits=logits)
+        return hidden, pi, jnp.zeros(logits.shape[:-1])
+
+
 class IDAACActorCriticRNN(nn.Module):
     """Inference module exposing both IDAAC policy and value representations."""
 

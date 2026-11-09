@@ -33,7 +33,8 @@ METHODS = [  # (result directory name, display label, color)
     ("CEC_DAAC", "DAAC", "#CC79A7"),
     ("CEC_IDAAC", "DCEC", "#0072B2"),
 ]
-BATCHES = [(32, "8K"), (256, "65K")]
+BATCHES = [(32, "8K"), (64, "16K"), (128, "32K"), (256, "65K")]
+BATCH_ALPHAS = [0.3, 0.5, 0.75, 1.0]  # lighter = smaller batch
 LAYOUTS = [
     "asymm_advantages_9", "coord_ring_9", "counter_circuit_9",
     "cramped_room_9", "forced_coord_9",
@@ -86,17 +87,17 @@ def summarize(root: Path, loader) -> pd.DataFrame:
 
 def plot_panel(ax, summary: pd.DataFrame, title: str) -> None:
     x = np.arange(len(METHODS))
-    width = 0.38
+    width = 0.8 / len(BATCHES)
     for b, (_, batch) in enumerate(BATCHES):
         sub = summary[summary["batch"] == batch].set_index("method")
         means = [sub.loc[label, "mean"] for _, label, _ in METHODS]
         sems = [sub.loc[label, "sem"] for _, label, _ in METHODS]
         colors = [color for _, _, color in METHODS]
         ax.bar(
-            x + (b - 0.5) * width, np.nan_to_num(means), width,
-            yerr=np.nan_to_num(sems), capsize=4, color=colors,
-            alpha=0.45 if b == 0 else 1.0, edgecolor="black", linewidth=0.7,
-            hatch="//" if b == 0 else None,
+            x + (b - (len(BATCHES) - 1) / 2) * width, np.nan_to_num(means),
+            width, yerr=np.nan_to_num(sems), capsize=3, color=colors,
+            alpha=BATCH_ALPHAS[b], edgecolor="black", linewidth=0.7,
+            error_kw={"elinewidth": 1.0},
         )
     ax.set_xticks(x)
     ax.set_xticklabels([label for _, label, _ in METHODS])
@@ -124,16 +125,16 @@ def main() -> None:
     print(fixed.to_string(index=False))
     print(pcg.to_string(index=False))
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.2))
+    fig, axes = plt.subplots(1, 2, figsize=(14, 4.2))
     plot_panel(axes[0], fixed, "(a) 5 Fixed Tasks")
     plot_panel(axes[1], pcg, "(b) 100 Procedurally Generated Tasks")
     handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=0.45,
-                      hatch="//", edgecolor="black"),
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", edgecolor="black"),
+        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=alpha,
+                      edgecolor="black")
+        for alpha in BATCH_ALPHAS
     ]
     fig.legend(handles, [f"Batch {b}" for _, b in BATCHES], loc="upper center",
-               ncol=2, frameon=False, bbox_to_anchor=(0.5, 1.04))
+               ncol=len(BATCHES), frameon=False, bbox_to_anchor=(0.5, 1.04))
     fig.tight_layout()
     for ext in ("pdf", "png"):
         out = args.output_dir / f"ablation_xp_bar.{ext}"

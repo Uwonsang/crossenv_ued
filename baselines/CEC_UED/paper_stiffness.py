@@ -23,6 +23,8 @@ STIFFNESS_METRIC_NAMES = (
 SAMPLEWISE_GSNR_METRIC_NAMES = (
     "value_parameterwise_gsnr_mean",
     "value_parameterwise_gsnr_mean_log10",
+    "policy_parameterwise_gsnr_mean",
+    "policy_parameterwise_gsnr_mean_log10",
 )
 
 
@@ -187,6 +189,190 @@ def _partition_value_params(params, value_param_keys: Sequence[str]):
         )
 
     return flax.core.freeze(value_params), merge
+
+
+def _parameterwise_gsnr(
+    gradient_sum, gradient_squared_sum, samplewise_count, epsilon
+):
+    """Mean (and mean log10) of per-parameter sample-wise GSNR."""
+
+    # Liu et al. (ICLR 2020) define a parameter's GSNR as its squared
+    # sample-wise mean gradient divided by its sample-wise gradient variance.
+    # Accumulating first and second moments keeps memory linear in the number
+    # of parameters instead of materializing samples x params.
+    gsnr_count = jnp.maximum(samplewise_count, 1.0)
+    variance_denominator = jnp.maximum(samplewise_count - 1.0, 1.0)
+    gsnr_total = jnp.asarray(0.0, dtype=jnp.float32)
+    gsnr_log_total = jnp.asarray(0.0, dtype=jnp.float32)
+    parameter_count = jnp.asarray(0.0, dtype=jnp.float32)
+    for gradient_sum_leaf, gradient_squared_sum_leaf in zip(
+        jax.tree_util.tree_leaves(gradient_sum),
+        jax.tree_util.tree_leaves(gradient_squared_sum),
+    ):
+        mean_gradient = gradient_sum_leaf / gsnr_count
+        gradient_variance = jnp.maximum(
+            gradient_squared_sum_leaf
+            - gsnr_count * jnp.square(mean_gradient),
+            0.0,
+        ) / variance_denominator
+        coordinate_gsnr = jnp.square(mean_gradient) / (
+            gradient_variance + epsilon
+        )
+        gsnr_total += jnp.sum(coordinate_gsnr)
+        gsnr_log_total += jnp.sum(
+            jnp.log10(jnp.maximum(coordinate_gsnr, epsilon))
+        )
+        parameter_count += jnp.asarray(
+            gradient_sum_leaf.size, dtype=jnp.float32
+        )
+    valid_gsnr = jnp.logical_and(
+        samplewise_count > 1.0, parameter_count > 0.0
+    )
+    gsnr_mean = jnp.where(
+        valid_gsnr,
+        gsnr_total / jnp.maximum(parameter_count, 1.0),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
+    gsnr_mean_log10 = jnp.where(
+        valid_gsnr,
+        gsnr_log_total / jnp.maximum(parameter_count, 1.0),
+        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    )
+    return gsnr_mean, gsnr_mean_log10
+
+
+def compute_samplewise_policy_gsnr(
+    *,
+    network,
+    params,
+    sampled_hstates,
+    observations: jnp.ndarray,
+    dones: jnp.ndarray,
+    agent_positions: jnp.ndarray,
+    actions: jnp.ndarray,
+    old_log_probs: jnp.ndarray,
+    normalized_advantages: jnp.ndarray,
+    sample_mask: jnp.ndarray,
+    policy_param_keys: Sequence[str],
+    clip_eps: float,
+    entropy_coef: float,
+    chunk_size: int,
+    epsilon: float = 1e-12,
+):
+    """Parameter-wise GSNR of per-state policy-loss gradients.
+
+    Mirrors the value GSNR in ``compute_paper_stiffness``: one gradient per
+    actor-state of the same minibatch, recurrent carries treated as fixed
+    inputs. The per-state loss is the PPO clipped surrogate minus the entropy
+    bonus, with advantages normalized over the selected minibatch.
+    """
+
+    sample_size = int(observations.shape[0])
+    if sample_size % int(chunk_size) != 0:
+        raise ValueError("chunk_size must evenly divide the sampled batch.")
+    policy_params, merge_params = _partition_value_params(
+        params, policy_param_keys
+    )
+
+    def single_policy_loss(
+        candidate_policy_params,
+        sample_hstate,
+        observation,
+        done,
+        agent_position,
+        action,
+        old_log_prob,
+        advantage,
+    ):
+        full_params = merge_params(candidate_policy_params)
+        batched_hstate = jax.tree.map(
+            lambda value: jax.lax.stop_gradient(value)[None, :],
+            sample_hstate,
+        )
+        network_input = (
+            observation[None, None, ...],
+            done[None, None, ...],
+            agent_position[None, None, ...],
+        )
+        pi = network.apply(full_params, batched_hstate, network_input)[1]
+        log_prob = pi.log_prob(action[None, None]).reshape(())
+        entropy = pi.entropy().reshape(())
+        ratio = jnp.exp(log_prob - old_log_prob)
+        actor_term = -jnp.minimum(
+            ratio * advantage,
+            jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantage,
+        )
+        return actor_term - entropy_coef * entropy
+
+    individual_gradient = jax.grad(single_policy_loss)
+
+    def chunk(values):
+        return values.reshape(
+            (sample_size // chunk_size, chunk_size) + values.shape[1:]
+        )
+
+    chunked_inputs = (
+        jax.tree.map(chunk, sampled_hstates),
+        chunk(observations),
+        chunk(dones),
+        chunk(agent_positions),
+        chunk(actions),
+        chunk(old_log_probs),
+        chunk(normalized_advantages),
+        chunk(sample_mask),
+    )
+
+    def accumulate_chunk(state, batch):
+        gradient_sum, gradient_squared_sum, samplewise_count = state
+        *gradient_inputs, batch_sample_mask = batch
+        gradients = jax.vmap(
+            individual_gradient,
+            in_axes=(None, 0, 0, 0, 0, 0, 0, 0),
+        )(policy_params, *gradient_inputs)
+
+        squared_norms = jnp.zeros((chunk_size,), dtype=jnp.float32)
+        for gradient_leaf in jax.tree_util.tree_leaves(gradients):
+            squared_norms = squared_norms + jnp.sum(
+                jnp.square(gradient_leaf),
+                axis=tuple(range(1, gradient_leaf.ndim)),
+            )
+        samplewise_valid = jnp.logical_and(
+            jnp.isfinite(squared_norms),
+            batch_sample_mask.astype(jnp.bool_),
+        )
+
+        def weighted_sum(total, gradient_leaf, power):
+            weights = samplewise_valid.astype(jnp.float32).reshape(
+                (chunk_size,) + (1,) * (gradient_leaf.ndim - 1)
+            )
+            return total + jnp.sum(gradient_leaf ** power * weights, axis=0)
+
+        return (
+            jax.tree.map(
+                lambda t, g: weighted_sum(t, g, 1), gradient_sum, gradients
+            ),
+            jax.tree.map(
+                lambda t, g: weighted_sum(t, g, 2),
+                gradient_squared_sum,
+                gradients,
+            ),
+            samplewise_count
+            + jnp.sum(samplewise_valid.astype(jnp.float32)),
+        ), None
+
+    zero_tree = jax.tree.map(jnp.zeros_like, policy_params)
+    (gradient_sum, gradient_squared_sum, samplewise_count), _ = jax.lax.scan(
+        accumulate_chunk,
+        (zero_tree, zero_tree, jnp.asarray(0.0, dtype=jnp.float32)),
+        chunked_inputs,
+    )
+    gsnr_mean, gsnr_mean_log10 = _parameterwise_gsnr(
+        gradient_sum, gradient_squared_sum, samplewise_count, epsilon
+    )
+    return {
+        "policy_parameterwise_gsnr_mean": gsnr_mean,
+        "policy_parameterwise_gsnr_mean_log10": gsnr_mean_log10,
+    }
 
 
 def compute_paper_stiffness(
@@ -499,47 +685,8 @@ def compute_paper_stiffness(
 
     off_diagonal = safe_mean(off_diagonal_sum, off_diagonal_count)
 
-    # Liu et al. (ICLR 2020) define a parameter's GSNR as its squared
-    # sample-wise mean gradient divided by its sample-wise gradient variance.
-    # Accumulating first and second moments keeps memory linear in the number
-    # of value-network parameters instead of materializing samples x params.
-    gsnr_count = jnp.maximum(samplewise_count, 1.0)
-    variance_denominator = jnp.maximum(samplewise_count - 1.0, 1.0)
-    gsnr_total = jnp.asarray(0.0, dtype=jnp.float32)
-    gsnr_log_total = jnp.asarray(0.0, dtype=jnp.float32)
-    parameter_count = jnp.asarray(0.0, dtype=jnp.float32)
-    for gradient_sum_leaf, gradient_squared_sum_leaf in zip(
-        jax.tree_util.tree_leaves(raw_gradient_sum),
-        jax.tree_util.tree_leaves(raw_gradient_squared_sum),
-    ):
-        mean_gradient = gradient_sum_leaf / gsnr_count
-        gradient_variance = jnp.maximum(
-            gradient_squared_sum_leaf
-            - gsnr_count * jnp.square(mean_gradient),
-            0.0,
-        ) / variance_denominator
-        coordinate_gsnr = jnp.square(mean_gradient) / (
-            gradient_variance + epsilon
-        )
-        gsnr_total += jnp.sum(coordinate_gsnr)
-        gsnr_log_total += jnp.sum(
-            jnp.log10(jnp.maximum(coordinate_gsnr, epsilon))
-        )
-        parameter_count += jnp.asarray(
-            gradient_sum_leaf.size, dtype=jnp.float32
-        )
-    valid_gsnr = jnp.logical_and(
-        samplewise_count > 1.0, parameter_count > 0.0
-    )
-    samplewise_gsnr_mean = jnp.where(
-        valid_gsnr,
-        gsnr_total / jnp.maximum(parameter_count, 1.0),
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
-    )
-    samplewise_gsnr_mean_log10 = jnp.where(
-        valid_gsnr,
-        gsnr_log_total / jnp.maximum(parameter_count, 1.0),
-        jnp.asarray(jnp.nan, dtype=jnp.float32),
+    samplewise_gsnr_mean, samplewise_gsnr_mean_log10 = _parameterwise_gsnr(
+        raw_gradient_sum, raw_gradient_squared_sum, samplewise_count, epsilon
     )
 
     static_grid_layout_ids = jnp.argmax(

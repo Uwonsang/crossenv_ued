@@ -39,6 +39,7 @@ from paper_stiffness import (
     STIFFNESS_METRIC_NAMES,
     advance_rollout_rng,
     compute_paper_stiffness,
+    compute_samplewise_policy_gsnr,
     count_unique_static_signatures,
     encode_static_grid_signature,
     empty_paper_stiffness_metrics,
@@ -938,7 +939,7 @@ def make_train(
                         targets=targets,
                         actor_indices=stiffness_actor_indices,
                     )
-                    return compute_paper_stiffness(
+                    value_metrics = compute_paper_stiffness(
                         network=network,
                         params=original_params,
                         sampled_hstates=stiffness_hstates,
@@ -953,6 +954,33 @@ def make_train(
                         value_param_keys=VALUE_NETWORK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
+
+                    def flatten_selected(values):
+                        selected = jnp.take(
+                            values, stiffness_actor_indices, axis=1
+                        )
+                        return selected.reshape((-1,) + selected.shape[2:])
+
+                    policy_metrics = compute_samplewise_policy_gsnr(
+                        network=network,
+                        params=original_params,
+                        sampled_hstates=stiffness_hstates,
+                        observations=stiffness_observations,
+                        dones=stiffness_dones,
+                        agent_positions=stiffness_agent_positions,
+                        actions=flatten_selected(traj_batch.action),
+                        old_log_probs=flatten_selected(traj_batch.log_prob),
+                        normalized_advantages=flatten_selected(
+                            (advantages - selected_advantage_mean)
+                            / (selected_advantage_std + 1e-8)
+                        ),
+                        sample_mask=selected_static_sample_mask_by_state.reshape(-1),
+                        policy_param_keys=POLICY_NETWORK_KEYS,
+                        clip_eps=config["CLIP_EPS"],
+                        entropy_coef=config["ENT_COEF"],
+                        chunk_size=stiffness_chunk_size,
+                    )
+                    return {**value_metrics, **policy_metrics}
 
                 stiffness_metrics = jax.lax.cond(
                     run_stiffness,

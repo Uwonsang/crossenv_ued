@@ -102,6 +102,9 @@ ALGORITHM_COLORS = {
     "CEC_DECOUPLED": "#e68632",
     "CEC_IDAAC": "#377eb8",
 }
+ALGORITHM_DISPLAY_NAMES = {
+    "CEC_IDAAC": "DCEC",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -130,6 +133,15 @@ def parse_args() -> argparse.Namespace:
         help="W&B run states included while fetching histories.",
     )
     parser.add_argument("--num-envs", nargs="*", type=int, default=None)
+    parser.add_argument(
+        "--rollout-steps",
+        type=int,
+        default=256,
+        help=(
+            "Steps collected per parallel environment; used to label each "
+            "training panel with batch size = NUM_ENVS * rollout steps."
+        ),
+    )
     parser.add_argument(
         "--seeds",
         nargs="*",
@@ -377,6 +389,10 @@ def build_window_summary(args, history_rows, run_rows, window_start):
                 "std_across_runs": (
                     float(np.std(values, ddof=1)) if len(values) > 1 else 0.0
                 ),
+                "sem_across_runs": (
+                    float(np.std(values, ddof=1) / np.sqrt(len(values)))
+                    if len(values) > 1 else 0.0
+                ),
                 "num_runs": len(values),
             }
         )
@@ -401,21 +417,50 @@ def short_metric_name(metric: str) -> str:
     return metric.split("/", 1)[1].replace("_", " ")
 
 
+def algorithm_display_name(algorithm: str) -> str:
+    return ALGORITHM_DISPLAY_NAMES.get(algorithm, algorithm)
+
+
+def batch_size_label(num_envs: int, rollout_steps: int) -> str:
+    return f"{num_envs * rollout_steps // 1_000}K"
+
+
 def subplot_grid(num_panels: int):
     cols = min(2, num_panels)
     rows = int(math.ceil(num_panels / cols))
     return rows, cols
 
 
-def plot_summary(args, aggregate_rows, window_start, output_suffix):
+def plot_summary(
+    args,
+    aggregate_rows,
+    window_start,
+    output_suffix,
+    selected_group=None,
+    selected_metrics=None,
+    compared_algorithms=None,
+    output_filename=None,
+    show_suptitle=True,
+    show_panel_titles=True,
+    font_scale=1.0,
+    font_size=None,
+    font_family=None,
+):
     for group, configured_metrics in METRIC_GROUPS.items():
+        if selected_group is not None and group != selected_group:
+            continue
         plotted_algorithms = (
-            ("CEC", "CEC_DECOUPLED")
-            if group == "sample_gradient_gsnr"
-            else args.algorithms
+            compared_algorithms
+            if compared_algorithms is not None
+            else (
+                ("CEC", "CEC_DECOUPLED")
+                if group == "sample_gradient_gsnr"
+                else args.algorithms
+            )
         )
         metrics = [
             metric for metric in configured_metrics
+            if selected_metrics is None or metric in selected_metrics
             if any(row["metric"] == metric for row in aggregate_rows)
         ]
         if not metrics:
@@ -423,6 +468,11 @@ def plot_summary(args, aggregate_rows, window_start, output_suffix):
         rows, cols = subplot_grid(len(metrics))
         fig, axes = plt.subplots(rows, cols, figsize=(6.2 * cols, 3.8 * rows))
         axes = np.asarray(axes, dtype=object).reshape(-1)
+        panel_title_size = font_size or 12 * font_scale
+        axis_label_size = font_size or 10 * font_scale
+        tick_label_size = font_size or 10 * font_scale
+        legend_size = font_size or 10 * font_scale
+        suptitle_size = font_size or 14 * font_scale
         for ax, metric in zip(axes, metrics):
             for algorithm in plotted_algorithms:
                 points = [
@@ -434,14 +484,48 @@ def plot_summary(args, aggregate_rows, window_start, output_suffix):
                 points.sort(key=lambda row: row["num_envs"])
                 x = np.asarray([row["num_envs"] for row in points])
                 y = np.asarray([row["mean"] for row in points])
-                yerr = np.asarray([row["std_across_runs"] for row in points])
+                yerr = np.asarray([row["sem_across_runs"] for row in points])
                 color = ALGORITHM_COLORS.get(algorithm)
-                ax.plot(x, y, marker="o", linewidth=1.8, color=color, label=algorithm)
+                ax.plot(
+                    x,
+                    y,
+                    marker="o",
+                    linewidth=1.8,
+                    color=color,
+                    label=algorithm_display_name(algorithm),
+                )
                 if np.any(yerr > 0):
                     ax.fill_between(x, y - yerr, y + yerr, color=color, alpha=0.14)
-            ax.set_title(short_metric_name(metric))
-            ax.set_xlabel("NUM_ENVS")
-            ax.set_xticks(sorted({row["num_envs"] for row in aggregate_rows}))
+            if show_panel_titles:
+                ax.set_title(
+                    short_metric_name(metric),
+                    fontsize=panel_title_size,
+                    fontfamily=font_family,
+                )
+            num_env_ticks = sorted({row["num_envs"] for row in aggregate_rows})
+            ax.set_xticks(num_env_ticks)
+            if group == "sample_gradient_gsnr":
+                ax.set_xlabel(
+                    "Batch size",
+                    fontsize=axis_label_size,
+                    fontfamily=font_family,
+                )
+                ax.set_xticklabels(
+                    [
+                        batch_size_label(num_envs, args.rollout_steps)
+                        for num_envs in num_env_ticks
+                    ]
+                )
+            else:
+                ax.set_xlabel(
+                    "NUM_ENVS",
+                    fontsize=axis_label_size,
+                    fontfamily=font_family,
+                )
+            ax.tick_params(axis="both", labelsize=tick_label_size)
+            if font_family is not None:
+                for tick_label in ax.get_xticklabels() + ax.get_yticklabels():
+                    tick_label.set_fontfamily(font_family)
             ax.grid(alpha=0.3)
         for ax in axes[len(metrics):]:
             ax.set_visible(False)
@@ -451,22 +535,33 @@ def plot_summary(args, aggregate_rows, window_start, output_suffix):
             for handle, label in zip(handles, labels):
                 legend_entries.setdefault(label, handle)
         if legend_entries:
+            legend_kwargs = {"fontsize": legend_size}
+            if font_family is not None:
+                legend_kwargs = {
+                    "prop": {"family": font_family, "size": legend_size}
+                }
             fig.legend(
                 legend_entries.values(),
                 legend_entries.keys(),
                 loc="upper center",
-                bbox_to_anchor=(0.5, 0.955),
+                bbox_to_anchor=(0.5, 0.985 if not show_suptitle else 0.955),
                 ncol=len(legend_entries),
+                **legend_kwargs,
             )
-        fig.suptitle(
-            f"{group}: mean over "
-            f"{window_start / 1e6:.0f}M–{args.target_timesteps / 1e6:.0f}M",
-            fontsize=14,
-            y=0.995,
-        )
-        fig.tight_layout(rect=(0, 0, 1, 0.91))
+        if show_suptitle:
+            fig.suptitle(
+                f"{group}: mean over "
+                f"{window_start / 1e6:.0f}M–{args.target_timesteps / 1e6:.0f}M",
+                fontsize=suptitle_size,
+                fontfamily=font_family,
+                y=0.995,
+            )
+        layout_top = 0.86 if not show_suptitle else 0.91
+        fig.tight_layout(rect=(0, 0, 1, layout_top))
         output = args.output_dir / (
-            f"{group}_vs_num_envs_{output_suffix}.pdf"
+            output_filename
+            if output_filename is not None
+            else f"{group}_vs_num_envs_{output_suffix}.pdf"
         )
         fig.savefig(output, bbox_inches="tight")
         plt.close(fig)
@@ -478,12 +573,12 @@ def plot_metrics_over_training(
     group,
     filenames,
     figure_titles,
+    compared_algorithms=("CEC", "CEC_DECOUPLED"),
 ):
     """Write one 2x2 training figure per configured metric."""
     configured_metrics = tuple(
         metric for metric in METRIC_GROUPS[group] if metric in filenames
     )
-    compared_algorithms = ("CEC", "CEC_DECOUPLED")
     rows = [
         row for row in history_rows
         if row["metric_group"] == group
@@ -563,7 +658,7 @@ def plot_metrics_over_training(
                     y,
                     color=ALGORITHM_COLORS[algorithm],
                     linewidth=1.6,
-                    label=algorithm,
+                    label=algorithm_display_name(algorithm),
                 )
                 if np.any(yerr > 0.0):
                     ax.fill_between(
@@ -574,7 +669,10 @@ def plot_metrics_over_training(
                         alpha=0.12,
                         linewidth=0,
                     )
-            ax.set_title(f"NUM_ENVS={num_envs}", fontsize=panel_title_size)
+            ax.set_title(
+                f"Batch size = {batch_size_label(num_envs, args.rollout_steps)}",
+                fontsize=panel_title_size,
+            )
             panel_row = column_index // subplot_cols
             if panel_row == subplot_rows - 1:
                 ax.set_xlabel("Environment steps (millions)", fontsize=axis_label_size)
@@ -589,11 +687,16 @@ def plot_metrics_over_training(
             for handle, label in zip(handles, labels):
                 legend_entries.setdefault(label, handle)
         if legend_entries:
+            legend_loc = "upper right" if figure_title is None else "upper center"
+            legend_anchor = (
+                (0.985, 0.985) if figure_title is None
+                else (0.5, 0.93)
+            )
             fig.legend(
                 legend_entries.values(),
                 legend_entries.keys(),
-                loc="upper center",
-                bbox_to_anchor=(0.5, 0.93 if figure_title else 0.985),
+                loc=legend_loc,
+                bbox_to_anchor=legend_anchor,
                 ncol=len(legend_entries),
                 fontsize=legend_size,
             )
@@ -636,6 +739,19 @@ def plot_sample_gsnr_over_training(args, history_rows):
             ),
             log_metric: None,
         },
+    )
+    plot_metrics_over_training(
+        args,
+        history_rows,
+        "sample_gradient_gsnr",
+        {
+            log_metric: (
+                "sample_gradient_gsnr_over_training_log10_"
+                "cec_vs_cec_idaac.pdf"
+            ),
+        },
+        {log_metric: None},
+        compared_algorithms=("CEC", "CEC_IDAAC"),
     )
 
 
@@ -718,6 +834,37 @@ def main():
         full_aggregate_rows,
     )
     plot_summary(args, full_aggregate_rows, 0, "full_window")
+    plot_summary(
+        args,
+        full_aggregate_rows,
+        0,
+        "full_window",
+        selected_group="sample_gradient_gsnr",
+        compared_algorithms=("CEC", "CEC_IDAAC"),
+        output_filename=(
+            "sample_gradient_gsnr_vs_num_envs_full_window_"
+            "cec_vs_cec_idaac.pdf"
+        ),
+    )
+    plot_summary(
+        args,
+        full_aggregate_rows,
+        0,
+        "full_window",
+        selected_group="sample_gradient_gsnr",
+        selected_metrics=(
+            "sample_gradient_gsnr/value_parameterwise_gsnr_mean",
+        ),
+        compared_algorithms=("CEC", "CEC_IDAAC"),
+        output_filename=(
+            "sample_gradient_gsnr_vs_num_envs_full_window_"
+            "cec_vs_cec_idaac_raw.pdf"
+        ),
+        show_suptitle=False,
+        show_panel_titles=False,
+        font_scale=1.5,
+        font_family="DejaVu Sans",
+    )
     plot_sample_gsnr_over_training(args, history_rows)
     plot_env_snr_over_training(args, history_rows)
 

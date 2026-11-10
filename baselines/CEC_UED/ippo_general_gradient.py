@@ -62,6 +62,9 @@ VALUE_NETWORK_KEYS = (
     "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
     "Dense_7", "Dense_8", "Dense_9", "Dense_10", "Dense_11",
 )
+POLICY_TRUNK_KEYS = VALUE_TRUNK_KEYS = (
+    "Conv_0", "Conv_1", "Dense_0", "Dense_1", "ScannedRNN_0",
+)
 IPPO_FEATURE_RANK_NAMES = (
     ("shared", "shared"),
     ("policy", "policy_penultimate"),
@@ -952,6 +955,7 @@ def make_train(
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         max_static_grids=stiffness_sample_size,
                         value_param_keys=VALUE_NETWORK_KEYS,
+                        value_trunk_param_keys=VALUE_TRUNK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
 
@@ -976,6 +980,7 @@ def make_train(
                         ),
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         policy_param_keys=POLICY_NETWORK_KEYS,
+                        policy_trunk_param_keys=POLICY_TRUNK_KEYS,
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

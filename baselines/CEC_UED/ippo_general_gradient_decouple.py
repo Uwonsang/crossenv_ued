@@ -65,6 +65,8 @@ VALUE_NETWORK_KEYS = (
     "critic_hidden_0", "critic_hidden_1", "critic_hidden_2",
     "critic_hidden_3", "critic_output",
 )
+POLICY_TRUNK_KEYS = ("actor_trunk",)
+VALUE_TRUNK_KEYS = ("critic_trunk",)
 DIAGNOSTIC_NETWORK_KEYS = tuple(
     dict.fromkeys(POLICY_NETWORK_KEYS + VALUE_NETWORK_KEYS)
 )
@@ -990,6 +992,7 @@ def make_train(
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         max_static_grids=stiffness_sample_size,
                         value_param_keys=VALUE_NETWORK_KEYS,
+                        value_trunk_param_keys=VALUE_TRUNK_KEYS,
                         chunk_size=stiffness_chunk_size,
                     )
 
@@ -1014,6 +1017,7 @@ def make_train(
                         ),
                         sample_mask=selected_static_sample_mask_by_state.reshape(-1),
                         policy_param_keys=POLICY_NETWORK_KEYS,
+                        policy_trunk_param_keys=POLICY_TRUNK_KEYS,
                         clip_eps=config["CLIP_EPS"],
                         entropy_coef=config["ENT_COEF"],
                         chunk_size=stiffness_chunk_size,

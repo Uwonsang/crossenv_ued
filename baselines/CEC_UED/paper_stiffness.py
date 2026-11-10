@@ -25,6 +25,11 @@ SAMPLEWISE_GSNR_METRIC_NAMES = (
     "value_parameterwise_gsnr_mean_log10",
     "policy_parameterwise_gsnr_mean",
     "policy_parameterwise_gsnr_mean_log10",
+) + tuple(
+    f"{loss}_{part}_parameterwise_gsnr_mean{suffix}"
+    for loss in ("value", "policy")
+    for part in ("trunk", "head")
+    for suffix in ("", "_log10")
 )
 
 
@@ -241,6 +246,40 @@ def _parameterwise_gsnr(
     return gsnr_mean, gsnr_mean_log10
 
 
+def _trunk_head_gsnr(
+    loss_name,
+    gradient_sum,
+    gradient_squared_sum,
+    samplewise_count,
+    trunk_param_keys,
+    epsilon,
+):
+    """Split parameter-wise GSNR into trunk and head root modules."""
+
+    trunk_keys = set(trunk_param_keys)
+    if not trunk_keys or not trunk_keys.issubset(gradient_sum.keys()):
+        raise ValueError(
+            f"{loss_name} trunk keys must be a non-empty subset of the "
+            "differentiated parameter keys."
+        )
+    metrics = {}
+    for part, keys in (
+        ("trunk", [key for key in gradient_sum if key in trunk_keys]),
+        ("head", [key for key in gradient_sum if key not in trunk_keys]),
+    ):
+        gsnr_mean, gsnr_mean_log10 = _parameterwise_gsnr(
+            {key: gradient_sum[key] for key in keys},
+            {key: gradient_squared_sum[key] for key in keys},
+            samplewise_count,
+            epsilon,
+        )
+        metrics[f"{loss_name}_{part}_parameterwise_gsnr_mean"] = gsnr_mean
+        metrics[f"{loss_name}_{part}_parameterwise_gsnr_mean_log10"] = (
+            gsnr_mean_log10
+        )
+    return metrics
+
+
 def compute_samplewise_policy_gsnr(
     *,
     network,
@@ -254,6 +293,7 @@ def compute_samplewise_policy_gsnr(
     normalized_advantages: jnp.ndarray,
     sample_mask: jnp.ndarray,
     policy_param_keys: Sequence[str],
+    policy_trunk_param_keys: Sequence[str],
     clip_eps: float,
     entropy_coef: float,
     chunk_size: int,
@@ -372,6 +412,14 @@ def compute_samplewise_policy_gsnr(
     return {
         "policy_parameterwise_gsnr_mean": gsnr_mean,
         "policy_parameterwise_gsnr_mean_log10": gsnr_mean_log10,
+        **_trunk_head_gsnr(
+            "policy",
+            gradient_sum,
+            gradient_squared_sum,
+            samplewise_count,
+            policy_trunk_param_keys,
+            epsilon,
+        ),
     }
 
 
@@ -389,6 +437,7 @@ def compute_paper_stiffness(
     sample_mask: jnp.ndarray,
     max_static_grids: int,
     value_param_keys: Sequence[str],
+    value_trunk_param_keys: Sequence[str],
     chunk_size: int,
     num_layouts: int = 5,
     sketch_size: int = 512,
@@ -756,5 +805,13 @@ def compute_paper_stiffness(
         "value_parameterwise_gsnr_mean": samplewise_gsnr_mean,
         "value_parameterwise_gsnr_mean_log10": (
             samplewise_gsnr_mean_log10
+        ),
+        **_trunk_head_gsnr(
+            "value",
+            raw_gradient_sum,
+            raw_gradient_squared_sum,
+            samplewise_count,
+            value_trunk_param_keys,
+            epsilon,
         ),
     }

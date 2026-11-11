@@ -191,23 +191,29 @@ def main():
     config = load_config(args.config)
     env = make_family_env(config)
     action_dim = env.action_space("agent_0").n
+    # Network structure does not depend on num_envs, so jitted rollouts are
+    # shared across num_envs of the same model: one compilation per
+    # (model, behavior, layout family).
+    rollout_cache = {}
 
     for model, num_envs in args.models:
         spec = MODEL_SPECS[model]
-        # The value network also sows actor_penultimate, so one rollout gives both.
-        network = spec["value_network"](action_dim, config=config)
         cross_model = CROSS_MODELS[model]
-        cross_network = MODEL_SPECS[cross_model]["actor_network"](
-            action_dim, config=config,
-        )
         for behavior in args.behaviors:
-            rollout_fns = [
-                make_rollout_fn(
-                    network, env, reset_name, config, args.steps, args.argmax,
-                    bool(spec["value_separate_hidden"]), behavior, cross_network,
+            if (model, behavior) not in rollout_cache:
+                # The value network also sows actor_penultimate, so one rollout gives both.
+                network = spec["value_network"](action_dim, config=config)
+                cross_network = MODEL_SPECS[cross_model]["actor_network"](
+                    action_dim, config=config,
                 )
-                for _, reset_name in LAYOUT_FAMILIES
-            ]
+                rollout_cache[(model, behavior)] = [
+                    make_rollout_fn(
+                        network, env, reset_name, config, args.steps, args.argmax,
+                        bool(spec["value_separate_hidden"]), behavior, cross_network,
+                    )
+                    for _, reset_name in LAYOUT_FAMILIES
+                ]
+            rollout_fns = rollout_cache[(model, behavior)]
             for seed in args.seeds:
                 out_path = args.output_dir / f"behavior_{behavior}" / (
                     f"{MODEL_FILE_LABELS[model]}_{num_envs}_seed{seed}.npz"

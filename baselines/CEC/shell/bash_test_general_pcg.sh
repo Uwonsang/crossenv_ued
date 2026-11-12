@@ -30,6 +30,7 @@ all_models=(
   CEC_IDAAC_small
   CEC_DAAC
   CEC_decouple
+  CEC_ADV
   E3T
   FCP
   FCP_Fixed
@@ -72,7 +73,7 @@ all_layouts=(
 )
 
 for model in "${models[@]}"; do
-  if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_IDAAC_small" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" ]]; then
+  if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_IDAAC_small" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" || "${model}" == "CEC_ADV" ]]; then
     selected_envs=("${model_num_envs_values[@]}")
     selected_layouts=(cramped_room_9)
   else
@@ -90,7 +91,7 @@ for model in "${models[@]}"; do
 
   for model_num_envs in "${selected_envs[@]}"; do
     model_output_dir="${output_dir%/}/${model}"
-    if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_IDAAC_small" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" ]]; then
+    if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_IDAAC_small" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" || "${model}" == "CEC_ADV" ]]; then
       model_output_dir="${model_output_dir}/envs${model_num_envs}"
     fi
 

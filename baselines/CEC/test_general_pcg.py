@@ -362,7 +362,7 @@ def main(config):
     config = OmegaConf.to_container(config)
     model_name = config["model_name"]
     scalable_model_names = {
-        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple",
+        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple", "CEC_ADV",
     }
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
     # DAAC/decouple checkpoints share the IDAAC actor parameter names.
@@ -371,6 +371,7 @@ def main(config):
     }
     rnn_model_names = {
         "CEC",
+        "CEC_ADV",
         "CEC_Finetune",
         "FCP",
         "FCP_Fixed",

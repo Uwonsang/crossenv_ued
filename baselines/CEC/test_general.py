@@ -188,6 +188,7 @@ def main(config):
     }
     rnn_model_names = {
         "CEC",
+        "CEC_ADV",
         "CEC_Finetune",
         "CEC_IDAAC",
         "CEC_IDAAC_Finetune",
@@ -209,7 +210,7 @@ def main(config):
         from jaxmarl.viz.toy_coop_jitted_visualizer import render_fn
 
     scalable_model_names = {
-        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple",
+        "CEC", "CEC_IDAAC", "CEC_IDAAC_small", "CEC_DAAC", "CEC_decouple", "CEC_ADV",
     }
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
     # DAAC/decouple checkpoints share the IDAAC actor parameter names.

@@ -185,6 +185,10 @@ def collect(rollout_fns, params, behavior_params, args, model_seed: int):
 
 def main():
     args = parse_args()
+    # JAX uses a visible GPU automatically; report it so a CPU fallback is obvious.
+    print(f"JAX devices: {jax.devices()}")
+    if jax.default_backend() != "gpu":
+        print("WARNING: no GPU visible to JAX, running on CPU (much slower).")
     args.model_root = args.model_root.expanduser()
     if args.output_dir is None:
         args.output_dir = args.model_root / "analysis" / "representation_probe" / "data"

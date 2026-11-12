@@ -35,6 +35,7 @@ if str(CEC_DIR) not in sys.path:
 import jaxmarl  # noqa: E402
 from jaxmarl.environments.overcooked import overcooked_layouts  # noqa: E402
 
+from probe_jax import probe_accuracies  # noqa: E402
 from actor_networks import (  # noqa: E402
     ActorCriticRNN,
     IDAACActorCriticRNN,
@@ -334,27 +335,20 @@ def run_probes(
     features, labels, episode_ids, args, model: str, num_envs: int,
     seed: int, ckpt: Path, behavior: str,
 ):
-    try:
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.pipeline import make_pipeline
-        from sklearn.preprocessing import StandardScaler
-    except ImportError as exc:
-        raise RuntimeError(
-            "scikit-learn is required for the linear representation probe"
-        ) from exc
+    train_masks, test_masks = zip(*(
+        stratified_episode_split(
+            labels, episode_ids, args.train_fraction,
+            np.random.default_rng(args.rollout_seed + 7919 * seed + split),
+        )
+        for split in range(args.probe_splits)
+    ))
+    accuracies = probe_accuracies(
+        features, labels, train_masks, test_masks, len(LAYOUT_FAMILIES)
+    )
 
     rows = []
-    for split in range(args.probe_splits):
-        rng = np.random.default_rng(args.rollout_seed + 7919 * seed + split)
-        train_mask, test_mask = stratified_episode_split(
-            labels, episode_ids, args.train_fraction, rng
-        )
-        probe = make_pipeline(
-            StandardScaler(),
-            LogisticRegression(max_iter=3000, solver="lbfgs"),
-        )
-        probe.fit(features[train_mask], labels[train_mask])
-        accuracy = float(probe.score(features[test_mask], labels[test_mask]))
+    for split, (train_mask, test_mask) in enumerate(zip(train_masks, test_masks)):
+        accuracy = float(accuracies[split])
         rows.append({
             "model": model,
             "model_label": MODEL_SPECS[model]["display"],

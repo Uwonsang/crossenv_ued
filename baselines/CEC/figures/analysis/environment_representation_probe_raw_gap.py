@@ -22,6 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from probe_jax import probe_accuracies
 from environment_representation_probe_review import (
     CROSS_MODELS,
     LAYOUT_FAMILIES,
@@ -192,25 +193,21 @@ def run_probes(
     features, raw_obs, labels, episode_ids, args, model: str, num_envs: int,
     seed: int, ckpt: Path, behavior: str,
 ):
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    def probe_accuracy(x, train_mask, test_mask):
-        probe = make_pipeline(
-            StandardScaler(), LogisticRegression(max_iter=3000, solver="lbfgs"),
+    train_masks, test_masks = zip(*(
+        stratified_episode_split(
+            labels, episode_ids, args.train_fraction,
+            np.random.default_rng(args.rollout_seed + 7919 * seed + split),
         )
-        probe.fit(x[train_mask], labels[train_mask])
-        return float(probe.score(x[test_mask], labels[test_mask]))
+        for split in range(args.probe_splits)
+    ))
+    num_classes = len(LAYOUT_FAMILIES)
+    accuracies = probe_accuracies(features, labels, train_masks, test_masks, num_classes)
+    raw_accuracies = probe_accuracies(raw_obs, labels, train_masks, test_masks, num_classes)
 
     rows = []
-    for split in range(args.probe_splits):
-        rng = np.random.default_rng(args.rollout_seed + 7919 * seed + split)
-        train_mask, test_mask = stratified_episode_split(
-            labels, episode_ids, args.train_fraction, rng
-        )
-        accuracy = probe_accuracy(features, train_mask, test_mask)
-        raw_accuracy = probe_accuracy(raw_obs, train_mask, test_mask)
+    for split, (train_mask, test_mask) in enumerate(zip(train_masks, test_masks)):
+        accuracy = float(accuracies[split])
+        raw_accuracy = float(raw_accuracies[split])
         rows.append({
             "model": model,
             "model_label": MODEL_SPECS[model]["display"],

@@ -8,6 +8,9 @@ The input probes are fit once per split and shared by the actor and value rows:
   gap            = raw_accuracy - accuracy
   featurized_gap = featurized_accuracy - accuracy
 
+Probes run on the GPU (probe_jax.py: sklearn StandardScaler +
+LogisticRegression objective solved with jaxopt.LBFGS, all splits at once).
+
 Writes CSVs compatible with environment_representation_probe_graph.py:
   <output-dir>/behavior_<b>/environment_probe_{,value_}<cec|dcec>_<num_envs>.csv
 """
@@ -17,8 +20,10 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import jax
 import numpy as np
 
+from probe_jax import probe_accuracies
 from environment_representation_probe_review import (
     LAYOUT_FAMILIES,
     MODEL_FILE_LABELS,
@@ -58,34 +63,29 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def probe_accuracy(x, labels, train_mask, test_mask) -> float:
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.pipeline import make_pipeline
-    from sklearn.preprocessing import StandardScaler
-
-    probe = make_pipeline(
-        StandardScaler(), LogisticRegression(max_iter=3000, solver="lbfgs"),
-    )
-    probe.fit(x[train_mask], labels[train_mask])
-    return float(probe.score(x[test_mask], labels[test_mask]))
-
-
 def run_probes(data, args, model: str, num_envs: int, seed: int, behavior: str):
     labels, episode_ids = data["labels"], data["episode_ids"]
+    train_masks, test_masks = zip(*(
+        stratified_episode_split(
+            labels, episode_ids, args.train_fraction,
+            np.random.default_rng(args.rollout_seed + 7919 * seed + split),
+        )
+        for split in range(args.probe_splits)
+    ))
+    train_masks, test_masks = np.stack(train_masks), np.stack(test_masks)
+    accuracies = {
+        name: probe_accuracies(
+            data[name], labels, train_masks, test_masks, len(LAYOUT_FAMILIES)
+        )
+        for name in ("raw", "featurized", "actor", "value")
+    }
+
     rows = {"actor": [], "value": []}
     for split in range(args.probe_splits):
-        rng = np.random.default_rng(args.rollout_seed + 7919 * seed + split)
-        train_mask, test_mask = stratified_episode_split(
-            labels, episode_ids, args.train_fraction, rng
-        )
-        raw_accuracy = probe_accuracy(data["raw"], labels, train_mask, test_mask)
-        featurized_accuracy = probe_accuracy(
-            data["featurized"], labels, train_mask, test_mask
-        )
+        raw_accuracy = float(accuracies["raw"][split])
+        featurized_accuracy = float(accuracies["featurized"][split])
         for representation in ("actor", "value"):
-            accuracy = probe_accuracy(
-                data[representation], labels, train_mask, test_mask
-            )
+            accuracy = float(accuracies[representation][split])
             rows[representation].append({
                 "model": model,
                 "model_label": MODEL_SPECS[model]["display"],
@@ -100,8 +100,8 @@ def run_probes(data, args, model: str, num_envs: int, seed: int, behavior: str):
                 "featurized_accuracy": featurized_accuracy,
                 "featurized_gap": featurized_accuracy - accuracy,
                 "chance_accuracy": 1.0 / len(LAYOUT_FAMILIES),
-                "num_train_samples": int(train_mask.sum()),
-                "num_test_samples": int(test_mask.sum()),
+                "num_train_samples": int(train_masks[split].sum()),
+                "num_test_samples": int(test_masks[split].sum()),
                 "checkpoint": str(data["checkpoint"]),
             })
     return rows
@@ -109,6 +109,10 @@ def run_probes(data, args, model: str, num_envs: int, seed: int, behavior: str):
 
 def main():
     args = parse_args()
+    # JAX uses a visible GPU automatically; report it so a CPU fallback is obvious.
+    print(f"JAX devices: {jax.devices()}")
+    if jax.default_backend() != "gpu":
+        print("WARNING: no GPU visible to JAX, running on CPU (much slower).")
     args.model_root = args.model_root.expanduser()
     probe_root = args.model_root / "analysis" / "representation_probe"
     data_dir = args.data_dir or probe_root / "data"

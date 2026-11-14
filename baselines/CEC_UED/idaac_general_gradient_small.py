@@ -1684,8 +1684,27 @@ def main(config):
     _has_mid_ckpt = bool(resume_xpid) and os.path.exists(mid_ckpt_path)
     wandb_resume_id = None
     if _has_mid_ckpt:
-        with open(mid_ckpt_path, "rb") as f:
-            _peek = pickle.load(f)
+        try:
+            with open(mid_ckpt_path, "rb") as f:
+                _peek = pickle.load(f)
+        except ModuleNotFoundError as e:
+            if not str(e.name).startswith("optax.transforms"):
+                raise
+            from optax._src import combine, wrappers
+            # Checkpoints saved with optax>=0.2.3 reference optax.transforms.*;
+            # map them to the identical optax 0.1.7 classes.
+            _optax_compat = {
+                ("optax.transforms._combining", "PartitionState"): combine.MultiTransformState,
+                ("optax.transforms._masking", "MaskedState"): wrappers.MaskedState,
+                ("optax.transforms._masking", "MaskedNode"): wrappers.MaskedNode,
+            }
+
+            class _CompatUnpickler(pickle.Unpickler):
+                def find_class(self, module, name):
+                    return _optax_compat.get((module, name)) or super().find_class(module, name)
+
+            with open(mid_ckpt_path, "rb") as f:
+                _peek = _CompatUnpickler(f).load()
         wandb_resume_id = _peek.get('wandb_run_id', None)
 
     layout_name = config["ENV_KWARGS"]["layout"]

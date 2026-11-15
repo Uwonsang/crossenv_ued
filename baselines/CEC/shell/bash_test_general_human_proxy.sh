@@ -27,6 +27,8 @@ all_models=(
   CEC_Finetune
   CEC_IDAAC
   CEC_IDAAC_Finetune
+  CEC_FCP
+  CEC_IDAAC_FCP
   E3T
   FCP
   FCP_Fixed
@@ -76,7 +78,10 @@ for layout in "${layouts[@]}"; do
       selected_envs=("${model_num_envs_values[0]}")
     fi
     for model_num_envs in "${selected_envs[@]}"; do
-      if [[ "${model}" == "IPPO" ]]; then
+      if [[ "${model}" == "CEC_FCP" || "${model}" == "CEC_IDAAC_FCP" ]]; then
+        model_seeds="[0,1,2]"
+        model_seed_label="0,1,2"
+      elif [[ "${model}" == "IPPO" ]]; then
         model_seeds="[0,1,2,3,5,6]"
         model_seed_label="0,1,2,3,5,6"
       else

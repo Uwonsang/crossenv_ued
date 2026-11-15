@@ -237,6 +237,7 @@ def main(config):
     }
     rnn_model_names = {
         "CEC",
+        "CEC_FCP",
         "CEC_Finetune",
         "CEC_IDAAC",
         "CEC_IDAAC_Finetune",
@@ -254,7 +255,7 @@ def main(config):
 
     scalable_model_names = {"CEC", "CEC_IDAAC"}
     finetune_model_names = {"CEC_Finetune", "CEC_IDAAC_Finetune"}
-    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune"}
+    idaac_model_names = {"CEC_IDAAC", "CEC_IDAAC_Finetune", "CEC_IDAAC_FCP"}
     if config.get("OUTPUT_DIR"):
         save_path_final = config["OUTPUT_DIR"]
     else:
@@ -281,6 +282,8 @@ def main(config):
                 f"{model_root}/{config['MODEL_NUM_ENVS']}/seed{seed}/"
                 f"seed{seed}_ckpt*.pkl"
             ]
+        elif model_name in ("CEC_FCP", "CEC_IDAAC_FCP"):
+            patterns = [f"{model_root}/seed{seed}/seed{seed}_ckpt*.pkl"]
         elif model_name in finetune_model_names:
             patterns = [
                 f"{model_root}/{config['ENV_KWARGS']['layout']}/seed{seed}/"

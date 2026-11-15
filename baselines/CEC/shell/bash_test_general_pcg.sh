@@ -31,6 +31,8 @@ all_models=(
   CEC_DAAC
   CEC_decouple
   CEC_ADV
+  CEC_FCP
+  CEC_IDAAC_FCP
   E3T
   FCP
   FCP_Fixed
@@ -76,12 +78,19 @@ for model in "${models[@]}"; do
   if [[ "${model}" == "CEC" || "${model}" == "CEC_IDAAC" || "${model}" == "CEC_IDAAC_small" || "${model}" == "CEC_DAAC" || "${model}" == "CEC_decouple" || "${model}" == "CEC_ADV" ]]; then
     selected_envs=("${model_num_envs_values[@]}")
     selected_layouts=(cramped_room_9)
+  elif [[ "${model}" == "CEC_FCP" || "${model}" == "CEC_IDAAC_FCP" ]]; then
+    # General checkpoints: one PCG evaluation, no per-layout models.
+    selected_envs=("${model_num_envs_values[0]}")
+    selected_layouts=(cramped_room_9)
   else
     selected_envs=("${model_num_envs_values[0]}")
     selected_layouts=("${all_layouts[@]}")
   fi
 
-  if [[ "${model}" == "IPPO" ]]; then
+  if [[ "${model}" == "CEC_FCP" || "${model}" == "CEC_IDAAC_FCP" ]]; then
+    model_seeds="[0,1,2]"
+    model_seed_label="0,1,2"
+  elif [[ "${model}" == "IPPO" ]]; then
     model_seeds="[0,1,2,3,5,6]"
     model_seed_label="0,1,2,3,5,6"
   else

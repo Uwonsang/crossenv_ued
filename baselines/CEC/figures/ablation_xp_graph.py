@@ -1,4 +1,4 @@
-"""Ablation bar charts: CEC / Decoupled / DAAC / DCEC at 8K and 65K batch size.
+"""Ablation line plots: CEC / Decoupled / DAAC / DCEC across 8K-65K batch size.
 
 (a) cross-play on the 5 fixed tasks (xp_results)
 (b) cross-play on 100 procedurally generated tasks (pcg_xp_results)
@@ -15,6 +15,7 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 
@@ -27,14 +28,15 @@ def _default_results_root() -> Path:
     return Path("/app/nas/models/ICRL")
 
 
-METHODS = [  # (result directory name, display label, color)
-    ("CEC", "CEC", "#2F9956"),
-    ("CEC_decouple", "Decoupled", "#E69F00"),
-    ("CEC_DAAC", "DAAC", "#CC79A7"),
+# (result directory name, display label, color);
+# CEC/DCEC colors match test_general_graph(_scaling).py.
+METHODS = [
+    ("CEC", "CEC", "#117733"),
+    ("CEC_decouple", "+ Decoupled", "#009E73"),
+    ("CEC_DAAC", "+ Adv.", "#CC79A7"),
     ("CEC_IDAAC", "DCEC", "#0072B2"),
 ]
 BATCHES = [(32, "8K"), (64, "16K"), (128, "32K"), (256, "65K")]
-BATCH_ALPHAS = [0.3, 0.5, 0.75, 1.0]  # lighter = smaller batch
 LAYOUTS = [
     "asymm_advantages_9", "coord_ring_9", "counter_circuit_9",
     "cramped_room_9", "forced_coord_9",
@@ -85,26 +87,96 @@ def summarize(root: Path, loader) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def plot_panel(ax, summary: pd.DataFrame, title: str) -> None:
-    x = np.arange(len(METHODS))
-    width = 0.8 / len(BATCHES)
-    for b, (_, batch) in enumerate(BATCHES):
-        sub = summary[summary["batch"] == batch].set_index("method")
-        means = [sub.loc[label, "mean"] for _, label, _ in METHODS]
-        sems = [sub.loc[label, "sem"] for _, label, _ in METHODS]
-        colors = [color for _, _, color in METHODS]
-        ax.bar(
-            x + (b - (len(BATCHES) - 1) / 2) * width, np.nan_to_num(means),
-            width, yerr=np.nan_to_num(sems), capsize=3, color=colors,
-            alpha=BATCH_ALPHAS[b], edgecolor="black", linewidth=0.7,
-            error_kw={"elinewidth": 1.0},
+# Same style as plot_overall_line in test_general_graph_scaling.py
+SCALING_RC = {
+    "font.size": 20,
+    "axes.titlesize": 26,
+    "axes.labelsize": 24,
+    "xtick.labelsize": 22,
+    "ytick.labelsize": 22,
+    "legend.fontsize": 20,
+}
+
+
+# Display names in legends and bar ticks (cumulative ablation); data keeps METHODS labels.
+DISPLAY_LABELS = {"DCEC": "+ Invariance\n(DCEC)"}
+
+
+def plot_line(panels, out_path: Path) -> None:
+    """panels: [(summary, title), ...] drawn side by side with one legend."""
+    x = np.arange(len(BATCHES))
+    with plt.rc_context(SCALING_RC):
+        fig, axes = plt.subplots(1, len(panels), figsize=(18.0, 6.5))
+        for ax, (summary, title) in zip(axes, panels):
+            for _, label, color in METHODS:
+                sub = summary[summary["method"] == label].set_index("batch")
+                means = np.array([sub.loc[b, "mean"] for _, b in BATCHES])
+                sems = np.array([sub.loc[b, "sem"] for _, b in BATCHES])
+                ax.plot(x, means, color=color, marker="o", markersize=9,
+                        linewidth=2.8)
+                # Standard error across seeds as a shaded band.
+                ax.fill_between(x, means - sems, means + sems, color=color,
+                                alpha=0.2, linewidth=0)
+            ax.set_xticks(x)
+            ax.set_xticklabels([batch for _, batch in BATCHES])
+            ax.set_xlabel("Batch Size")
+            ax.set_ylabel("XP Reward")
+            ax.set_title(title, pad=12)
+            ax.grid(alpha=0.25)
+            ax.set_axisbelow(True)
+        fig.tight_layout()
+        # One horizontal legend centered below the panels, thick line handles only.
+        handles = [Line2D([], [], color=color, linewidth=6)
+                   for _, _, color in METHODS]
+        legend = fig.legend(
+            handles,
+            [DISPLAY_LABELS.get(label, label).replace("\n", " ")
+             for _, label, _ in METHODS],
+            loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=len(METHODS),
+            frameon=True, handlelength=1.6, columnspacing=1.8,
         )
-    ax.set_xticks(x)
-    ax.set_xticklabels([label for _, label, _ in METHODS])
-    ax.set_ylabel("XP Reward")
-    ax.set_title(title)
-    ax.grid(axis="y", alpha=0.35)
-    ax.set_axisbelow(True)
+        legend.get_frame().set_edgecolor("#dddddd")
+        fig.savefig(out_path, bbox_inches="tight")
+        plt.close(fig)
+    print(f"Saved {out_path}")
+
+
+# Same style as plot_overall in test_general_graph.py / test_general_graph_pcg.py
+OVERALL_RC = {
+    "font.family": "DejaVu Sans",
+    "font.size": 24,
+    "axes.titlesize": 28,
+    "axes.labelsize": 24,
+    "xtick.labelsize": 24,
+    "ytick.labelsize": 24,
+}
+
+
+def plot_bar_overall(summary: pd.DataFrame, title: str, batch: str,
+                     out_path: Path, ymax: float) -> None:
+    sub = summary[summary["batch"] == batch].set_index("method")
+    labels = [label for _, label, _ in METHODS]
+    with plt.rc_context(OVERALL_RC):
+        fig, ax = plt.subplots(figsize=(10.0, 5.694))
+        x = np.arange(len(METHODS))
+        ax.bar(
+            x, sub.loc[labels, "mean"], yerr=sub.loc[labels, "sem"],
+            capsize=5, color=[color for _, _, color in METHODS],
+            edgecolor="none", linewidth=0,
+            alpha=0.8,
+        )
+        ax.set_xticks(x)
+        ax.set_xticklabels([DISPLAY_LABELS.get(l, l) for l in labels],
+                           rotation=0, ha="center", multialignment="center")
+        ax.tick_params(axis="x", pad=12)
+        ax.set_ylabel("XP Reward")
+        ax.set_title(title, fontweight="normal", pad=16)
+        ax.set_ylim(0, ymax)
+        ax.grid(False)
+        fig.tight_layout()
+        fig.savefig(out_path)
+        plt.close(fig)
+    print(f"Saved {out_path}")
 
 
 def main() -> None:
@@ -125,21 +197,21 @@ def main() -> None:
     print(fixed.to_string(index=False))
     print(pcg.to_string(index=False))
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 4.2))
-    plot_panel(axes[0], fixed, "(a) 5 Fixed Tasks")
-    plot_panel(axes[1], pcg, "(b) 100 Procedurally Generated Tasks")
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, facecolor="gray", alpha=alpha,
-                      edgecolor="black")
-        for alpha in BATCH_ALPHAS
-    ]
-    fig.legend(handles, [f"Batch {b}" for _, b in BATCHES], loc="upper center",
-               ncol=len(BATCHES), frameon=False, bbox_to_anchor=(0.5, 1.04))
-    fig.tight_layout()
-    for ext in ("pdf", "png"):
-        out = args.output_dir / f"ablation_xp_bar.{ext}"
-        fig.savefig(out, bbox_inches="tight", dpi=200)
-        print(f"Saved {out}")
+    plot_line(
+        [(fixed, "5 Fixed Tasks"), (pcg, "100 Procedurally Generated Tasks")],
+        args.output_dir / "ablation_xp_line.pdf",
+    )
+
+    # One bar plot per batch size; shared y-axis per evaluation for comparison.
+    for summary, title, name in (
+        (fixed, "(a) 5 Fixed Tasks", "fixed"),
+        (pcg, "(b) 100 Procedurally Generated Tasks", "pcg"),
+    ):
+        ymax = float((summary["mean"] + summary["sem"]).max()) * 1.08
+        for _, batch in BATCHES:
+            plot_bar_overall(summary, title, batch,
+                             args.output_dir / f"ablation_xp_bar_{batch}_{name}.pdf",
+                             ymax)
 
 
 if __name__ == "__main__":

@@ -375,16 +375,20 @@ def plot_overall_line(
     fig, ax = plt.subplots(figsize=(9.0, 6.5))
     for label, algorithm_keys, color, marker in families:
         family = overall.reindex(algorithm_keys)
-        ax.errorbar(
+        means = family["mean_reward"].to_numpy(dtype=float)
+        sems = family["sem_seeds"].to_numpy(dtype=float)
+        ax.plot(
             x,
-            family["mean_reward"].to_numpy(dtype=float),
-            yerr=family["sem_seeds"].to_numpy(dtype=float),
+            means,
             label=label,
             color=color,
             marker=marker,
             markersize=9,
             linewidth=2.8,
-            capsize=5,
+        )
+        # Standard error across seeds as a shaded band.
+        ax.fill_between(
+            x, means - sems, means + sems, color=color, alpha=0.2, linewidth=0,
         )
 
     ax.set_xticks(x)

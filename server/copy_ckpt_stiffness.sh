@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Copy trained-checkpoint lr-* folders from /app/ckpts/... into the shared
-# NAS layout under /app/nas/models/ICRL/<MODEL>/<N>/<lr-folder> for CEC and
-# CEC_IDDAC (where <N> is picked from the "updates" count baked into the
-# final checkpoint filename). Only ikTrue runs are copied.
+# NAS layout under /app/nas/models/ICLR/<MODEL>/<N>/seed<K> for CEC and
+# CEC_IDAAC (where <N> is picked from the "updates" count and seed<K> from the
+# "seed" prefix of the final checkpoint filename). Only ikTrue runs are copied.
+# Existing destinations are reported and never overwritten.
 set -euo pipefail
 
 NAS_ROOT="/app/nas/models/ICLR"
 CKPTS_ROOT="/app/ckpts"
-FORCE=0
 
 declare -A UPDATES_TO_N=(
   [2929]=256
@@ -17,7 +17,7 @@ declare -A UPDATES_TO_N=(
 )
 
 usage() {
-  echo "Usage: $0 [-f|--force] [lr-folder-path ...]" >&2
+  echo "Usage: $0 [lr-folder-path ...]" >&2
   echo "  With no path given, scans every lr-* folder under $CKPTS_ROOT." >&2
   echo "  Example: $0 /app/ckpts/idaac/overcooked/cramped_room_9/ikTrue/reset_all/lr-20260809-090611" >&2
   exit 1
@@ -35,7 +35,6 @@ model_for_path() {
 ARGS=()
 for arg in "$@"; do
   case "$arg" in
-    -f|--force) FORCE=1 ;;
     -h|--help) usage ;;
     *) ARGS+=("$arg") ;;
   esac
@@ -95,16 +94,20 @@ for src in "${ARGS[@]}"; do
   fi
   dest_dir="$NAS_ROOT/$model/$n"
 
-  lr_name="$(basename "$src")"
-  dest="$dest_dir/$lr_name"
+  if [[ ! "$fname" =~ ^(seed[0-9]+)_ ]]; then
+    echo "[SKIP] couldn't parse seed from filename: $fname" >&2
+    continue
+  fi
+  seed_name="${BASH_REMATCH[1]}"
+  dest="$dest_dir/$seed_name"
 
-  if [ -e "$dest" ] && [ "$FORCE" -ne 1 ]; then
-    echo "[SKIP] destination already exists (use -f to overwrite): $dest" >&2
+  if [ -e "$dest" ]; then
+    echo "[EXISTS] destination already exists, not overwriting: $dest  (from $src)" >&2
     continue
   fi
 
   mkdir -p "$dest_dir"
   echo "[COPY] $src"
   echo "    -> $dest  (updates=$updates -> $n)"
-  cp -a --no-preserve=ownership "$src" "$dest_dir/"
+  cp -a --no-preserve=ownership "$src" "$dest"
 done

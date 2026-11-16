@@ -52,9 +52,11 @@ METRIC_GROUPS = {
         "env_gradient_gsnr/policy_parameterwise_gsnr_mean_log10",
         "env_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
     ),
-    "sample_gradient_gsnr": (
-        "sample_gradient_gsnr/value_parameterwise_gsnr_mean",
-        "sample_gradient_gsnr/value_parameterwise_gsnr_mean_log10",
+    "sample_gradient_gsnr": tuple(
+        f"sample_gradient_gsnr/{loss}{part}_parameterwise_gsnr_mean{suffix}"
+        for loss in ("value", "policy")
+        for part in ("", "_trunk", "_head")
+        for suffix in ("", "_log10")
     ),
     "env_gradient_norm": tuple(
         f"env_gradient_norm/{gradient_name}_{statistic}"
@@ -162,6 +164,14 @@ def parse_args() -> argparse.Namespace:
             "run for each algorithm/NUM_ENVS/seed combination."
         ),
     )
+    parser.add_argument(
+        "--created-after",
+        default=None,
+        help=(
+            "Only include runs created at or after this ISO date/time "
+            "(e.g. 2026-11-11)."
+        ),
+    )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
         "--history-samples",
@@ -222,6 +232,10 @@ def fetch_history(args: argparse.Namespace):
         except (TypeError, ValueError):
             continue
         if total_timesteps != args.target_timesteps or run.state not in args.states:
+            continue
+        if args.created_after and (
+            str(getattr(run, "created_at", "") or "") < args.created_after
+        ):
             continue
 
         algorithm = canonical_algorithm(run)
@@ -406,6 +420,21 @@ def short_metric_name(metric: str) -> str:
         ),
         "sample_gradient_gsnr/value_parameterwise_gsnr_mean_log10": (
             "Mean parameter-wise log10(GSNR)"
+        ),
+        "sample_gradient_gsnr/value_trunk_parameterwise_gsnr_mean": (
+            "Value GSNR: trunk"
+        ),
+        "sample_gradient_gsnr/value_head_parameterwise_gsnr_mean": (
+            "Value GSNR: head"
+        ),
+        "sample_gradient_gsnr/policy_parameterwise_gsnr_mean": (
+            "Policy GSNR"
+        ),
+        "sample_gradient_gsnr/policy_trunk_parameterwise_gsnr_mean": (
+            "Policy GSNR: trunk"
+        ),
+        "sample_gradient_gsnr/policy_head_parameterwise_gsnr_mean": (
+            "Policy GSNR: head"
         ),
         "env_gradient_snr/policy_snr": "Policy gradient SNR",
         "env_gradient_snr/value_snr": "Value gradient SNR",
@@ -864,6 +893,43 @@ def main():
         show_panel_titles=False,
         font_scale=1.5,
         font_family="DejaVu Sans",
+    )
+    plot_summary(
+        args,
+        full_aggregate_rows,
+        0,
+        "full_window",
+        selected_group="sample_gradient_gsnr",
+        selected_metrics=(
+            "sample_gradient_gsnr/policy_parameterwise_gsnr_mean",
+        ),
+        compared_algorithms=("CEC", "CEC_IDAAC"),
+        output_filename=(
+            "sample_gradient_policy_gsnr_vs_num_envs_full_window_"
+            "cec_vs_cec_idaac_raw.pdf"
+        ),
+        show_suptitle=False,
+        show_panel_titles=False,
+        font_scale=1.5,
+        font_family="DejaVu Sans",
+    )
+    plot_summary(
+        args,
+        full_aggregate_rows,
+        0,
+        "full_window",
+        selected_group="sample_gradient_gsnr",
+        selected_metrics=tuple(
+            f"sample_gradient_gsnr/{loss}_{part}_parameterwise_gsnr_mean"
+            for loss in ("value", "policy")
+            for part in ("trunk", "head")
+        ),
+        compared_algorithms=("CEC", "CEC_IDAAC"),
+        output_filename=(
+            "sample_gradient_gsnr_trunk_head_vs_num_envs_full_window_"
+            "cec_vs_cec_idaac.pdf"
+        ),
+        show_suptitle=False,
     )
     plot_sample_gsnr_over_training(args, history_rows)
     plot_env_snr_over_training(args, history_rows)

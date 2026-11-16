@@ -5,7 +5,7 @@
 # final checkpoint filename). Only ikTrue runs are copied.
 set -euo pipefail
 
-NAS_ROOT="/app/nas/models/IClR"
+NAS_ROOT="/app/nas/models/ICLR"
 CKPTS_ROOT="/app/ckpts"
 FORCE=0
 

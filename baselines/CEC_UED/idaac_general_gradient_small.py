@@ -69,19 +69,19 @@ VALUE_TRUNK_KEYS = (
 
 # Parameter-matched architecture for the default CEC Overcooked experiment.
 #
-# IPPO (FC_DIM_SIZE=GRU_HIDDEN_DIM=256, 6 actions) has 3,862,311 policy/value
-# parameters. IDAAC cannot reuse IPPO's 512-wide shared trunk because its actor
-# and critic have independent encoder/RNN trunks. The configuration below uses
-# power-of-two widths throughout both trunks and the policy/value MLPs while
-# staying within 0.1% of the IPPO budget:
+# IPPO (FC_DIM_SIZE=GRU_HIDDEN_DIM=256, 6 actions) has 2,878,247 policy/value
+# parameters (one shared 2,392,672 trunk + 148,486 policy head + 337,089 value
+# head). IDAAC needs two independent trunks, so each trunk uses FC_DIM=128
+# (2 x 1,269,856), the policy head keeps IPPO's widths, and the value head is
+# narrowed to absorb the extra trunk parameters:
 #
-#   IDAAC policy/value: 3,863,047 (+736 parameters, +0.019%)
+#   IDAAC policy/value: 2,869,319 (-8,928 parameters, -0.31%)
 #
 # DAAC's advantage head and IDAAC's order-classifier are deliberately excluded
 # from this comparison because they are auxiliary objectives, not policy/value.
 IDAAC_MATCHED_FC_DIM = 128
-IDAAC_MATCHED_POLICY_HIDDEN_DIMS = (1024, 512, 128, 64)
-IDAAC_MATCHED_VALUE_HIDDEN_DIMS = (1024, 512, 256, 256)
+IDAAC_MATCHED_POLICY_HIDDEN_DIMS = (256, 192, 128, 64)
+IDAAC_MATCHED_VALUE_HIDDEN_DIMS = (256, 256, 128, 128)
 AUXILIARY_PARAM_PREFIXES = (
     "advantage_output",
     "order_classifier_hidden",

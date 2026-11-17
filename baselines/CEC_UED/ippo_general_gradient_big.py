@@ -72,13 +72,15 @@ SHARED_TRUNK_KEYS = (
 )
 
 
-# A large IPPO with approximately the same policy/value parameter budget as
-# the original IDAAC. IDAAC's advantage and order-classifier heads are excluded
-# from the reference count. All hidden widths are powers of two; the shared
-# encoder/RNN width is 2 * IPPO_BIG_FC_DIM = 512.
+# A large IPPO matched to the original IDAAC, whose total is 5,271,438
+# parameters including its advantage and order-classifier heads. The shared
+# encoder/RNN width is 2 * IPPO_BIG_FC_DIM = 512 (trunk 3,704,416); the heads
+# fill the rest so that IPPO-big is slightly larger than IDAAC:
+#
+#   IPPO-big: 5,314,279 (+42,841 parameters, +0.81%)
 IPPO_BIG_FC_DIM = 256
-IPPO_BIG_POLICY_HIDDEN_DIMS = (1024, 512, 512, 512)
-IPPO_BIG_VALUE_HIDDEN_DIMS = (1024, 1024, 512, 256)
+IPPO_BIG_POLICY_HIDDEN_DIMS = (512, 512, 256, 128)
+IPPO_BIG_VALUE_HIDDEN_DIMS = (512, 512, 512, 256)
 
 
 def _big_fc_dim(config):

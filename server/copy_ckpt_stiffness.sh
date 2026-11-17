@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Copy trained-checkpoint lr-* folders from /app/ckpts/... into the shared
-# NAS layout under /app/nas/models/ICLR/<MODEL>/<N>/seed<K> for CEC and
+# NAS layout under /app/nas/stiffness_ckpt/models/ICLR/<MODEL>/<N>/seed<K> for CEC and
 # CEC_IDAAC (where <N> is picked from the "updates" count and seed<K> from the
 # "seed" prefix of the final checkpoint filename). Only ikTrue runs are copied.
 # Existing destinations are reported and never overwritten.
 set -euo pipefail
 
-NAS_ROOT="/app/nas/models/ICLR"
+NAS_ROOT="/app/nas/stiffness_ckpt/models/ICLR"
 CKPTS_ROOT="/app/ckpts"
 
 declare -A UPDATES_TO_N=(

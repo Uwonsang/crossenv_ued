@@ -332,7 +332,7 @@ class IDAACActorTrunkSmall(nn.Module):
 class IDAACActorRNNSmall(nn.Module):
     """Policy-only module matching CEC_IDAAC_small checkpoint parameter names.
 
-    Policy head 1024 -> 512 -> 128 -> 64 (IDAAC_MATCHED_POLICY_HIDDEN_DIMS in
+    Policy head 256 -> 192 -> 128 -> 64 (IDAAC_MATCHED_POLICY_HIDDEN_DIMS in
     CEC_UED/idaac_general_gradient_small.py). Overcooked only.
     """
 
@@ -348,14 +348,14 @@ class IDAACActorRNNSmall(nn.Module):
         )(hidden, obs, dones)
 
         actor_mean = nn.Dense(
-            1024,
+            256,
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
             name="actor_hidden_0",
         )(embedding)
         actor_mean = nn.relu(actor_mean)
         actor_mean = nn.Dense(
-            512,
+            192,
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
             name="actor_hidden_1",

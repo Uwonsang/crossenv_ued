@@ -2,9 +2,9 @@
 
 set -euo pipefail
 
-if (( $# < 3 || $# > 4 )); then
-    echo "Usage: bash $0 <gpu> <ippo|decoupled|idaac|both|all> \"seed ...\" [\"num_envs ...\"]" >&2
-    echo "Example: bash $0 0 all \"0 1\" \"32 64 128 256\"" >&2
+if (( $# < 3 || $# > 5 )); then
+    echo "Usage: bash $0 <gpu> <ippo|decoupled|idaac|both|all> \"seed ...\" [\"num_envs ...\"] [total_timesteps]" >&2
+    echo "Example: bash $0 0 all \"0 1\" \"32 64 128 256\" 300000000" >&2
     exit 1
 fi
 
@@ -55,7 +55,7 @@ if (( ${#SEEDS[@]} == 0 || ${#NUM_ENVS_VALUES[@]} == 0 )); then
     exit 1
 fi
 
-TOTAL_STEPS=300000000
+TOTAL_STEPS=${5:-300000000}
 # Keep reward-shaping and learning-rate annealing aligned with the original
 # 3B-step training run while collecting only its first 300M steps.
 SCHEDULE_STEPS=3000000000

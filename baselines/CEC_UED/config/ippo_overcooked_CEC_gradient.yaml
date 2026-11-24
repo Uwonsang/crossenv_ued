@@ -3,7 +3,7 @@
 "WEIGHT_DECAY": 0.0001  # used by ippo_general_gradient_wd.py (AdamW)
 "NUM_ENVS": 256
 "NUM_SEEDS": 1
-"NUM_STEPS": 400 #checked
+"NUM_STEPS": 256 #checked
 "FC_DIM_SIZE": 256
 "GRU_HIDDEN_DIM": 256
 "TOTAL_TIMESTEPS": 3e9 #checked #for overcooked : 3e9
